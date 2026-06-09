@@ -15,7 +15,7 @@
 from collections import Counter
 from types import SimpleNamespace
 
-from verl.utils.vllm.batch_stats import counter_to_histogram_raw, record_forward
+from verl.utils.vllm.batch_stats import counter_to_histogram_raw, forward_batch_sizes, record_forward
 
 
 def _scheduler_output(num_scheduled_tokens):
@@ -23,37 +23,31 @@ def _scheduler_output(num_scheduled_tokens):
     return SimpleNamespace(num_scheduled_tokens=num_scheduled_tokens, total_num_scheduled_tokens=total)
 
 
-def test_record_forward_all_decode():
-    decode, total = Counter(), Counter()
-    record_forward(decode, total, _scheduler_output({"a": 1, "b": 1, "c": 1}))
-    # 3 requests, all decoding one token each.
-    assert dict(total) == {3: 1}
-    assert dict(decode) == {3: 1}
+def test_forward_batch_sizes_all_decode():
+    # 3 requests, all decoding one token each: num_reqs=3, num_decode=3.
+    assert forward_batch_sizes(_scheduler_output({"a": 1, "b": 1, "c": 1})) == (3, 3)
 
 
-def test_record_forward_mixed_prefill_decode():
-    decode, total = Counter(), Counter()
+def test_forward_batch_sizes_mixed_prefill_decode():
     # b is doing (chunked) prefill (5 tokens); a and c are decoding.
-    record_forward(decode, total, _scheduler_output({"a": 1, "b": 5, "c": 1}))
-    assert dict(total) == {3: 1}  # batch width counts all 3 requests
-    assert dict(decode) == {2: 1}  # only 2 are emitting a decode token
+    assert forward_batch_sizes(_scheduler_output({"a": 1, "b": 5, "c": 1})) == (3, 2)
 
 
-def test_record_forward_accumulates():
-    decode, total = Counter(), Counter()
-    record_forward(decode, total, _scheduler_output({"a": 1, "b": 1}))
-    record_forward(decode, total, _scheduler_output({"a": 1, "b": 1}))
-    record_forward(decode, total, _scheduler_output({"a": 1}))
+def test_forward_batch_sizes_missing_fields_is_none():
+    assert forward_batch_sizes(SimpleNamespace()) is None  # no num_scheduled_tokens
+    assert forward_batch_sizes(_scheduler_output({})) is None  # empty batch
+
+
+def test_record_forward_counts_and_times_accumulate():
+    decode, total, decode_time, total_time = Counter(), Counter(), Counter(), Counter()
+    # Two forwards at width 2 (dt 0.1, 0.2), one at width 1 (dt 0.5).
+    record_forward(decode, total, decode_time, total_time, 2, 2, 0.1)
+    record_forward(decode, total, decode_time, total_time, 2, 2, 0.2)
+    record_forward(decode, total, decode_time, total_time, 1, 1, 0.5)
     assert dict(total) == {2: 2, 1: 1}
     assert dict(decode) == {2: 2, 1: 1}
-
-
-def test_record_forward_missing_fields_is_noop():
-    decode, total = Counter(), Counter()
-    record_forward(decode, total, SimpleNamespace())  # no num_scheduled_tokens
-    record_forward(decode, total, _scheduler_output({}))  # empty batch
-    assert dict(total) == {}
-    assert dict(decode) == {}
+    assert total_time[2] == 0.1 + 0.2 and total_time[1] == 0.5
+    assert decode_time[2] == 0.1 + 0.2 and decode_time[1] == 0.5
 
 
 def test_counter_to_histogram_raw_normalizes_to_one():
@@ -80,6 +74,16 @@ def test_counter_to_histogram_raw_single_value():
 
 
 def test_counter_to_histogram_raw_empty():
-    hist, n_calls = counter_to_histogram_raw({})
+    hist, total = counter_to_histogram_raw({})
     assert hist is None
-    assert n_calls == 0
+    assert total == 0
+
+
+def test_counter_to_histogram_raw_float_weights():
+    # Time-weighted counter ({batch_size: seconds}); normalizes the same way.
+    hist, total = counter_to_histogram_raw({2: 0.6, 4: 0.2})
+    assert abs(total - 0.8) < 1e-9
+    assert hist["bucket_limits"] == [2.5, 3.5, 4.5]
+    expected = [0.75, 0.0, 0.25]  # 0.6/0.8, gap, 0.2/0.8
+    assert all(abs(a - b) < 1e-9 for a, b in zip(hist["bucket_counts"], expected, strict=True))
+    assert abs(sum(hist["bucket_counts"]) - 1.0) < 1e-9

@@ -18,6 +18,7 @@ import os
 import platform
 import signal
 import threading
+import time
 from collections import Counter
 from collections.abc import Mapping
 from types import MethodType
@@ -249,7 +250,7 @@ class vLLMColocateWorkerExtension:
         ``reset_batch_stats``. Counts are reported per GPU through
         ``pop_batch_stats``.
         """
-        from verl.utils.vllm.batch_stats import record_forward
+        from verl.utils.vllm.batch_stats import forward_batch_sizes, record_forward
 
         original_execute_model = getattr(self.model_runner, "execute_model", None)
         if original_execute_model is None:
@@ -260,12 +261,23 @@ class vLLMColocateWorkerExtension:
         self._bs_enabled = False
         self._bs_decode = Counter()
         self._bs_total = Counter()
+        self._bs_decode_time = Counter()
+        self._bs_total_time = Counter()
         self._bs_gpu_id = self._batch_stats_gpu_id()
 
         def execute_model(_self, scheduler_output, *args, **kwargs):
-            if self._bs_enabled:
-                record_forward(self._bs_decode, self._bs_total, scheduler_output)
-            return original_execute_model(scheduler_output, *args, **kwargs)
+            if not self._bs_enabled:
+                return original_execute_model(scheduler_output, *args, **kwargs)
+            # Read batch sizes before the call (scheduler_output may be consumed by it).
+            sizes = forward_batch_sizes(scheduler_output)
+            t0 = time.perf_counter()
+            out = original_execute_model(scheduler_output, *args, **kwargs)
+            dt = time.perf_counter() - t0
+            if sizes is not None:
+                record_forward(
+                    self._bs_decode, self._bs_total, self._bs_decode_time, self._bs_total_time, sizes[0], sizes[1], dt
+                )
+            return out
 
         self.model_runner.execute_model = MethodType(execute_model, self.model_runner)
 
@@ -276,6 +288,8 @@ class vLLMColocateWorkerExtension:
         self._bs_enabled = True
         self._bs_decode.clear()
         self._bs_total.clear()
+        self._bs_decode_time.clear()
+        self._bs_total_time.clear()
 
     def pop_batch_stats(self) -> dict:
         """End of a rollout: return this GPU's histograms and clear them."""
@@ -285,9 +299,13 @@ class vLLMColocateWorkerExtension:
             "gpu_id": self._bs_gpu_id,
             "decode": dict(self._bs_decode),
             "total": dict(self._bs_total),
+            "decode_time": dict(self._bs_decode_time),
+            "total_time": dict(self._bs_total_time),
         }
         self._bs_decode.clear()
         self._bs_total.clear()
+        self._bs_decode_time.clear()
+        self._bs_total_time.clear()
         return result
 
     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
