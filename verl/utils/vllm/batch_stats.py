@@ -21,8 +21,7 @@ decode long-tail. See ``verl/workers/rollout/vllm_rollout/utils.py``.
 """
 
 from collections import Counter
-
-import numpy as np
+from typing import Optional
 
 
 def record_forward(decode_counter: Counter, total_counter: Counter, scheduler_output) -> None:
@@ -52,12 +51,33 @@ def record_forward(decode_counter: Counter, total_counter: Counter, scheduler_ou
     decode_counter[num_decode] += 1
 
 
-def counter_to_samples(counter: dict) -> np.ndarray:
-    """Expand a histogram Counter ({batch_size: num_forwards}) into a flat sample
-    array suitable for ``SummaryWriter.add_histogram``. Returns an empty array if
-    the counter is empty."""
-    if not counter:
-        return np.empty(0, dtype=np.int64)
-    keys = np.fromiter(counter.keys(), dtype=np.int64, count=len(counter))
-    counts = np.fromiter(counter.values(), dtype=np.int64, count=len(counter))
-    return np.repeat(keys, counts)
+def counter_to_histogram_raw(counter: dict) -> tuple[Optional[dict], int]:
+    """Turn a histogram Counter ({batch_size: num_forwards}) into the arguments for
+    ``SummaryWriter.add_histogram_raw``, as a normalized, unbinned (one bucket per
+    integer batch size) probability mass function.
+
+    Returns ``(hist_kwargs, n_calls)`` where ``hist_kwargs`` has the keys
+    ``min, max, num, sum, sum_squares, bucket_limits, bucket_counts`` and
+    ``bucket_counts`` sums to 1; ``n_calls`` is the total number of forward calls
+    (sum of the counter values). Returns ``(None, 0)`` for an empty counter.
+    """
+    n_calls = int(sum(counter.values()))
+    if n_calls == 0:
+        return None, 0
+    lo, hi = min(counter), max(counter)
+    values = list(range(lo, hi + 1))  # contiguous: zero-fill gaps for per-integer resolution
+    probs = [counter.get(v, 0) / n_calls for v in values]
+    bucket_limits = [v + 0.5 for v in values]  # right edge per integer -> each value alone in a bucket
+    mean = float(sum(v * p for v, p in zip(values, probs, strict=True)))
+    sum_squares = float(sum(v * v * p for v, p in zip(values, probs, strict=True)))
+    hist_kwargs = {
+        "min": float(lo),
+        "max": float(hi),
+        # Probability-mass convention: total mass is 1, so mean=sum, var=sum_squares-sum^2.
+        "num": 1.0,
+        "sum": mean,
+        "sum_squares": sum_squares,
+        "bucket_limits": bucket_limits,
+        "bucket_counts": probs,
+    }
+    return hist_kwargs, n_calls

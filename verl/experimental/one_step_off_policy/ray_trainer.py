@@ -44,7 +44,7 @@ from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference
 from verl.utils.debug import marked_timer
 from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.tracking import ValidationGenerationsLogger
-from verl.utils.vllm.batch_stats import counter_to_samples
+from verl.utils.vllm.batch_stats import counter_to_histogram_raw
 from verl.workers.rollout.llm_server import LLMServerManager
 
 
@@ -284,12 +284,20 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             return
         if not per_gpu or self.logger is None:
             return
-        data = {}
+        hist_data = {}
+        scalar_data = {}
         for stats in per_gpu:
             gpu_id = stats["gpu_id"]
-            data[f"rollout_batch/decode/{gpu_id}"] = counter_to_samples(stats["decode"])
-            data[f"rollout_batch/total/{gpu_id}"] = counter_to_samples(stats["total"])
-        self.logger.log_histogram(data, step=gen_step)
+            decode_hist, decode_calls = counter_to_histogram_raw(stats["decode"])
+            total_hist, total_calls = counter_to_histogram_raw(stats["total"])
+            if decode_hist is not None:
+                hist_data[f"rollout_batch/decode/{gpu_id}"] = decode_hist
+            if total_hist is not None:
+                hist_data[f"rollout_batch/total/{gpu_id}"] = total_hist
+            scalar_data[f"rollout_batch/decode_calls/{gpu_id}"] = decode_calls
+            scalar_data[f"rollout_batch/total_calls/{gpu_id}"] = total_calls
+        self.logger.log_histogram_raw(hist_data, step=gen_step)
+        self.logger.log(scalar_data, step=gen_step)
 
     @staticmethod
     @ray.remote

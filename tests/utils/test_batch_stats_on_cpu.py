@@ -15,9 +15,7 @@
 from collections import Counter
 from types import SimpleNamespace
 
-import numpy as np
-
-from verl.utils.vllm.batch_stats import counter_to_samples, record_forward
+from verl.utils.vllm.batch_stats import counter_to_histogram_raw, record_forward
 
 
 def _scheduler_output(num_scheduled_tokens):
@@ -58,15 +56,30 @@ def test_record_forward_missing_fields_is_noop():
     assert dict(decode) == {}
 
 
-def test_counter_to_samples_roundtrip():
-    samples = counter_to_samples({150: 2, 3: 1})
-    assert len(samples) == 3
-    assert sorted(samples.tolist()) == [3, 150, 150]
-    # The distribution of values matches the counter.
-    assert Counter(samples.tolist()) == Counter({150: 2, 3: 1})
+def test_counter_to_histogram_raw_normalizes_to_one():
+    # 3 forwards at width 2, 1 forward at width 4.
+    hist, n_calls = counter_to_histogram_raw({2: 3, 4: 1})
+    assert n_calls == 4
+    # Contiguous per-integer buckets over [2, 4]: values 2, 3, 4.
+    assert hist["min"] == 2.0 and hist["max"] == 4.0
+    assert hist["bucket_limits"] == [2.5, 3.5, 4.5]
+    assert hist["bucket_counts"] == [0.75, 0.0, 0.25]  # 3/4, gap, 1/4
+    assert abs(sum(hist["bucket_counts"]) - 1.0) < 1e-9
+    # Probability-mass convention: num=1, sum=mean.
+    assert hist["num"] == 1.0
+    assert abs(hist["sum"] - (2 * 0.75 + 4 * 0.25)) < 1e-9  # mean = 2.5
+    assert abs(hist["sum_squares"] - (4 * 0.75 + 16 * 0.25)) < 1e-9
+    assert len(hist["bucket_limits"]) == len(hist["bucket_counts"])
 
 
-def test_counter_to_samples_empty():
-    samples = counter_to_samples({})
-    assert isinstance(samples, np.ndarray)
-    assert len(samples) == 0
+def test_counter_to_histogram_raw_single_value():
+    hist, n_calls = counter_to_histogram_raw({190: 7})
+    assert n_calls == 7
+    assert hist["bucket_counts"] == [1.0]
+    assert hist["bucket_limits"] == [190.5]
+
+
+def test_counter_to_histogram_raw_empty():
+    hist, n_calls = counter_to_histogram_raw({})
+    assert hist is None
+    assert n_calls == 0
