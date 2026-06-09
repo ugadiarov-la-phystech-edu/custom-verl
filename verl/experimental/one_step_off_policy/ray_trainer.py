@@ -286,6 +286,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             return
         hist_data = {}
         scalar_data = {}
+        tokens_generated_total = 0
         for stats in per_gpu:
             gpu_id = stats["gpu_id"]
             # Histograms over batch size: number of forward calls, and total forward time.
@@ -305,6 +306,13 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             scalar_data[f"rollout_batch/total_calls/{gpu_id}"] = total_calls
             # Total forward wall time (seconds); also the normalizer for the time histograms.
             scalar_data[f"rollout_batch/forward_time_total/{gpu_id}"] = forward_time_total
+            # Tokens generated on this GPU = sum over forwards of (#sequences decoding a token),
+            # i.e. the decode-count histogram weighted by batch size.
+            gpu_tokens = sum(batch_size * calls for batch_size, calls in stats["decode"].items())
+            scalar_data[f"rollout_batch/tokens_generated/{gpu_id}"] = gpu_tokens
+            tokens_generated_total += gpu_tokens
+        # Total tokens generated this generation phase (summed across all rollout GPUs).
+        scalar_data["rollout_batch/tokens_generated_total"] = tokens_generated_total
         self.logger.log_histogram_raw(hist_data, step=gen_step)
         self.logger.log(scalar_data, step=gen_step)
 
