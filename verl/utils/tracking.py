@@ -185,12 +185,13 @@ class Tracking:
             if backend is None or default_backend in backend:
                 logger_instance.log(data=data, step=step)
 
-    def log_histogram(self, data, step, backend=None):
-        """Log histograms ({tag: 1-D array of samples}). Only dispatched to backends
-        that implement ``log_histogram`` (currently TensorBoard); others are skipped."""
+    def log_histogram_raw(self, data, step, backend=None):
+        """Log pre-computed histograms ({tag: add_histogram_raw kwargs}). Only dispatched
+        to backends that implement ``log_histogram_raw`` (currently TensorBoard); others
+        are skipped."""
         for default_backend, logger_instance in self.logger.items():
-            if (backend is None or default_backend in backend) and hasattr(logger_instance, "log_histogram"):
-                logger_instance.log_histogram(data=data, step=step)
+            if (backend is None or default_backend in backend) and hasattr(logger_instance, "log_histogram_raw"):
+                logger_instance.log_histogram_raw(data=data, step=step)
 
     def __del__(self):
         if "wandb" in self.logger:
@@ -312,11 +313,11 @@ class _TensorboardAdapter:
         for key in data:
             self.writer.add_scalar(key, data[key], step)
 
-    def log_histogram(self, data, step):
-        for key, values in data.items():
-            if values is None or len(values) == 0:
+    def log_histogram_raw(self, data, step):
+        for key, hist_kwargs in data.items():
+            if not hist_kwargs:
                 continue
-            self.writer.add_histogram(key, values, step)
+            self.writer.add_histogram_raw(tag=key, global_step=step, **hist_kwargs)
 
     def finish(self):
         self.writer.close()

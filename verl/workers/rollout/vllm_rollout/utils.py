@@ -231,7 +231,11 @@ class vLLMColocateWorkerExtension:
         replica_rank = os.environ.get("VERL_REPLICA_RANK", "0")
         parallel_config = getattr(self.model_runner.vllm_config, "parallel_config", None)
         dp_rank = getattr(parallel_config, "data_parallel_rank", 0)
-        visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")[0]
+        visible_devices = [d for d in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if d != ""]
+        try:
+            visible = visible_devices[int(self.local_rank)]
+        except (IndexError, ValueError):
+            visible = visible_devices[0] if visible_devices else "?"
         return f"replica{replica_rank}_dp{dp_rank}_l{self.local_rank}_cuda{visible}"
 
     def init_batch_stats(self):
