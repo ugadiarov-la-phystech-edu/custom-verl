@@ -371,3 +371,21 @@ class LLMServerManager:
     async def stop_profile(self):
         """Stop profiling on all rollout replicas."""
         await asyncio.gather(*[replica.stop_profile() for replica in self.rollout_replicas])
+
+    @auto_await
+    async def init_batch_stats(self):
+        """Install the dormant per-forward batch-size recorder on every rollout worker."""
+        await asyncio.gather(*[server.collective_rpc.remote("init_batch_stats") for server in self.server_handles])
+
+    @auto_await
+    async def reset_batch_stats(self):
+        """Start-of-rollout: enable recording and clear histograms on every rollout worker."""
+        await asyncio.gather(*[server.collective_rpc.remote("reset_batch_stats") for server in self.server_handles])
+
+    @auto_await
+    async def collect_batch_stats(self) -> list[dict]:
+        """End-of-rollout: return one batch-size histogram dict per generation GPU."""
+        per_server = await asyncio.gather(
+            *[server.collective_rpc.remote("pop_batch_stats") for server in self.server_handles]
+        )
+        return [stats for server_results in per_server for stats in server_results if stats]

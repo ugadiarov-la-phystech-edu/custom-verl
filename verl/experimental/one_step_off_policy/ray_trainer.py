@@ -19,6 +19,7 @@ This trainer supports model-agonistic model initialization with huggingface
 """
 
 import asyncio
+import os
 import uuid
 from pprint import pprint
 from typing import Optional
@@ -43,6 +44,7 @@ from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference
 from verl.utils.debug import marked_timer
 from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.tracking import ValidationGenerationsLogger
+from verl.utils.vllm.batch_stats import counter_to_samples
 from verl.workers.rollout.llm_server import LLMServerManager
 
 
@@ -86,6 +88,8 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
 
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert not self.hybrid_engine
+
+        self._rollout_batch_stats = bool(os.environ.get("VERL_ROLLOUT_BATCH_STATS"))
 
         # Skip rollout worker mapping and let agentloop create it.
         role_worker_mapping.pop(Role.Rollout, None)
@@ -194,6 +198,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             reward_loop_worker_handles=reward_loop_worker_handles,
         )
 
+        if self._rollout_batch_stats:
+            self.llm_server_manager.init_batch_stats()
+
     def _create_continuous_iterator(self):
         """
         Create a continuous data iterator across epoch
@@ -231,8 +238,13 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         gen_batch_output = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
 
         # async generation
+        if self._rollout_batch_stats:
+            gen_step = self.global_steps
+            await self.llm_server_manager.reset_batch_stats()
         with marked_timer("generate_async", timing_raw, color="purple"):
             gen_batch_output = await self.async_rollout_manager.generate_sequences(gen_batch_output)
+        if self._rollout_batch_stats:
+            await self._log_rollout_batch_stats(gen_step)
 
         # repeat to align with repeated responses in rollout
         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
@@ -255,6 +267,23 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
 
         # Return the original, now-modified `batch` and the `future_reward`
         return metrics, timing_raw, epoch, batch, future_reward
+
+    async def _log_rollout_batch_stats(self, gen_step: int):
+        """Collect per-GPU forward batch-size histograms for the just-finished rollout
+        and log them to TensorBoard (HISTOGRAMS tab), keyed by the generation step."""
+        try:
+            per_gpu = await self.llm_server_manager.collect_batch_stats()
+        except Exception as e:
+            print(f"Failed to collect rollout batch stats: {e}")
+            return
+        if not per_gpu or self.logger is None:
+            return
+        data = {}
+        for stats in per_gpu:
+            gpu_id = stats["gpu_id"]
+            data[f"rollout_batch/decode/{gpu_id}"] = counter_to_samples(stats["decode"])
+            data[f"rollout_batch/total/{gpu_id}"] = counter_to_samples(stats["total"])
+        self.logger.log_histogram(data, step=gen_step)
 
     @staticmethod
     @ray.remote
