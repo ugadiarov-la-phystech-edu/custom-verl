@@ -185,6 +185,13 @@ class Tracking:
             if backend is None or default_backend in backend:
                 logger_instance.log(data=data, step=step)
 
+    def log_histogram(self, data, step, backend=None):
+        """Log histograms ({tag: 1-D array of samples}). Only dispatched to backends
+        that implement ``log_histogram`` (currently TensorBoard); others are skipped."""
+        for default_backend, logger_instance in self.logger.items():
+            if (backend is None or default_backend in backend) and hasattr(logger_instance, "log_histogram"):
+                logger_instance.log_histogram(data=data, step=step)
+
     def __del__(self):
         if "wandb" in self.logger:
             self.logger["wandb"].finish(exit_code=0)
@@ -304,6 +311,12 @@ class _TensorboardAdapter:
     def log(self, data, step):
         for key in data:
             self.writer.add_scalar(key, data[key], step)
+
+    def log_histogram(self, data, step):
+        for key, values in data.items():
+            if values is None or len(values) == 0:
+                continue
+            self.writer.add_histogram(key, values, step)
 
     def finish(self):
         self.writer.close()

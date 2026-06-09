@@ -18,6 +18,7 @@ import os
 import platform
 import signal
 import threading
+from collections import Counter
 from collections.abc import Mapping
 from types import MethodType
 from typing import Any, Literal, Optional, get_args
@@ -224,6 +225,64 @@ class vLLMColocateWorkerExtension:
             monkey_patch_compute_logits(model, vocab_size)
             # patch weight loader to support MoE model
             patch_vllm_moe_model_weight_loader(model)
+
+    def _batch_stats_gpu_id(self) -> str:
+        """Stable, human-readable identifier for the GPU this worker owns."""
+        replica_rank = os.environ.get("VERL_REPLICA_RANK", "0")
+        parallel_config = getattr(self.model_runner.vllm_config, "parallel_config", None)
+        dp_rank = getattr(parallel_config, "data_parallel_rank", 0)
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")[0]
+        return f"replica{replica_rank}_dp{dp_rank}_l{self.local_rank}_cuda{visible}"
+
+    def init_batch_stats(self):
+        """Install a dormant per-forward batch-size recorder on this worker.
+
+        Wraps ``model_runner.execute_model`` once; while ``self._bs_enabled`` is
+        False (the default) the wrapper only does a single boolean check, so the
+        feature has effectively zero overhead until the driver activates it via
+        ``reset_batch_stats``. Counts are reported per GPU through
+        ``pop_batch_stats``.
+        """
+        from verl.utils.vllm.batch_stats import record_forward
+
+        original_execute_model = getattr(self.model_runner, "execute_model", None)
+        if original_execute_model is None:
+            # Defensive: a vLLM rename should disable the diagnostic, not break generation.
+            logger.warning("init_batch_stats: model_runner has no execute_model; batch stats disabled.")
+            return
+
+        self._bs_enabled = False
+        self._bs_decode = Counter()
+        self._bs_total = Counter()
+        self._bs_gpu_id = self._batch_stats_gpu_id()
+
+        def execute_model(_self, scheduler_output, *args, **kwargs):
+            if self._bs_enabled:
+                record_forward(self._bs_decode, self._bs_total, scheduler_output)
+            return original_execute_model(scheduler_output, *args, **kwargs)
+
+        self.model_runner.execute_model = MethodType(execute_model, self.model_runner)
+
+    def reset_batch_stats(self):
+        """Start of a rollout: enable recording and clear the histograms."""
+        if not hasattr(self, "_bs_decode"):
+            return
+        self._bs_enabled = True
+        self._bs_decode.clear()
+        self._bs_total.clear()
+
+    def pop_batch_stats(self) -> dict:
+        """End of a rollout: return this GPU's histograms and clear them."""
+        if not hasattr(self, "_bs_decode"):
+            return {}
+        result = {
+            "gpu_id": self._bs_gpu_id,
+            "decode": dict(self._bs_decode),
+            "total": dict(self._bs_total),
+        }
+        self._bs_decode.clear()
+        self._bs_total.clear()
+        return result
 
     def update_weights_from_ipc(self, peft_config: dict = None, base_sync_done=False, use_shm: bool = False):
         """Update the weights of the rollout model."""
