@@ -32,6 +32,7 @@ import logging
 import os
 import random
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -471,11 +472,17 @@ class AgentLoopWorker:
                 mm_processor_kwargs["sampling_rate"] = int(sampling_rate)
         return mm_processor_kwargs
 
-    async def generate_sequences(self, batch: DataProto) -> DataProto:
+    async def generate_sequences(
+        self, batch: DataProto, batch_gate: ray.actor.ActorHandle = None
+    ) -> Optional[DataProto]:
         """Generate sequences from agent loop.
 
         Args:
             batch (DataProto): Input batch.
+            batch_gate (ray.actor.ActorHandle): Optional shared ``BatchGate`` for over-sample +
+                discard generation. When given, the worker stops as soon as the global target of
+                complete prompt-groups is reached and returns only its accepted (fastest) groups,
+                discarding the slow long-tail. When ``None`` (default), all sequences are generated.
 
         Returns:
             DataProto: Output batch.
@@ -558,11 +565,79 @@ class AgentLoopWorker:
                     self._run_agent_loop(sample_sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
                 )
             )
-        outputs = await asyncio.gather(*tasks)
+        if batch_gate is None:
+            outputs = await asyncio.gather(*tasks)
+            return self._postprocess(
+                outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
+            )
 
+        # Over-sample + discard: keep only the fastest complete prompt-groups (all n rollouts done),
+        # up to the global target enforced by the shared gate; cancel and discard the slow long-tail.
+        return await self._generate_with_early_stop(batch, tasks, batch_gate)
+
+    async def _generate_with_early_stop(
+        self, batch: DataProto, tasks: list, batch_gate: ray.actor.ActorHandle
+    ) -> Optional[DataProto]:
+        """Collect complete prompt-groups until the shared gate's global target is reached, then
+        cancel the rest. A prompt-group is the ``n`` rollouts that share a ``uid``; with
+        ``repeat(interleave=True)`` they are contiguous and the manager chunks on group boundaries,
+        so every uid in this chunk is intact (requires num_workers to divide the number of groups)."""
+        uids = batch.non_tensor_batch["uid"]
+        group_rows: dict = defaultdict(list)
+        for i in range(len(tasks)):
+            group_rows[uids[i]].append(i)
+        group_pending = {uid: set(rows) for uid, rows in group_rows.items()}
+
+        task_to_row = {t: i for i, t in enumerate(tasks)}
+        results: dict[int, Any] = {}
+        accepted_rows: list[int] = []
+
+        async def _await_ref(ref):
+            return await ref
+
+        done_signal = asyncio.create_task(_await_ref(batch_gate.wait_until_done.remote()))
+        pending = set(tasks)
+        stopped = False
+        while pending and not stopped:
+            finished, _ = await asyncio.wait(pending | {done_signal}, return_when=asyncio.FIRST_COMPLETED)
+            stopped = done_signal in finished
+            for t in finished:
+                if t is done_signal:
+                    continue
+                pending.discard(t)
+                i = task_to_row[t]
+                results[i] = t.result()
+                uid = uids[i]
+                group_pending[uid].discard(i)
+                if not group_pending[uid]:  # all n rollouts of this group finished
+                    accepted = await batch_gate.offer.remote()
+                    if accepted:
+                        accepted_rows.extend(group_rows[uid])
+
+        # Cancel the discarded long-tail; their in-flight vLLM requests are flushed by the
+        # trainer's abort_all_requests() once generation returns.
+        for t in pending:
+            t.cancel()
+        if not done_signal.done():
+            done_signal.cancel()
+        await asyncio.gather(*pending, done_signal, return_exceptions=True)
+
+        if not accepted_rows:
+            # This worker's groups all lost the global race (the target was filled by other
+            # workers): contribute nothing. The manager filters these None outputs before concat.
+            # (Returning partial/incomplete groups here would violate GRPO's complete-group invariant
+            # and overshoot train_batch_size.)
+            return None
+
+        inputs = [results[i] for i in accepted_rows]
+        rows_idx = np.array(accepted_rows)
+        sub_non_tensor = {k: v[rows_idx] for k, v in batch.non_tensor_batch.items()}
         output = self._postprocess(
-            outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
+            inputs, input_non_tensor_batch=sub_non_tensor, validate=batch.meta_info.get("validate", False)
         )
+        # Attach uid explicitly: the reward-loop postprocess path does not merge input_non_tensor_batch,
+        # and the trainer needs uid to re-align the surviving groups with their prompts.
+        output.non_tensor_batch["uid"] = np.array([uids[i] for i in accepted_rows], dtype=object)
         return output
 
     async def _run_agent_loop(
@@ -1110,13 +1185,26 @@ class AgentLoopManager:
         Returns:
             DataProto: Output batch.
         """
+        # Over-sample + discard: when the trainer over-samples prompts and asks to keep only the
+        # fastest `keep_complete_groups` complete groups, share one BatchGate across all workers so
+        # the global count is exact (not a per-worker approximation).
+        target = prompts.meta_info.get("keep_complete_groups", 0)
+        batch_gate = None
+        if target and target > 0:
+            from verl.experimental.agent_loop.batch_gate import BatchGate
+
+            batch_gate = BatchGate.remote(target)
+
         chunkes = prompts.chunk(len(self.agent_loop_workers))
         outputs = await asyncio.gather(
             *[
-                worker.generate_sequences.remote(chunk)
+                worker.generate_sequences.remote(chunk, batch_gate)
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
             ]
         )
+        if batch_gate is not None:
+            # Over-sample + discard: drop workers whose groups all lost the global race (None).
+            outputs = [o for o in outputs if o is not None]
         output = DataProto.concat(outputs)
 
         # calculate performance metrics

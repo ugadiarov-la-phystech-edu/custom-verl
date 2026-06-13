@@ -48,6 +48,13 @@ from verl.utils.vllm.batch_stats import build_cdf_figure, counter_to_histogram_r
 from verl.workers.rollout.llm_server import LLMServerManager
 
 
+def _env_flag(name: str) -> bool:
+    """Parse a boolean env var. True only for "1"/"true"/"yes" (case-insensitive); unset, empty,
+    "0", "false", etc. are False. Avoids the ``bool(os.environ.get(...))`` pitfall where the string
+    "0" is truthy."""
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
+
+
 class OneStepOffRayTrainer(SeparateRayPPOTrainer):
     def __init__(
         self,
@@ -90,8 +97,15 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         assert not self.hybrid_engine
 
         # Optional diagnostic: per-GPU, per-rollout vLLM forward batch-size histograms.
-        # Enabled by setting VERL_ROLLOUT_BATCH_STATS; zero overhead when unset.
-        self._rollout_batch_stats = bool(os.environ.get("VERL_ROLLOUT_BATCH_STATS"))
+        # Enabled by setting VERL_ROLLOUT_BATCH_STATS=1; off when unset/0/false.
+        self._rollout_batch_stats = _env_flag("VERL_ROLLOUT_BATCH_STATS")
+
+        # Optional: over-sample + discard-slow-tail generation. With data.gen_batch_size =
+        # k * train_batch_size, generate k*train_batch_size prompt-groups and keep only the fastest
+        # train_batch_size complete groups, aborting the slow long-tail. Trades wasted generation
+        # FLOPs and a short-completion selection bias for lower per-step generation latency.
+        # Enabled by VERL_OVERSAMPLE_DISCARD=1; off when unset/0/false.
+        self._oversample_discard = _env_flag("VERL_OVERSAMPLE_DISCARD")
 
         # Skip rollout worker mapping and let agentloop create it.
         role_worker_mapping.pop(Role.Rollout, None)
@@ -240,6 +254,11 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         gen_batch.meta_info["global_steps"] = self.global_steps
         gen_batch_output = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
 
+        if self._oversample_discard:
+            # Keep only the fastest train_batch_size complete groups; discard the rest. gen_batch
+            # holds the over-sampled k*train_batch_size prompts (via data.gen_batch_size).
+            gen_batch_output.meta_info["keep_complete_groups"] = self.config.data.train_batch_size
+
         # async generation
         if self._rollout_batch_stats:
             # Bracket this rollout so each generation GPU records a fresh forward
@@ -249,8 +268,23 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             await self.llm_server_manager.reset_batch_stats()
         with marked_timer("generate_async", timing_raw, color="purple"):
             gen_batch_output = await self.async_rollout_manager.generate_sequences(gen_batch_output)
+        if self._oversample_discard:
+            # Flush the discarded long-tail's in-flight vLLM requests, then re-arm the engine
+            # (abort_all_requests leaves the engine paused on vLLM >= 0.12).
+            await self.llm_server_manager.abort_all_requests()
+            await self.llm_server_manager.resume_generation()
         if self._rollout_batch_stats:
             await self._log_rollout_batch_stats(gen_step)
+
+        if self._oversample_discard:
+            # gen_batch_output holds only the surviving train_batch_size groups (uid attached).
+            # Select the matching prompts from the over-sampled batch, in surviving-group order,
+            # so the positional union below aligns each rollout with its prompt.
+            ordered_uids = list(dict.fromkeys(gen_batch_output.non_tensor_batch["uid"].tolist()))
+            uid_to_row = {uid: row for row, uid in enumerate(batch.non_tensor_batch["uid"])}
+            batch = batch.select_idxs([uid_to_row[uid] for uid in ordered_uids])
+            # Drop uid from the generation output to avoid a union key conflict (batch supplies uid).
+            gen_batch_output.non_tensor_batch.pop("uid", None)
 
         # repeat to align with repeated responses in rollout
         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
