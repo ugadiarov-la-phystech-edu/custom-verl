@@ -193,6 +193,13 @@ class Tracking:
             if (backend is None or default_backend in backend) and hasattr(logger_instance, "log_histogram_raw"):
                 logger_instance.log_histogram_raw(data=data, step=step)
 
+    def log_figure(self, data, step, backend=None):
+        """Log matplotlib figures ({tag: Figure}). Only dispatched to backends that implement
+        ``log_figure`` (currently TensorBoard); others are skipped."""
+        for default_backend, logger_instance in self.logger.items():
+            if (backend is None or default_backend in backend) and hasattr(logger_instance, "log_figure"):
+                logger_instance.log_figure(data=data, step=step)
+
     def __del__(self):
         if "wandb" in self.logger:
             self.logger["wandb"].finish(exit_code=0)
@@ -318,6 +325,12 @@ class _TensorboardAdapter:
             if not hist_kwargs:
                 continue
             self.writer.add_histogram_raw(tag=key, global_step=step, **hist_kwargs)
+
+    def log_figure(self, data, step):
+        for key, figure in data.items():
+            if figure is None:
+                continue
+            self.writer.add_figure(tag=key, figure=figure, global_step=step)
 
     def finish(self):
         self.writer.close()

@@ -96,3 +96,61 @@ def counter_to_histogram_raw(counter: dict) -> tuple[Optional[dict], float]:
         "bucket_counts": probs,
     }
     return hist_kwargs, total
+
+
+def counter_to_cdf(counter: dict) -> tuple[list[float], list[float]]:
+    """Turn a histogram Counter ({batch_size: weight}) into an empirical cumulative
+    distribution function (CDF), normalized so the right-most value is 1.
+
+    Returns ``(xs, ys)`` where ``xs`` are the distinct observed batch sizes in ascending
+    order and ``ys[i] = (sum of weights for batch size <= xs[i]) / total``, so ``ys[-1] == 1``.
+    No binning / no zero-fill: each point is an exact observed batch size. The weight per
+    batch size is either a call count (int) or accumulated forward time (float); the function
+    works for both. Returns ``([], [])`` for an empty counter.
+    """
+    total = sum(counter.values())
+    if total == 0:
+        return [], []
+    xs = sorted(counter)
+    ys = []
+    running = 0.0
+    for x in xs:
+        running += counter[x]
+        ys.append(running / total)
+    return [float(x) for x in xs], ys
+
+
+def build_cdf_figure(title: str, xlabel: str, curves: list[tuple[str, dict]]):
+    """Build a matplotlib step-line CDF figure overlaying one curve per ``(label, counter)``.
+
+    Each counter is turned into an empirical CDF via :func:`counter_to_cdf` and plotted as a
+    step line (batch size on x, cumulative fraction <= x on y, rising to 1). Intended for
+    ``SummaryWriter.add_figure`` (TensorBoard IMAGES tab).
+
+    matplotlib is imported lazily (with the headless ``Agg`` backend) so that importing this
+    module on the rollout workers stays light and a missing matplotlib is a silent no-op:
+    returns ``None`` on ``ImportError`` or when every curve is empty.
+    """
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except ImportError:
+        return None
+
+    plotted = [(label, *counter_to_cdf(counter)) for label, counter in curves]
+    plotted = [(label, xs, ys) for label, xs, ys in plotted if xs]
+    if not plotted:
+        return None
+
+    fig, ax = plt.subplots()
+    for label, xs, ys in plotted:
+        ax.step(xs, ys, where="post", label=label)
+    ax.set_title(title)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("cumulative fraction (<= x)")
+    ax.set_ylim(0, 1.05)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    return fig
