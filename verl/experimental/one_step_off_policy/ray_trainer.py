@@ -48,6 +48,13 @@ from verl.utils.vllm.batch_stats import build_cdf_figure, counter_to_histogram_r
 from verl.workers.rollout.llm_server import LLMServerManager
 
 
+def _env_flag(name: str) -> bool:
+    """Parse a boolean env var. True only for "1"/"true"/"yes" (case-insensitive); unset, empty,
+    "0", "false", etc. are False. Avoids the ``bool(os.environ.get(...))`` pitfall where the string
+    "0" is truthy."""
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
+
+
 class OneStepOffRayTrainer(SeparateRayPPOTrainer):
     def __init__(
         self,
@@ -89,7 +96,9 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         self.hybrid_engine = config.actor_rollout_ref.hybrid_engine
         assert not self.hybrid_engine
 
-        self._rollout_batch_stats = bool(os.environ.get("VERL_ROLLOUT_BATCH_STATS"))
+        self._rollout_batch_stats = _env_flag("VERL_ROLLOUT_BATCH_STATS")
+
+        self._oversample_discard = _env_flag("VERL_OVERSAMPLE_DISCARD")
 
         # Skip rollout worker mapping and let agentloop create it.
         role_worker_mapping.pop(Role.Rollout, None)
@@ -237,14 +246,26 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         gen_batch.meta_info["global_steps"] = self.global_steps
         gen_batch_output = gen_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
 
+        if self._oversample_discard:
+            gen_batch_output.meta_info["keep_complete_groups"] = self.config.data.train_batch_size
+
         # async generation
         if self._rollout_batch_stats:
             gen_step = self.global_steps
             await self.llm_server_manager.reset_batch_stats()
         with marked_timer("generate_async", timing_raw, color="purple"):
             gen_batch_output = await self.async_rollout_manager.generate_sequences(gen_batch_output)
+        if self._oversample_discard:
+            await self.llm_server_manager.abort_all_requests()
+            await self.llm_server_manager.resume_generation()
         if self._rollout_batch_stats:
             await self._log_rollout_batch_stats(gen_step)
+
+        if self._oversample_discard:
+            ordered_uids = list(dict.fromkeys(gen_batch_output.non_tensor_batch["uid"].tolist()))
+            uid_to_row = {uid: row for row, uid in enumerate(batch.non_tensor_batch["uid"])}
+            batch = batch.select_idxs([uid_to_row[uid] for uid in ordered_uids])
+            gen_batch_output.non_tensor_batch.pop("uid", None)
 
         # repeat to align with repeated responses in rollout
         batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)

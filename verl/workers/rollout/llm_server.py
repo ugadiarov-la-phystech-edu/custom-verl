@@ -373,6 +373,20 @@ class LLMServerManager:
         await asyncio.gather(*[replica.stop_profile() for replica in self.rollout_replicas])
 
     @auto_await
+    async def abort_all_requests(self):
+        """Abort and discard all in-flight generation requests on every rollout replica.
+
+        Used by over-sample + discard generation to flush the slow long-tail once enough fast
+        groups are collected. On vLLM >= 0.12 this leaves the engine paused, so callers must pair
+        it with ``resume_generation`` before the next generation round."""
+        await asyncio.gather(*[replica.abort_all_requests() for replica in self.rollout_replicas])
+
+    @auto_await
+    async def resume_generation(self):
+        """Resume generation on every rollout replica after ``abort_all_requests``."""
+        await asyncio.gather(*[replica.resume_generation() for replica in self.rollout_replicas])
+
+    @auto_await
     async def init_batch_stats(self):
         """Install the dormant per-forward batch-size recorder on every rollout worker."""
         await asyncio.gather(*[server.collective_rpc.remote("init_batch_stats") for server in self.server_handles])
