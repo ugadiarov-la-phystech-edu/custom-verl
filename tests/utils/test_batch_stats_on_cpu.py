@@ -15,7 +15,13 @@
 from collections import Counter
 from types import SimpleNamespace
 
-from verl.utils.vllm.batch_stats import counter_to_histogram_raw, forward_batch_sizes, record_forward
+from verl.utils.vllm.batch_stats import (
+    build_cdf_figure,
+    counter_to_cdf,
+    counter_to_histogram_raw,
+    forward_batch_sizes,
+    record_forward,
+)
 
 
 def _scheduler_output(num_scheduled_tokens):
@@ -87,3 +93,34 @@ def test_counter_to_histogram_raw_float_weights():
     expected = [0.75, 0.0, 0.25]  # 0.6/0.8, gap, 0.2/0.8
     assert all(abs(a - b) < 1e-9 for a, b in zip(hist["bucket_counts"], expected, strict=True))
     assert abs(sum(hist["bucket_counts"]) - 1.0) < 1e-9
+
+
+def test_counter_to_cdf_normalizes_to_one():
+    # 3 forwards at width 2, 1 forward at width 4: CDF over distinct observed sizes.
+    xs, ys = counter_to_cdf({2: 3, 4: 1})
+    assert xs == [2.0, 4.0]  # exact observed batch sizes, no zero-fill
+    assert all(abs(a - b) < 1e-9 for a, b in zip(ys, [0.75, 1.0], strict=True))
+    assert ys[-1] == 1.0
+
+
+def test_counter_to_cdf_single_value():
+    xs, ys = counter_to_cdf({190: 7})
+    assert xs == [190.0]
+    assert ys == [1.0]
+
+
+def test_counter_to_cdf_empty():
+    assert counter_to_cdf({}) == ([], [])
+
+
+def test_counter_to_cdf_float_weights():
+    # Time-weighted counter ({batch_size: seconds}); normalizes the same way.
+    xs, ys = counter_to_cdf({2: 0.6, 4: 0.2})
+    assert xs == [2.0, 4.0]
+    assert all(abs(a - b) < 1e-9 for a, b in zip(ys, [0.75, 1.0], strict=True))
+    assert ys[-1] == 1.0
+
+
+def test_build_cdf_figure_all_empty_is_none():
+    # No data on any curve -> None (also None if matplotlib is unavailable).
+    assert build_cdf_figure("t", "x", [("a", {}), ("b", {})]) is None

@@ -44,7 +44,7 @@ from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference
 from verl.utils.debug import marked_timer
 from verl.utils.import_utils import load_class_from_fqn
 from verl.utils.tracking import ValidationGenerationsLogger
-from verl.utils.vllm.batch_stats import counter_to_histogram_raw
+from verl.utils.vllm.batch_stats import build_cdf_figure, counter_to_histogram_raw
 from verl.workers.rollout.llm_server import LLMServerManager
 
 
@@ -285,6 +285,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         if not per_gpu or self.logger is None:
             return
         hist_data = {}
+        figure_data = {}
         scalar_data = {}
         tokens_generated_total = 0
         for stats in per_gpu:
@@ -302,6 +303,22 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
                 hist_data[f"rollout_batch/decode_time/{gpu_id}"] = decode_time_hist
             if total_time_hist is not None:
                 hist_data[f"rollout_batch/total_time/{gpu_id}"] = total_time_hist
+            # Cumulative (CDF) line plots: fraction of forward calls / forward time at batch
+            # sizes <= x (rises to 1). Logged as matplotlib figures to the IMAGES tab.
+            calls_fig = build_cdf_figure(
+                f"forward-call CDF - {gpu_id}",
+                "batch size",
+                [("decode", stats["decode"]), ("total", stats["total"])],
+            )
+            time_fig = build_cdf_figure(
+                f"forward-time CDF - {gpu_id}",
+                "batch size",
+                [("decode_time", stats["decode_time"]), ("total_time", stats["total_time"])],
+            )
+            if calls_fig is not None:
+                figure_data[f"rollout_batch/calls_cdf/{gpu_id}"] = calls_fig
+            if time_fig is not None:
+                figure_data[f"rollout_batch/time_cdf/{gpu_id}"] = time_fig
             scalar_data[f"rollout_batch/decode_calls/{gpu_id}"] = decode_calls
             scalar_data[f"rollout_batch/total_calls/{gpu_id}"] = total_calls
             # Total forward wall time (seconds); also the normalizer for the time histograms.
@@ -314,6 +331,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         # Total tokens generated this generation phase (summed across all rollout GPUs).
         scalar_data["rollout_batch/tokens_generated_total"] = tokens_generated_total
         self.logger.log_histogram_raw(hist_data, step=gen_step)
+        self.logger.log_figure(figure_data, step=gen_step)
         self.logger.log(scalar_data, step=gen_step)
 
     @staticmethod
