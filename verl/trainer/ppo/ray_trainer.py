@@ -68,9 +68,17 @@ from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_
 from verl.utils.skip.skip_manager import SkipManager
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
+from verl.utils.vllm.batch_stats import build_cdf_figure, counter_to_histogram_raw
 from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.rollout.llm_server import LLMServerManager
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
+
+def _env_flag(name: str) -> bool:
+    """Parse a boolean env var. True only for "1"/"true"/"yes" (case-insensitive); unset, empty,
+    "0", "false", etc. are False. Avoids the ``bool(os.environ.get(...))`` pitfall where the string
+    "0" is truthy."""
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -366,6 +374,15 @@ class RayPPOTrainer:
 
         self.use_prefix_grouper = self.config.actor_rollout_ref.actor.get("use_prefix_grouper", False)
 
+        self._rollout_batch_stats = _env_flag("VERL_ROLLOUT_BATCH_STATS")
+
+        self._oversample_discard = _env_flag("VERL_OVERSAMPLE_DISCARD")
+        if self._oversample_discard and self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+            raise ValueError(
+                "VERL_OVERSAMPLE_DISCARD=1 is incompatible with adv_estimator=remax "
+                "(REMAX's greedy-baseline slice cannot be reconciled with the discard gate)."
+            )
+
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
         self.checkpoint_manager = None
@@ -587,6 +604,61 @@ class RayPPOTrainer:
         gen_batch.non_tensor_batch.update(batch.non_tensor_batch)
 
         return gen_batch
+
+    def _log_rollout_batch_stats(self, step: int, logger):
+        """Collect per-GPU forward batch-size statistics for the just-finished rollout and log them
+        to TensorBoard: histograms (HISTOGRAMS tab), cumulative (CDF) figures (IMAGES tab), and
+        scalar counts/timings, all keyed by the generation ``step``. Synchronous: ``collect_batch_stats``
+        is ``@auto_await`` so a plain call runs it to completion when there is no running event loop."""
+        try:
+            per_gpu = self.llm_server_manager.collect_batch_stats()
+        except Exception as e:
+            print(f"Failed to collect rollout batch stats: {e}")
+            return
+        if not per_gpu or logger is None:
+            return
+        hist_data = {}
+        figure_data = {}
+        scalar_data = {}
+        tokens_generated_total = 0
+        for stats in per_gpu:
+            gpu_id = stats["gpu_id"]
+            decode_hist, decode_calls = counter_to_histogram_raw(stats["decode"])
+            total_hist, total_calls = counter_to_histogram_raw(stats["total"])
+            decode_time_hist, _ = counter_to_histogram_raw(stats["decode_time"])
+            total_time_hist, forward_time_total = counter_to_histogram_raw(stats["total_time"])
+            if decode_hist is not None:
+                hist_data[f"rollout_batch/decode/{gpu_id}"] = decode_hist
+            if total_hist is not None:
+                hist_data[f"rollout_batch/total/{gpu_id}"] = total_hist
+            if decode_time_hist is not None:
+                hist_data[f"rollout_batch/decode_time/{gpu_id}"] = decode_time_hist
+            if total_time_hist is not None:
+                hist_data[f"rollout_batch/total_time/{gpu_id}"] = total_time_hist
+            calls_fig = build_cdf_figure(
+                f"forward-call CDF - {gpu_id}",
+                "batch size",
+                [("decode", stats["decode"]), ("total", stats["total"])],
+            )
+            time_fig = build_cdf_figure(
+                f"forward-time CDF - {gpu_id}",
+                "batch size",
+                [("decode_time", stats["decode_time"]), ("total_time", stats["total_time"])],
+            )
+            if calls_fig is not None:
+                figure_data[f"rollout_batch/calls_cdf/{gpu_id}"] = calls_fig
+            if time_fig is not None:
+                figure_data[f"rollout_batch/time_cdf/{gpu_id}"] = time_fig
+            scalar_data[f"rollout_batch/decode_calls/{gpu_id}"] = decode_calls
+            scalar_data[f"rollout_batch/total_calls/{gpu_id}"] = total_calls
+            scalar_data[f"rollout_batch/forward_time_total/{gpu_id}"] = forward_time_total
+            gpu_tokens = sum(batch_size * calls for batch_size, calls in stats["decode"].items())
+            scalar_data[f"rollout_batch/tokens_generated/{gpu_id}"] = gpu_tokens
+            tokens_generated_total += gpu_tokens
+        scalar_data["rollout_batch/tokens_generated_total"] = tokens_generated_total
+        logger.log_histogram_raw(hist_data, step=step)
+        logger.log_figure(figure_data, step=step)
+        logger.log(scalar_data, step=step)
 
     def _compute_reward_colocate(self, batch: DataProto) -> tuple[torch.Tensor, dict[str, Any]] | torch.Tensor:
         """
@@ -942,6 +1014,9 @@ class RayPPOTrainer:
         self.llm_server_manager = LLMServerManager.create(
             config=self.config, worker_group=self.actor_rollout_wg, rollout_resource_pool=actor_rollout_resource_pool
         )
+
+        if self._rollout_batch_stats:
+            self.llm_server_manager.init_batch_stats()
 
         # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
         # to stream reward computation with actor rollout
@@ -1460,6 +1535,8 @@ class RayPPOTrainer:
                 else:
                     combined_gen_batch = gen_batch_output
                     num_sampled_prompts = len(gen_batch_output)
+                    if self._oversample_discard:
+                        combined_gen_batch.meta_info["keep_complete_groups"] = self.config.data.train_batch_size
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
@@ -1467,31 +1544,45 @@ class RayPPOTrainer:
                     with marked_timer("gen", timing_raw, color="red"):
                         if curr_step_profile:
                             self.llm_server_manager.start_profile()
+                        if self._rollout_batch_stats:
+                            self.llm_server_manager.reset_batch_stats()
                         combined_gen_output = self.async_rollout_manager.generate_sequences(combined_gen_batch)
+                        if self._oversample_discard:
+                            self.llm_server_manager.abort_all_requests()
+                            self.llm_server_manager.resume_generation()
                         self.checkpoint_manager.sleep_replicas()
                         if curr_step_profile:
                             self.llm_server_manager.stop_profile()
 
                         timing_raw.update(combined_gen_output.meta_info["timing"])
                         combined_gen_output.meta_info.pop("timing", None)
+                        if self._rollout_batch_stats:
+                            self._log_rollout_batch_stats(self.global_steps, logger)
 
-                    gen_batch_output = combined_gen_output.slice(0, num_sampled_prompts)
-                    if "__do_sample__" in gen_batch_output.non_tensor_batch:
-                        gen_batch_output.pop(non_tensor_batch_keys=["__do_sample__"])
+                    if self._oversample_discard:
+                        gen_batch_output = combined_gen_output
+                        ordered_uids = list(dict.fromkeys(gen_batch_output.non_tensor_batch["uid"].tolist()))
+                        uid_to_row = {uid: row for row, uid in enumerate(batch.non_tensor_batch["uid"])}
+                        batch = batch.select_idxs([uid_to_row[uid] for uid in ordered_uids])
+                        gen_batch_output.non_tensor_batch.pop("uid", None)
+                    else:
+                        gen_batch_output = combined_gen_output.slice(0, num_sampled_prompts)
+                        if "__do_sample__" in gen_batch_output.non_tensor_batch:
+                            gen_batch_output.pop(non_tensor_batch_keys=["__do_sample__"])
 
-                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-                        gen_baseline_output = combined_gen_output.slice(num_sampled_prompts, None)
-                        if "__do_sample__" in gen_baseline_output.non_tensor_batch:
-                            gen_baseline_output.pop(non_tensor_batch_keys=["__do_sample__"])
+                        if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                            gen_baseline_output = combined_gen_output.slice(num_sampled_prompts, None)
+                            if "__do_sample__" in gen_baseline_output.non_tensor_batch:
+                                gen_baseline_output.pop(non_tensor_batch_keys=["__do_sample__"])
 
-                        if self.use_rm and "rm_scores" not in gen_baseline_output.batch.keys():
-                            baseline_reward = self._compute_reward_colocate(gen_baseline_output)
-                            gen_baseline_output = gen_baseline_output.union(baseline_reward)
+                            if self.use_rm and "rm_scores" not in gen_baseline_output.batch.keys():
+                                baseline_reward = self._compute_reward_colocate(gen_baseline_output)
+                                gen_baseline_output = gen_baseline_output.union(baseline_reward)
 
-                        reward_baseline_tensor = gen_baseline_output.batch["rm_scores"].sum(dim=-1)
-                        batch.batch["reward_baselines"] = reward_baseline_tensor
+                            reward_baseline_tensor = gen_baseline_output.batch["rm_scores"].sum(dim=-1)
+                            batch.batch["reward_baselines"] = reward_baseline_tensor
 
-                        del gen_baseline_output
+                            del gen_baseline_output
                     del combined_gen_batch, combined_gen_output
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
