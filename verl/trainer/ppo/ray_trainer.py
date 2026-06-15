@@ -383,6 +383,54 @@ class RayPPOTrainer:
                 "(REMAX's greedy-baseline slice cannot be reconciled with the discard gate)."
             )
 
+        self._partial_rollout = _env_flag("VERL_PARTIAL_ROLLOUT")
+        self._carry_pool: dict = {}
+        if self._partial_rollout:
+            if self._oversample_discard:
+                raise ValueError(
+                    "VERL_PARTIAL_ROLLOUT=1 and VERL_OVERSAMPLE_DISCARD=1 are mutually exclusive: both "
+                    "consume the over-sampled long-tail (discard throws it away, partial-rollout carries "
+                    "it forward). Set exactly one."
+                )
+            if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                raise ValueError(
+                    "VERL_PARTIAL_ROLLOUT=1 is incompatible with adv_estimator=remax "
+                    "(REMAX's greedy-baseline slice cannot be reconciled with the per-uid carry gate)."
+                )
+            gen_bs = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
+            if gen_bs <= self.config.data.train_batch_size:
+                raise ValueError(
+                    "VERL_PARTIAL_ROLLOUT=1 requires data.gen_batch_size > data.train_batch_size (got "
+                    f"gen_batch_size={gen_bs}, train_batch_size={self.config.data.train_batch_size}); "
+                    "otherwise there is no over-sampled tail to carry."
+                )
+            agent_cfg = self.config.actor_rollout_ref.rollout.get("agent", {})
+            if agent_cfg.get("default_agent_loop") != "single_turn_agent" or agent_cfg.get("agent_loop_config_path"):
+                raise ValueError(
+                    "VERL_PARTIAL_ROLLOUT=1 currently supports only the single-turn agent loop "
+                    "(partial capture of a mid-tool-call multi-turn rollout is not defined). Got "
+                    f"default_agent_loop={agent_cfg.get('default_agent_loop')!r}, "
+                    f"agent_loop_config_path={agent_cfg.get('agent_loop_config_path')!r}."
+                )
+            if not self.config.actor_rollout_ref.rollout.get("calculate_log_probs", False):
+                raise ValueError(
+                    "VERL_PARTIAL_ROLLOUT=1 requires actor_rollout_ref.rollout.calculate_log_probs=True: "
+                    "carried responses mix policy versions, so per-token rollout log-probs are needed as "
+                    "the behavior-policy denominator (Layer-1 correctness). Enable it (and optionally "
+                    "algorithm.rollout_correction for rollout importance sampling)."
+                )
+            if (
+                self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
+                % (self.config.data.train_batch_size)
+                != 0
+            ):
+                raise ValueError(
+                    "VERL_PARTIAL_ROLLOUT=1 requires data.gen_batch_size to be an integer multiple of "
+                    f"data.train_batch_size (got gen_batch_size={gen_bs}, "
+                    f"train_batch_size={self.config.data.train_batch_size}); the cold-start over-sample "
+                    "pulls gen_batch_size/train_batch_size dataloader batches on the first step."
+                )
+
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
         self.checkpoint_manager = None
@@ -422,9 +470,15 @@ class RayPPOTrainer:
 
         num_workers = self.config.data["dataloader_num_workers"]
 
+        train_loader_batch_size = (
+            self.config.data.train_batch_size
+            if getattr(self, "_partial_rollout", False)
+            else self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
+        )
+
         self.train_dataloader = StatefulDataLoader(
             dataset=self.train_dataset,
-            batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
+            batch_size=train_loader_batch_size,
             num_workers=num_workers,
             drop_last=True,
             collate_fn=collate_fn,
@@ -659,6 +713,132 @@ class RayPPOTrainer:
         logger.log_histogram_raw(hist_data, step=step)
         logger.log_figure(figure_data, step=step)
         logger.log(scalar_data, step=step)
+
+    @staticmethod
+    def _object_array(rows: list) -> np.ndarray:
+        """Build a 1-D object ndarray whose elements are the given (possibly ragged/empty) lists.
+        ``np.array(list_of_lists, dtype=object)`` collapses uniform-length (e.g. all-empty) rows into a
+        2-D array, which breaks per-row indexing in the agent loop; this always stays 1-D."""
+        arr = np.empty(len(rows), dtype=object)
+        for i, r in enumerate(rows):
+            arr[i] = r
+        return arr
+
+    def _carry_epoch_source(self):
+        """Yield one ``fresh-groups`` DataProto per training step for partial-rollout carry-over (one
+        epoch's worth). Each step draws ``train_batch_size`` fresh groups; the very first step of training
+        draws ``gen_batch_size`` (``k`` batches) to bootstrap the over-sampled pool. Uses a single
+        iterator so no sample is double-consumed; relies on ``self._carry_first_step`` for the one-time
+        cold-start over-sample."""
+        tbs = self.config.data.train_batch_size
+        k = self.config.data.get("gen_batch_size", tbs) // tbs
+        data_iter = iter(self.train_dataloader)
+        while True:
+            n_pull = k if self._carry_first_step else 1
+            parts = []
+            try:
+                for _ in range(n_pull):
+                    parts.append(DataProto.from_single_dict(next(data_iter)))
+            except StopIteration:
+                pass
+            self._carry_first_step = False
+            if not parts:
+                break
+            yield parts[0] if len(parts) == 1 else DataProto.concat(parts)
+
+    def _carry_build_gen_batch(self, new_groups: DataProto) -> DataProto:
+        """Register the fresh groups in the carry pool, then build the rollout-level generation batch:
+        every pooled group's ``n`` rollouts, each re-prefilled with its accumulated tokens via the
+        ``single_turn_carry`` agent loop. Stashes the reward-side per-group rows on
+        ``self._carry_pool_batch`` (consumed by :meth:`_carry_harvest`)."""
+        rollout_n = self.config.actor_rollout_ref.rollout.n
+        new_uids = [str(uuid.uuid4()) for _ in range(len(new_groups))]
+        new_groups.non_tensor_batch["uid"] = np.array(new_uids, dtype=object)
+        for row, uid in enumerate(new_uids):
+            self._carry_pool[uid] = {
+                "batch_row": new_groups.select_idxs([row]),
+                "rollouts": [{"ids": [], "logprobs": [], "finished": False} for _ in range(rollout_n)],
+                "depth": 0,
+            }
+        pool_uids = list(self._carry_pool.keys())
+        pool_batch = DataProto.concat([self._carry_pool[uid]["batch_row"] for uid in pool_uids])
+        gen_batch = self._get_gen_batch(pool_batch)
+        self._carry_pool_batch = pool_batch
+        self._carry_pool_uids = pool_uids
+        gen_rollouts = gen_batch.repeat(repeat_times=rollout_n, interleave=True)
+        prefix_ids, prefix_lps, carry_done = [], [], []
+        for uid in pool_uids:
+            for r in self._carry_pool[uid]["rollouts"]:
+                prefix_ids.append(list(r["ids"]))
+                prefix_lps.append(list(r["logprobs"]) if r["logprobs"] is not None else [])
+                carry_done.append(bool(r["finished"]))
+        gen_rollouts.non_tensor_batch["agent_name"] = np.array(["single_turn_carry"] * len(gen_rollouts), dtype=object)
+        gen_rollouts.non_tensor_batch["prefix_response_ids"] = self._object_array(prefix_ids)
+        gen_rollouts.non_tensor_batch["prefix_logprobs"] = self._object_array(prefix_lps)
+        gen_rollouts.non_tensor_batch["carry_done"] = np.array(carry_done, dtype=bool)
+        gen_rollouts.meta_info["keep_complete_groups"] = self.config.data.train_batch_size
+        gen_rollouts.meta_info["partial_carry"] = True
+        return gen_rollouts
+
+    def _carry_harvest(self, combined_gen_output: DataProto):
+        """Split the generation output into harvested complete groups (train this step) and carried
+        groups (resume next step). Updates ``self._carry_pool`` in place and returns
+        ``(batch_prompt_side, gen_batch_output, carry_metrics)`` where ``batch_prompt_side`` is one
+        reward-side row per harvested group (the caller repeats by ``n`` and unions)."""
+        rollout_n = self.config.actor_rollout_ref.rollout.n
+        roles = combined_gen_output.non_tensor_batch["__carry_role__"]
+        out_uids = combined_gen_output.non_tensor_batch["uid"]
+        harvest_idx = [i for i in range(len(roles)) if roles[i] == "harvest"]
+        carry_idx = [i for i in range(len(roles)) if roles[i] == "carry"]
+
+        response_length = combined_gen_output.batch["responses"].shape[1]
+        eos_id = self.tokenizer.eos_token_id
+        has_lp = "rollout_log_probs" in combined_gen_output.batch
+
+        carried_by_uid = defaultdict(list)
+        for i in carry_idx:
+            carried_by_uid[out_uids[i]].append(i)
+        survivors: dict = {}
+        n_force_finished = 0
+        carry_depths = []
+        for uid, rows in carried_by_uid.items():
+            if uid not in self._carry_pool or len(rows) != rollout_n:
+                continue
+            entry = self._carry_pool[uid]
+            new_rollouts = []
+            for i in rows:
+                resp = combined_gen_output.batch["responses"][i]
+                length = int(combined_gen_output.batch["response_mask"][i].sum().item())
+                ids = resp[:length].tolist()
+                lps = combined_gen_output.batch["rollout_log_probs"][i][:length].tolist() if has_lp else None
+                hit_eos = length > 0 and ids[-1] == eos_id
+                finished = length >= response_length or hit_eos
+                if length >= response_length and not hit_eos:
+                    n_force_finished += 1
+                new_rollouts.append({"ids": ids, "logprobs": lps, "finished": finished})
+            entry["rollouts"] = new_rollouts
+            entry["depth"] = entry.get("depth", 0) + 1
+            carry_depths.append(entry["depth"])
+            survivors[uid] = entry
+        self._carry_pool = survivors
+
+        gen_batch_output = combined_gen_output.select_idxs(harvest_idx)
+        ordered = list(dict.fromkeys(gen_batch_output.non_tensor_batch["uid"].tolist()))
+        uid_to_row = {uid: row for row, uid in enumerate(self._carry_pool_uids)}
+        batch = self._carry_pool_batch.select_idxs([uid_to_row[uid] for uid in ordered])
+        for col in ("uid", "__carry_role__", "prefix_response_ids", "prefix_logprobs", "carry_done", "agent_name"):
+            gen_batch_output.non_tensor_batch.pop(col, None)
+
+        carry_metrics = {
+            "rollout_carry/carried_groups": len(survivors),
+            "rollout_carry/harvested_groups": len(ordered),
+            "rollout_carry/pool_groups": len(self._carry_pool_uids),
+            "rollout_carry/force_finished_rollouts": n_force_finished,
+        }
+        if carry_depths:
+            carry_metrics["rollout_carry/carry_depth_mean"] = float(np.mean(carry_depths))
+            carry_metrics["rollout_carry/carry_depth_max"] = float(np.max(carry_depths))
+        return batch, gen_batch_output, carry_metrics
 
     def _compute_reward_colocate(self, batch: DataProto) -> tuple[torch.Tensor, dict[str, Any]] | torch.Tensor:
         """
@@ -1028,6 +1208,7 @@ class RayPPOTrainer:
             llm_client=self.llm_server_manager.get_client(),
             teacher_client=self.teacher_model_manager.get_client() if self.use_teacher_policy else None,
             reward_loop_worker_handles=reward_loop_worker_handles,
+            server_manager=self.llm_server_manager if getattr(self, "_partial_rollout", False) else None,
         )
 
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
@@ -1494,8 +1675,9 @@ class RayPPOTrainer:
         )
         next_step_profile = False
 
+        self._carry_first_step = True
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
-            for batch_dict in self.train_dataloader:
+            for batch_dict in self._carry_epoch_source() if self._partial_rollout else self.train_dataloader:
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
                 metrics = {}
@@ -1507,36 +1689,44 @@ class RayPPOTrainer:
                         if self.config.global_profiler.profile_continuous_steps
                         else curr_step_profile
                     )
-                batch: DataProto = DataProto.from_single_dict(batch_dict)
-                batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
-
-                # add uid to batch
-                batch.non_tensor_batch["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
-                )
-
-                gen_batch = self._get_gen_batch(batch)
-
-                # pass global_steps to trace
-                gen_batch.meta_info["global_steps"] = self.global_steps
                 rollout_n = self.config.actor_rollout_ref.rollout.n
-                gen_batch_output = gen_batch.repeat(repeat_times=rollout_n, interleave=True)
-
-                if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-                    # NOTE: REMAX needs one sampled rollout plus one greedy baseline per prompt.
-                    # Keep them in a single agent-loop/vLLM request to avoid sending a second
-                    # rollout after replicas have been put to sleep, which can leave async vLLM
-                    # engines in an invalid state for multi-turn agent workloads.
-                    gen_batch_output.non_tensor_batch["__do_sample__"] = np.ones(len(gen_batch_output), dtype=bool)
-                    gen_baseline_batch = gen_batch.slice(0, None)
-                    gen_baseline_batch.non_tensor_batch["__do_sample__"] = np.zeros(len(gen_baseline_batch), dtype=bool)
-                    combined_gen_batch = DataProto.concat([gen_batch_output, gen_baseline_batch])
-                    num_sampled_prompts = len(gen_batch_output)
+                if self._partial_rollout:
+                    batch: DataProto = batch_dict
+                    batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+                    combined_gen_batch = self._carry_build_gen_batch(batch)
+                    combined_gen_batch.meta_info["global_steps"] = self.global_steps
                 else:
-                    combined_gen_batch = gen_batch_output
-                    num_sampled_prompts = len(gen_batch_output)
-                    if self._oversample_discard:
-                        combined_gen_batch.meta_info["keep_complete_groups"] = self.config.data.train_batch_size
+                    batch: DataProto = DataProto.from_single_dict(batch_dict)
+                    batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+
+                    # add uid to batch
+                    batch.non_tensor_batch["uid"] = np.array(
+                        [str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object
+                    )
+
+                    gen_batch = self._get_gen_batch(batch)
+
+                    # pass global_steps to trace
+                    gen_batch.meta_info["global_steps"] = self.global_steps
+                    gen_batch_output = gen_batch.repeat(repeat_times=rollout_n, interleave=True)
+
+                    if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+                        # NOTE: REMAX needs one sampled rollout plus one greedy baseline per prompt.
+                        # Keep them in a single agent-loop/vLLM request to avoid sending a second
+                        # rollout after replicas have been put to sleep, which can leave async vLLM
+                        # engines in an invalid state for multi-turn agent workloads.
+                        gen_batch_output.non_tensor_batch["__do_sample__"] = np.ones(len(gen_batch_output), dtype=bool)
+                        gen_baseline_batch = gen_batch.slice(0, None)
+                        gen_baseline_batch.non_tensor_batch["__do_sample__"] = np.zeros(
+                            len(gen_baseline_batch), dtype=bool
+                        )
+                        combined_gen_batch = DataProto.concat([gen_batch_output, gen_baseline_batch])
+                        num_sampled_prompts = len(gen_batch_output)
+                    else:
+                        combined_gen_batch = gen_batch_output
+                        num_sampled_prompts = len(gen_batch_output)
+                        if self._oversample_discard:
+                            combined_gen_batch.meta_info["keep_complete_groups"] = self.config.data.train_batch_size
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
@@ -1550,6 +1740,8 @@ class RayPPOTrainer:
                         if self._oversample_discard:
                             self.llm_server_manager.abort_all_requests()
                             self.llm_server_manager.resume_generation()
+                        if self._partial_rollout:
+                            self.llm_server_manager.resume_generation()
                         self.checkpoint_manager.sleep_replicas()
                         if curr_step_profile:
                             self.llm_server_manager.stop_profile()
@@ -1559,7 +1751,10 @@ class RayPPOTrainer:
                         if self._rollout_batch_stats:
                             self._log_rollout_batch_stats(self.global_steps, logger)
 
-                    if self._oversample_discard:
+                    if self._partial_rollout:
+                        batch, gen_batch_output, carry_metrics = self._carry_harvest(combined_gen_output)
+                        metrics.update(carry_metrics)
+                    elif self._oversample_discard:
                         gen_batch_output = combined_gen_output
                         ordered_uids = list(dict.fromkeys(gen_batch_output.non_tensor_batch["uid"].tolist()))
                         uid_to_row = {uid: row for row, uid in enumerate(batch.non_tensor_batch["uid"])}
