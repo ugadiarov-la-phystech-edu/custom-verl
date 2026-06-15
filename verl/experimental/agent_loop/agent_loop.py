@@ -614,30 +614,73 @@ class AgentLoopWorker:
                     if accepted:
                         accepted_rows.extend(group_rows[uid])
 
-        # Cancel the discarded long-tail; their in-flight vLLM requests are flushed by the
-        # trainer's abort_all_requests() once generation returns.
-        for t in pending:
-            t.cancel()
+        carry = bool(batch.meta_info.get("partial_carry", False))
+        if not carry:
+            # Over-sample + discard: cancel the long-tail; their in-flight vLLM requests are flushed by
+            # the trainer's abort_all_requests() once generation returns.
+            for t in pending:
+                t.cancel()
+            if not done_signal.done():
+                done_signal.cancel()
+            await asyncio.gather(*pending, done_signal, return_exceptions=True)
+
+            if not accepted_rows:
+                # This worker's groups all lost the global race (the target was filled by other
+                # workers): contribute nothing. The manager filters these None outputs before concat.
+                # (Returning partial/incomplete groups here would violate GRPO's complete-group invariant
+                # and overshoot train_batch_size.)
+                return None
+
+            return self._build_early_stop_output(batch, results, uids, accepted_rows, [], tag_roles=False)
+
+        # Partial-rollout carry-over: do NOT cancel the long-tail. The manager fires a global abort once
+        # the gate's target is reached, so the still-pending generate() calls return with the tokens
+        # produced so far. Await them and carry those partial rollouts forward instead of discarding.
         if not done_signal.done():
             done_signal.cancel()
-        await asyncio.gather(*pending, done_signal, return_exceptions=True)
+        leftover = list(pending)
+        gathered = await asyncio.gather(*leftover, done_signal, return_exceptions=True)
+        for t, res in zip(leftover, gathered[:-1], strict=True):
+            if isinstance(res, BaseException):
+                continue  # a request that errored / was cancelled contributes nothing to the carry
+            results[task_to_row[t]] = res
 
-        if not accepted_rows:
-            # This worker's groups all lost the global race (the target was filled by other
-            # workers): contribute nothing. The manager filters these None outputs before concat.
-            # (Returning partial/incomplete groups here would violate GRPO's complete-group invariant
-            # and overshoot train_batch_size.)
+        accepted_set = set(accepted_rows)
+        # Every row with a result that was not harvested this step is carried to the next step.
+        carried_rows = [i for i in range(len(tasks)) if i in results and i not in accepted_set]
+        if not accepted_rows and not carried_rows:
             return None
+        return self._build_early_stop_output(batch, results, uids, accepted_rows, carried_rows, tag_roles=True)
 
-        inputs = [results[i] for i in accepted_rows]
-        rows_idx = np.array(accepted_rows)
+    def _build_early_stop_output(
+        self,
+        batch: DataProto,
+        results: dict[int, Any],
+        uids: np.ndarray,
+        harvest_rows: list[int],
+        carried_rows: list[int],
+        *,
+        tag_roles: bool,
+    ) -> DataProto:
+        """Post-process the early-stop rows into one DataProto. ``harvest_rows`` are the complete groups
+        accepted this step; ``carried_rows`` are partial groups to resume next step (carry mode only).
+        When ``tag_roles`` is set, attach a ``__carry_role__`` column ("harvest"/"carry") so the trainer
+        can split the two cohorts; it is always attached in carry mode (even if all rows are "harvest")
+        to keep the column set uniform across workers for ``DataProto.concat``."""
+        all_rows = list(harvest_rows) + list(carried_rows)
+        inputs = [results[i] for i in all_rows]
+        rows_idx = np.array(all_rows)
         sub_non_tensor = {k: v[rows_idx] for k, v in batch.non_tensor_batch.items()}
         output = self._postprocess(
             inputs, input_non_tensor_batch=sub_non_tensor, validate=batch.meta_info.get("validate", False)
         )
         # Attach uid explicitly: the reward-loop postprocess path does not merge input_non_tensor_batch,
         # and the trainer needs uid to re-align the surviving groups with their prompts.
-        output.non_tensor_batch["uid"] = np.array([uids[i] for i in accepted_rows], dtype=object)
+        output.non_tensor_batch["uid"] = np.array([uids[i] for i in all_rows], dtype=object)
+        if tag_roles:
+            output.non_tensor_batch["__carry_role__"] = np.array(
+                ["harvest"] * len(harvest_rows) + ["carry"] * len(carried_rows), dtype=object
+            )
         return output
 
     async def _run_agent_loop(
@@ -1125,6 +1168,10 @@ class AgentLoopManager:
         llm_client (LLMServerClient): Client for the LLM server.
         teacher_client (dict[str, LLMServerClient]): Client for multiple teacher servers.
         reward_loop_worker_handles (List[ray.actor.ActorHandle]): Actor handles for streaming reward computation.
+        server_manager (LLMServerManager): Optional handle to the rollout server manager, used only by
+            partial-rollout carry-over (meta_info["partial_carry"]) to fire a single global
+            ``abort_all_requests`` once the gate's target of complete groups is reached, so the
+            still-pending generate() calls return their partial tokens instead of being cancelled.
     """
 
     def __init__(
@@ -1133,6 +1180,7 @@ class AgentLoopManager:
         llm_client: LLMServerClient,
         teacher_client: dict[str, LLMServerClient] = None,
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
+        server_manager=None,
     ):
         self.config = config
         self.rollout_config = config.actor_rollout_ref.rollout
@@ -1140,6 +1188,7 @@ class AgentLoopManager:
         self.llm_client = llm_client
         self.teacher_client = teacher_client
         self.reward_loop_worker_handles = reward_loop_worker_handles
+        self.server_manager = server_manager
 
         if not hasattr(self, "agent_loop_workers_class"):
             self.agent_loop_workers_class = ray.remote(AgentLoopWorker)
@@ -1189,11 +1238,25 @@ class AgentLoopManager:
         # fastest `keep_complete_groups` complete groups, share one BatchGate across all workers so
         # the global count is exact (not a per-worker approximation).
         target = prompts.meta_info.get("keep_complete_groups", 0)
+        partial_carry = bool(prompts.meta_info.get("partial_carry", False))
         batch_gate = None
         if target and target > 0:
             from verl.experimental.agent_loop.batch_gate import BatchGate
 
             batch_gate = BatchGate.remote(target)
+
+        # Partial-rollout carry-over: instead of cancelling the slow long-tail, the workers wait for
+        # their pending generate() calls to return so they can carry the partial tokens forward. Those
+        # calls only return once the engine is aborted, so fire a single global abort the moment the
+        # gate's target of complete groups is reached (concurrently with gathering the workers).
+        abort_task = None
+        if partial_carry and batch_gate is not None and self.server_manager is not None:
+
+            async def _abort_when_done():
+                await batch_gate.wait_until_done.remote()
+                await self.server_manager.abort_all_requests()
+
+            abort_task = asyncio.create_task(_abort_when_done())
 
         chunkes = prompts.chunk(len(self.agent_loop_workers))
         outputs = await asyncio.gather(
@@ -1202,8 +1265,12 @@ class AgentLoopManager:
                 for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
             ]
         )
+        if abort_task is not None:
+            # Ensure the abort fired (the engine stays paused; the trainer re-arms it with
+            # resume_generation() after generate_sequences returns).
+            await asyncio.gather(abort_task, return_exceptions=True)
         if batch_gate is not None:
-            # Over-sample + discard: drop workers whose groups all lost the global race (None).
+            # Over-sample + discard / carry: drop workers whose groups all lost the global race (None).
             outputs = [o for o in outputs if o is not None]
         output = DataProto.concat(outputs)
 

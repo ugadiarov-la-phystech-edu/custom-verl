@@ -20,9 +20,10 @@ from .agent_loop import (
     get_trajectory_info,
 )
 from .single_turn_agent_loop import SingleTurnAgentLoop
+from .single_turn_carry_agent_loop import PartialCarryAgentLoop
 from .tool_agent_loop import ToolAgentLoop
 
-_ = [SingleTurnAgentLoop, ToolAgentLoop]
+_ = [SingleTurnAgentLoop, PartialCarryAgentLoop, ToolAgentLoop]
 
 __all__ = [
     "AgentLoopBase",
