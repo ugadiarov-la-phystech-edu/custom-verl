@@ -10,7 +10,8 @@
 # limitations under the License.
 """Per-GPU phase monitoring via a Ray custom metric.
 
-Publishes a single ``ray.util.metrics.Gauge`` named ``verl_gpu_phase`` whose value is an integer
+Publishes a single ``ray.util.metrics.Gauge`` named ``verl_gpu_phase`` (exported to Prometheus as
+``ray_verl_gpu_phase`` -- Ray prefixes custom metrics) whose value is an integer
 **phase code** telling what the worker owning a given GPU is currently doing (idle / generating /
 forward log-prob / training / weight-sync / sleeping). One time series per GPU, tagged so it lines
 up with Ray's built-in ``ray_node_gpus_utilization{GpuIndex}`` (the ``gpu`` tag equals Ray's
