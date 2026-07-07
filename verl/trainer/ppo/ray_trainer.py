@@ -430,6 +430,16 @@ class RayPPOTrainer:
                     f"train_batch_size={self.config.data.train_batch_size}); the cold-start over-sample "
                     "pulls gen_batch_size/train_batch_size dataloader batches on the first step."
                 )
+            agent_num_workers = self.config.actor_rollout_ref.rollout.agent.num_workers
+            if self.config.data.train_batch_size % agent_num_workers != 0:
+                raise ValueError(
+                    "VERL_PARTIAL_ROLLOUT=1 requires actor_rollout_ref.rollout.agent.num_workers to divide "
+                    f"data.train_batch_size (got num_workers={agent_num_workers}, "
+                    f"train_batch_size={self.config.data.train_batch_size}): the carry pool is always a "
+                    "multiple of train_batch_size prompt-groups and AgentLoopManager splits it into "
+                    "num_workers equal chunks, which must land on group boundaries (all rollout.n rollouts "
+                    "of a group must reach the same worker for the completion gate to see the group)."
+                )
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
@@ -507,6 +517,10 @@ class RayPPOTrainer:
         )
 
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
+        if getattr(self, "_partial_rollout", False):
+            tbs = self.config.data.train_batch_size
+            k = self.config.data.get("gen_batch_size", tbs) // tbs
+            total_training_steps -= k - 1
 
         if self.config.trainer.total_training_steps is not None:
             total_training_steps = self.config.trainer.total_training_steps
@@ -794,17 +808,23 @@ class RayPPOTrainer:
         response_length = combined_gen_output.batch["responses"].shape[1]
         eos_id = self.tokenizer.eos_token_id
         has_lp = "rollout_log_probs" in combined_gen_output.batch
+        stop_reasons = combined_gen_output.non_tensor_batch.get("stop_reason")
 
         carried_by_uid = defaultdict(list)
         for i in carry_idx:
             carried_by_uid[out_uids[i]].append(i)
-        survivors: dict = {}
+        harvested_uids = {out_uids[i] for i in harvest_idx}
+        survivors = {uid: entry for uid, entry in self._carry_pool.items() if uid not in harvested_uids}
         n_force_finished = 0
+        n_retried_groups = 0
         carry_depths = []
         for uid, rows in carried_by_uid.items():
-            if uid not in self._carry_pool or len(rows) != rollout_n:
+            entry = survivors.get(uid)
+            if entry is None:
                 continue
-            entry = self._carry_pool[uid]
+            if len(rows) != rollout_n:
+                n_retried_groups += 1
+                continue
             new_rollouts = []
             for i in rows:
                 resp = combined_gen_output.batch["responses"][i]
@@ -812,14 +832,14 @@ class RayPPOTrainer:
                 ids = resp[:length].tolist()
                 lps = combined_gen_output.batch["rollout_log_probs"][i][:length].tolist() if has_lp else None
                 hit_eos = length > 0 and ids[-1] == eos_id
-                finished = length >= response_length or hit_eos
+                engine_finished = stop_reasons is not None and stop_reasons[i] in ("completed", "stop")
+                finished = engine_finished or hit_eos or length >= response_length
                 if length >= response_length and not hit_eos:
                     n_force_finished += 1
                 new_rollouts.append({"ids": ids, "logprobs": lps, "finished": finished})
             entry["rollouts"] = new_rollouts
             entry["depth"] = entry.get("depth", 0) + 1
             carry_depths.append(entry["depth"])
-            survivors[uid] = entry
         self._carry_pool = survivors
 
         gen_batch_output = combined_gen_output.select_idxs(harvest_idx)
@@ -834,6 +854,7 @@ class RayPPOTrainer:
             "rollout_carry/harvested_groups": len(ordered),
             "rollout_carry/pool_groups": len(self._carry_pool_uids),
             "rollout_carry/force_finished_rollouts": n_force_finished,
+            "rollout_carry/retried_groups": n_retried_groups,
         }
         if carry_depths:
             carry_metrics["rollout_carry/carry_depth_mean"] = float(np.mean(carry_depths))

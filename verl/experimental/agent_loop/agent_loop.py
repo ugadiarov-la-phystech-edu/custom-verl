@@ -1245,6 +1245,8 @@ class AgentLoopManager:
             ]
         )
         if abort_task is not None:
+            if not abort_task.done():
+                abort_task.cancel()
             await asyncio.gather(abort_task, return_exceptions=True)
         if batch_gate is not None:
             outputs = [o for o in outputs if o is not None]

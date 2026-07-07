@@ -553,7 +553,7 @@ class vLLMHttpServer:
         if not final_res.outputs:
             return TokenOutput(
                 token_ids=[],
-                log_probs=None,
+                log_probs=[] if sampling_params.logprobs is not None else None,
                 routed_experts=None,
                 stop_reason="aborted",
             )
