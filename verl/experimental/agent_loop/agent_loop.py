@@ -1266,8 +1266,14 @@ class AgentLoopManager:
             ]
         )
         if abort_task is not None:
-            # Ensure the abort fired (the engine stays paused; the trainer re-arms it with
-            # resume_generation() after generate_sequences returns).
+            # Normal path: the gate filled and the abort is what released the workers' pending
+            # generate() calls, so the task is already done here -- await it to surface errors
+            # (the engine stays paused; the trainer re-arms it with resume_generation()).
+            # If every group instead finished naturally without the gate ever filling (e.g. the
+            # pool held fewer completable groups than the target), the task is still parked on
+            # wait_until_done: there is nothing left to abort, so cancel it rather than hang.
+            if not abort_task.done():
+                abort_task.cancel()
             await asyncio.gather(abort_task, return_exceptions=True)
         if batch_gate is not None:
             # Over-sample + discard / carry: drop workers whose groups all lost the global race (None).

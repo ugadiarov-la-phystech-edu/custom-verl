@@ -17,6 +17,7 @@ from typing import Any
 from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, register
+from verl.experimental.agent_loop.carry_utils import stitch_carry_response
 from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
@@ -103,20 +104,12 @@ class PartialCarryAgentLoop(SingleTurnAgentLoop):
         if metrics.get("num_preempted") is None:
             metrics["num_preempted"] = num_preempted if num_preempted is not None else -1
 
-        # 5. stitch prefix + newly generated tokens into the full running response.
-        response_ids = (prefix_ids + list(new_token_ids))[: self.response_length]
-        # Keep per-token rollout log-probs aligned with response_ids only when available for both parts;
-        # otherwise drop them (a None here disables Layer-1 rollout-log-prob correctness for this row).
-        have_new_lp = new_logprobs is not None
-        prefix_lp_ok = len(prefix_logprobs) == len(prefix_ids)
-        if not prefix_ids and have_new_lp:
-            response_logprobs = list(new_logprobs)[: self.response_length]
-        elif prefix_lp_ok and (carry_done or remaining <= 0):
-            response_logprobs = prefix_logprobs[: self.response_length]
-        elif prefix_lp_ok and have_new_lp:
-            response_logprobs = (prefix_logprobs + list(new_logprobs))[: self.response_length]
-        else:
-            response_logprobs = None
+        # 5. stitch prefix + newly generated tokens into the full running response, keeping the
+        #    per-token rollout log-probs aligned whenever the available data covers the response
+        #    (in particular, a request aborted before its first token keeps the prefix log-probs).
+        response_ids, response_logprobs = stitch_carry_response(
+            prefix_ids, prefix_logprobs, list(new_token_ids), new_logprobs, self.response_length
+        )
         response_mask = [1] * len(response_ids)
 
         output = AgentLoopOutput(
