@@ -46,3 +46,25 @@ def stitch_carry_response(
     else:
         response_logprobs = None
     return response_ids, response_logprobs
+
+
+def carry_request_priority(prefix_len: int, backend: Optional[str], scheduling_policy: Optional[str]) -> Optional[int]:
+    """Per-request scheduler priority for a carry-mode generation request.
+
+    Returns ``None`` unless the rollout backend is vLLM with ``scheduling_policy="priority"`` --
+    the caller must then omit the ``priority`` kwarg entirely (other backends, e.g. sglang, do not
+    accept it, and under fcfs vLLM ignores it anyway). Otherwise returns ``-1`` for a carried
+    request (non-empty prefix) and ``0`` (vLLM's default) for a fresh one.
+
+    vLLM v1 priority semantics: a LOWER value is scheduled earlier (ties broken by arrival time),
+    and under KV-cache pressure the numerically highest-priority request is preempted first. So
+    carried partials start decoding before any fresh request and never lose their slot to one --
+    they retire in one extra step instead of being aborted repeatedly (each extra carry hop adds
+    another policy version to the response's token mix and re-pays prefill on a longer prefix).
+    A flat -1 suffices: carried survivors are re-submitted in stable oldest-first pool order, so
+    the arrival-time tiebreak already orders them; switch to ``-prefix_len`` if carried requests
+    ever starve each other.
+    """
+    if backend != "vllm" or scheduling_policy != "priority":
+        return None
+    return -1 if prefix_len > 0 else 0

@@ -14,7 +14,7 @@ from typing import Any
 from uuid import uuid4
 
 from verl.experimental.agent_loop.agent_loop import AgentLoopOutput, register
-from verl.experimental.agent_loop.carry_utils import stitch_carry_response
+from verl.experimental.agent_loop.carry_utils import carry_request_priority, stitch_carry_response
 from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
 from verl.utils.profiler import simple_timer
 from verl.utils.rollout_trace import rollout_trace_op
@@ -77,6 +77,11 @@ class PartialCarryAgentLoop(SingleTurnAgentLoop):
         if not carry_done and remaining > 0:
             gen_sampling_params = dict(sampling_params)
             gen_sampling_params["max_tokens"] = remaining
+            priority = carry_request_priority(
+                len(prefix_ids),
+                self.rollout_config.get("name"),
+                self.rollout_config.get("scheduling_policy", "fcfs"),
+            )
             with simple_timer("generate_sequences", metrics):
                 output: TokenOutput = await self.server_manager.generate(
                     request_id=uuid4().hex,
@@ -86,6 +91,7 @@ class PartialCarryAgentLoop(SingleTurnAgentLoop):
                     video_data=videos,
                     audio_data=audios,
                     mm_processor_kwargs=mm_processor_kwargs,
+                    **({} if priority is None else {"priority": priority}),
                 )
             new_token_ids = output.token_ids
             new_logprobs = output.log_probs

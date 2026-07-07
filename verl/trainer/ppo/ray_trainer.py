@@ -440,6 +440,13 @@ class RayPPOTrainer:
                     "num_workers equal chunks, which must land on group boundaries (all rollout.n rollouts "
                     "of a group must reach the same worker for the completion gate to see the group)."
                 )
+            rollout_cfg = self.config.actor_rollout_ref.rollout
+            if rollout_cfg.get("name") == "vllm" and rollout_cfg.get("scheduling_policy", "fcfs") != "priority":
+                print(
+                    "[partial_rollout] Hint: set actor_rollout_ref.rollout.scheduling_policy=priority so "
+                    "carried partials are scheduled ahead of fresh requests and retire in one extra step "
+                    "instead of being aborted repeatedly (fcfs is correct but slower to drain the carry pool)."
+                )
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
