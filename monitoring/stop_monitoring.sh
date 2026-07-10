@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
+export RAY_TMPDIR="${RAY_TMPDIR:-/tmp/ray}"
 MONITORING_HOME="${VERL_MONITORING_HOME:-${HOME}/.verl-monitoring}"
 GRAFANA_PID_FILE="${MONITORING_HOME}/grafana.pid"
 PROM_PID_FILE="${MONITORING_HOME}/prometheus.pid"
