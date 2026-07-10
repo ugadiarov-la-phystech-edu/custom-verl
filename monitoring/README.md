@@ -27,8 +27,9 @@ Works for all three trainer topologies:
   samples in Prometheus.
 - **`ray_node_gpus_utilization` / `ray_node_gram_*`** — Ray's built-in per-GPU metrics
   (`GpuIndex` matches the `gpu` tag, so phase and utilization line up with no mapping).
-- **Prometheus** scrapes every node (Ray writes its service-discovery file), retains 15 days
-  by default → "what was happening an hour ago" is just a Grafana time-range change.
+- **Prometheus** scrapes every node (Ray writes its service-discovery file), retains 90 days
+  by default → "what was happening an hour ago" is just a Grafana time-range change, and a
+  finished experiment stays browsable for months.
 - **Grafana** is auto-provisioned from Ray's session files + the dashboard in
   [`grafana/verl_gpu_phase_dashboard.json`](grafana/verl_gpu_phase_dashboard.json).
 
@@ -200,9 +201,15 @@ bash monitoring/start_monitoring.sh
 bash grpo_4k_8gpu_oversample.sh          # ray.init() attaches to the running cluster
 ```
 
+Since `start_monitoring.sh` no longer depends on the Ray session (see above), this is rarely
+needed — and it **breaks per-experiment dashboards**: every run attaching to that one cluster
+shares its `SessionName`, so they cannot be told apart. If you want one dashboard per experiment,
+let each launch script start its own Ray.
+
 Stop with `bash monitoring/stop_monitoring.sh` (Prometheus history is kept on disk).
-To start over, `bash monitoring/clean_monitoring_data.sh` stops both processes and wipes all
-state (metric history, Grafana db, logs) while keeping the downloaded binaries.
+`bash monitoring/clean_monitoring_data.sh` stops both processes and wipes all state (metric
+history, Grafana db, logs) while keeping the downloaded binaries. It prompts first: the TSDB is
+the only copy of every finished experiment's metrics.
 
 ## Historical queries
 
@@ -256,6 +263,105 @@ export `RAY_PROMETHEUS_HOST` / `RAY_GRAFANA_HOST` / `RAY_GRAFANA_IFRAME_HOST`
 (defaulting to `localhost`); override them with the externally reachable URLs when the
 browser is not on the training node, **before** the run starts Ray.
 
+## One dashboard per experiment
+
+Each launch script calls `ray.init()` itself, so **one experiment == one Ray session**, and Ray
+stamps a `SessionName` label on *both* `ray_verl_gpu_phase` and its own `ray_node_gpus_utilization`
+/ `ray_node_gram_*`. That single label scopes every panel, so an experiment can be frozen into its
+own dashboard with no changes to verl and no per-run metric tag.
+
+```bash
+bash grpo_4k_4gpu.sh &                # experiment A -- starts its own Ray session
+bash monitoring/start_monitoring.sh   # once Ray is up (first run mirrors Ray's config, see below)
+# ... A finishes ...
+python3 monitoring/grafana/make_run_dashboard.py --latest --name exp-a
+
+bash grpo_4k_4gpu_oversample.sh &     # experiment B -- new Ray session
+# monitoring keeps running; Prometheus follows the service-discovery file to B's new ports
+# ... B finishes ...
+python3 monitoring/grafana/make_run_dashboard.py --latest --name exp-b
+
+ray stop                              # optional -- monitoring outlives Ray
+bash monitoring/start_monitoring.sh   # post-hoc mode: no live Ray needed
+```
+
+`make_run_dashboard.py` clones `verl_gpu_phase_dashboard.json`, pins **every** PromQL selector to
+that run's `SessionName`, pins the dashboard's time range to the run's window (read back out of
+Prometheus, so no exit hook is needed) and disables auto-refresh so a finished run cannot drift
+toward `now`. Grafana's file provider rescans its dashboards dir every ~10s, so the new dashboard
+appears without restarting anything.
+
+```bash
+make_run_dashboard.py --list                     # sessions Prometheus knows about, with windows
+make_run_dashboard.py --latest --name exp-a      # the most recently started session
+make_run_dashboard.py --session session_2026-07-10_11-44-20_471818_3405251 --name exp-a
+```
+
+The base `verl-gpu-phase` dashboard stays unscoped — it always shows whatever is running now.
+Per-run dashboards are additive, named `verl · <name>` at `/d/vgp-<name>-<hash>`.
+
+### Watching a run live
+
+`/d/verl-gpu-phase` is already live: `now-1h → now`, refreshing every 10s. Start the run, start
+monitoring, open it. Nothing else is needed.
+
+Its one limitation is that it is unscoped. Restart a run within the hour and *both* Ray sessions
+fall inside the window: since the lane legend is `gpu · role · node` and carries no `SessionName`,
+you get two identical-looking lanes per GPU. For a live view of one specific experiment, add
+`--live` — it pins the session but keeps the rolling range and auto-refresh:
+
+```bash
+bash grpo_4k_4gpu.sh &
+bash monitoring/start_monitoring.sh                          # once Ray is up
+python3 monitoring/grafana/make_run_dashboard.py --latest --name exp-a --live
+# ... watch /d/vgp-exp-a-<hash>, titled "verl · exp-a (live)" ...
+python3 monitoring/grafana/make_run_dashboard.py --latest --name exp-a   # when it finishes
+```
+
+The uid depends only on `(name, session)`, so freezing reuses the **same URL**: the page stops
+following `now` and settles on the run's real window. `--live` needs one scrape to have landed
+(~10-20s after the first phase is emitted), otherwise there is no session for `--latest` to find.
+
+Injecting a label matcher into these queries is fiddlier than it looks: `label_replace(x, "gpu",
+"$1", "GpuIndex", "(.+)")` has string arguments that look exactly like label syntax. The injector
+therefore walks each expression tracking whether it is inside a double-quoted string and rewrites
+only metric names found outside one, leaving string literals and `offset $__interval` byte-identical.
+Re-running it on an already-pinned dashboard is a no-op.
+
+Two things to respect:
+
+- **Never run `clean_monitoring_data.sh` between experiments you want to compare.** It deletes the
+  TSDB, which is the only copy of a finished run's metrics; the dashboards survive as files and
+  render blank forever. It now prompts before doing so. `stop_monitoring.sh` is safe.
+- **Run experiments sequentially.** `--latest` and the one-session-per-experiment model assume runs
+  do not overlap.
+
+Retention bounds everything: history is kept for `VERL_PROM_RETENTION` (default **90d**). A dashboard
+pinned to a window older than that renders blank, and `make_run_dashboard.py` warns when it notices.
+
+### Monitoring outlives the Ray session
+
+Ray regenerates its session directory on every `ray.init()` and bakes that directory's *resolved*
+path into the Grafana dashboard provider. A Grafana started under session N therefore keeps reading
+session N's dashboards forever — so experiment B's dashboard would never appear, and
+`start_monitoring.sh` could not even start once both runs were over.
+
+`start_monitoring.sh` now mirrors Ray's generated config into `${VERL_MONITORING_HOME}` on every
+start and points Prometheus and Grafana at that copy instead:
+
+```
+~/.verl-monitoring/
+  prometheus/prometheus.yml   # verbatim: its file_sd still tracks whatever Ray is running
+  grafana/grafana.ini         # [paths] provisioning repointed
+  grafana/provisioning/       # the dashboard provider's `path:` repointed
+  grafana/dashboards/         # the one dir Grafana watches: Ray's + base + per-run dashboards
+  data/                       # Prometheus TSDB
+```
+
+The first ever start still needs Ray alive once, to generate the config to mirror. After that,
+`bash monitoring/start_monitoring.sh` works with no Ray at all — targets simply go DOWN while the
+TSDB keeps serving history.
+
 ## Shared nodes: set `RAY_TMPDIR`
 
 Ray's temp root (`/tmp/ray` by default) is world-writable and **shared by every user on the
@@ -300,8 +406,9 @@ curl -s localhost:9090/api/v1/targets | grep -c '"health":"up"'
   spawned through Ray runtime env inheritance; `ray start` nodes need it in their env).
 - Prometheus (started on the head node) scrapes all nodes automatically via Ray's
   service-discovery file.
-- `<ray root>/session_latest` (`/tmp/ray/session_latest` by default) is recreated per Ray session — re-run
-  `monitoring/start_monitoring.sh` after restarting the cluster to re-provision Grafana.
+- `<ray root>/session_latest` (`/tmp/ray/session_latest` by default) is recreated per Ray session.
+  `monitoring/start_monitoring.sh` re-mirrors Ray's config on every start, so re-run it after
+  restarting the cluster; a monitoring stack already running keeps working either way.
 - Export `RAY_TMPDIR` on every node (and in the shell that runs the monitoring scripts),
   or on none — a mismatch sends Prometheus looking for a service-discovery file that Ray
   is not writing.

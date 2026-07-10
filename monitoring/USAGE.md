@@ -117,11 +117,29 @@ Grafana needs no login (anonymous viewer access is enabled by Ray's config).
   matches the `gpu` of the phase lanes, so you can see e.g. utilization collapsing while
   a phase lane sits in `gen` during the decode long-tail.
 
+### Comparing two experiments
+
+Freeze each finished run into its own dashboard, pinned to that run's Ray session and time window:
+
+```bash
+python3 monitoring/grafana/make_run_dashboard.py --latest --name exp-a   # after run A
+python3 monitoring/grafana/make_run_dashboard.py --latest --name exp-b   # after run B
+python3 monitoring/grafana/make_run_dashboard.py --list                  # all known sessions
+```
+
+To watch a run *while it happens*, either open the always-live `/d/verl-gpu-phase`, or add
+`--live` for a view scoped to that one experiment; re-run without `--live` afterwards to freeze
+it at the same URL.
+
+They appear at `/d/vgp-<name>-<hash>` within ~10s and keep working after Ray is gone. Do **not**
+run `clean_monitoring_data.sh` in between — it deletes the metric history both dashboards read.
+See [README.md](README.md#one-dashboard-per-experiment).
+
 ### Historical data ("what was happening an hour ago?")
 
-Prometheus retains 15 days. In Grafana, use the time-range picker (top right): pick
-"Last 1 hour", or an absolute range like `2026-07-07 10:00 → 11:00`. Zoom by dragging on
-any panel. For raw history, query Prometheus (or Grafana → Explore):
+Prometheus retains 90 days (`VERL_PROM_RETENTION`). In Grafana, use the time-range picker (top
+right): pick "Last 1 hour", or an absolute range like `2026-07-07 10:00 → 11:00`. Zoom by dragging
+on any panel. For raw history, query Prometheus (or Grafana → Explore):
 
 ```promql
 ray_verl_gpu_phase                       # current phase per (gpu, role)
