@@ -28,6 +28,7 @@ worker-dispatch path costs one cheap boolean check when disabled.
 
 import logging
 import os
+import threading
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -73,6 +74,46 @@ _ENV_FLAG = "VERL_GPU_PHASE_MONITOR"
 # Lazily-initialized Gauge handle. ``False`` means "tried and unavailable" (distinct from ``None``
 # = "not yet tried") so we only attempt the import/registration once.
 _GAUGE = None
+
+# Ray's metrics agent stops exporting a custom metric that hasn't been recorded recently, so a
+# phase set once at a transition disappears from Prometheus while the phase is still running
+# (long ``gen``/``update`` phases show up as isolated samples). A per-process daemon thread
+# re-records the last value of every series it has seen, keeping the series alive for the whole
+# duration of the phase. Interval in seconds; 0 disables the heartbeat.
+_HEARTBEAT_S = float(os.environ.get("VERL_GPU_PHASE_HEARTBEAT_S", "15"))
+_LAST_LOCK = threading.Lock()
+_LAST: dict[tuple, tuple[int, dict]] = {}  # frozen tags -> (code, tags)
+_HEARTBEAT_STARTED = False
+
+
+def _heartbeat_loop():
+    import time
+
+    while True:
+        time.sleep(_HEARTBEAT_S)
+        g = _gauge()
+        if g is None:
+            return
+        with _LAST_LOCK:
+            snapshot = list(_LAST.values())
+        for code, tags in snapshot:
+            try:
+                g.set(code, tags=tags)
+            except Exception as e:
+                logger.warning("gpu-phase heartbeat re-set failed: %s", e)
+
+
+def _record(g, code: int, tags: dict) -> None:
+    """Set the gauge and remember the value so the heartbeat can keep the series alive."""
+    global _HEARTBEAT_STARTED
+    g.set(code, tags=tags)
+    if _HEARTBEAT_S <= 0:
+        return
+    with _LAST_LOCK:
+        _LAST[tuple(sorted(tags.items()))] = (code, tags)
+        if not _HEARTBEAT_STARTED:
+            _HEARTBEAT_STARTED = True
+            threading.Thread(target=_heartbeat_loop, name="verl-gpu-phase-heartbeat", daemon=True).start()
 
 
 def enabled() -> bool:
@@ -144,7 +185,7 @@ def set_phase(worker, code: int) -> None:
     if tags is None:
         return
     try:
-        g.set(code, tags=tags)
+        _record(g, code, tags)
     except Exception as e:
         logger.warning("failed to set verl_gpu_phase: %s", e)
 
@@ -182,6 +223,6 @@ def set_phase_gpus(gpu_ids, code: int, *, role: str, rank=None) -> None:
         if not gid:
             continue
         try:
-            g.set(code, tags={"rank": str(rank) if rank is not None else gid, "gpu": gid, "node": node, "role": role})
+            _record(g, code, tags={"rank": str(rank) if rank is not None else gid, "gpu": gid, "node": node, "role": role})
         except Exception as e:
             logger.warning("failed to set verl_gpu_phase for gpu %s: %s", gid, e)

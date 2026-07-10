@@ -1,16 +1,87 @@
 {
-  "annotations": { "list": [] },
+  "annotations": {
+    "list": []
+  },
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
   "id": null,
   "links": [],
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "description": "Prometheus datasource backing every panel.",
+        "hide": 2,
+        "refresh": 1,
+        "current": {
+          "selected": false
+        },
+        "options": [],
+        "skipUrlSync": false
+      },
+      {
+        "name": "node",
+        "label": "node",
+        "type": "query",
+        "datasource": "${datasource}",
+        "description": "Training node (Ray NodeAddress). GPU indices repeat across nodes, so pick one.",
+        "definition": "label_values(ray_verl_gpu_phase, NodeAddress)",
+        "query": {
+          "query": "label_values(ray_verl_gpu_phase, NodeAddress)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 1,
+        "sort": 1,
+        "multi": false,
+        "includeAll": false,
+        "current": {
+          "selected": false
+        },
+        "options": [],
+        "hide": 0,
+        "regex": "",
+        "skipUrlSync": false
+      },
+      {
+        "name": "gpu",
+        "label": "gpu",
+        "type": "query",
+        "datasource": "${datasource}",
+        "description": "Which GPUs get their own utilization-by-phase panel.",
+        "definition": "label_values(ray_verl_gpu_phase{NodeAddress=~\"$node\"}, gpu)",
+        "query": {
+          "query": "label_values(ray_verl_gpu_phase{NodeAddress=~\"$node\"}, gpu)",
+          "refId": "StandardVariableQuery"
+        },
+        "refresh": 1,
+        "sort": 3,
+        "multi": true,
+        "includeAll": true,
+        "allValue": ".+",
+        "current": {
+          "selected": false
+        },
+        "options": [],
+        "hide": 0,
+        "regex": "",
+        "skipUrlSync": false
+      }
+    ]
+  },
   "panels": [
     {
       "type": "state-timeline",
       "title": "Per-GPU phase (one lane per GPU x role)",
       "description": "What each GPU is doing right now and over time. Lanes are (node, gpu, role): in colocated runs the same GPU has a rollout lane (gen/sleep, emitted by the vLLM server) and a trainer lane (logprob/update/weight-sync, emitted by the worker). idle = waiting for work / data.",
-      "gridPos": { "h": 11, "w": 24, "x": 0, "y": 0 },
+      "gridPos": {
+        "h": 11,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
       "id": 1,
       "datasource": null,
       "fieldConfig": {
@@ -18,41 +89,142 @@
           "custom": {
             "lineWidth": 0,
             "fillOpacity": 72,
-            "spanNulls": false,
+            "spanNulls": 120000,
             "insertNulls": false,
-            "hideFrom": { "legend": false, "tooltip": false, "viz": false }
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
           },
-          "color": { "mode": "thresholds" },
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "#8a8a8a", "value": null }] },
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#808080"
+          },
           "mappings": [
-            { "type": "value", "options": { "0": { "text": "idle", "color": "#8a8a8a", "index": 0 } } },
-            { "type": "value", "options": { "1": { "text": "gen", "color": "#3987e5", "index": 1 } } },
-            { "type": "value", "options": { "2": { "text": "logprob_fwd", "color": "#199e70", "index": 2 } } },
-            { "type": "value", "options": { "3": { "text": "ref_fwd", "color": "#9085e9", "index": 3 } } },
-            { "type": "value", "options": { "4": { "text": "values_fwd", "color": "#d55181", "index": 4 } } },
-            { "type": "value", "options": { "5": { "text": "update_actor", "color": "#c98500", "index": 5 } } },
-            { "type": "value", "options": { "6": { "text": "update_critic", "color": "#008300", "index": 6 } } },
-            { "type": "value", "options": { "7": { "text": "weight_sync", "color": "#d95926", "index": 7 } } },
-            { "type": "value", "options": { "8": { "text": "sleep", "color": "#55565a", "index": 8 } } }
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "idle",
+                  "color": "#808080",
+                  "index": 0
+                }
+              }
+            },
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "gen",
+                  "color": "#ffffff",
+                  "index": 1
+                }
+              }
+            },
+            {
+              "type": "value",
+              "options": {
+                "2": {
+                  "text": "logprob_fwd",
+                  "color": "#e6194B",
+                  "index": 2
+                }
+              }
+            },
+            {
+              "type": "value",
+              "options": {
+                "3": {
+                  "text": "ref_fwd",
+                  "color": "#f032e6",
+                  "index": 3
+                }
+              }
+            },
+            {
+              "type": "value",
+              "options": {
+                "4": {
+                  "text": "values_fwd",
+                  "color": "#fffac8",
+                  "index": 4
+                }
+              }
+            },
+            {
+              "type": "value",
+              "options": {
+                "5": {
+                  "text": "update_actor",
+                  "color": "#3cb44b",
+                  "index": 5
+                }
+              }
+            },
+            {
+              "type": "value",
+              "options": {
+                "6": {
+                  "text": "update_critic",
+                  "color": "#4363d8",
+                  "index": 6
+                }
+              }
+            },
+            {
+              "type": "value",
+              "options": {
+                "7": {
+                  "text": "weight_sync",
+                  "color": "#42d4f4",
+                  "index": 7
+                }
+              }
+            },
+            {
+              "type": "value",
+              "options": {
+                "8": {
+                  "text": "sleep",
+                  "color": "#000000",
+                  "index": 8
+                }
+              }
+            }
           ]
         },
         "overrides": []
       },
       "options": {
         "mergeValues": true,
-        "showValue": "auto",
+        "showValue": "never",
         "alignValue": "left",
         "rowHeight": 0.85,
-        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "single", "sort": "none" }
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
       },
       "targets": [
         {
           "refId": "A",
-          "expr": "ray_verl_gpu_phase",
-          "legendFormat": "gpu {{gpu}} · {{role}} · {{node}}",
-          "instant": false,
-          "range": true
+          "expr": "ray_verl_gpu_phase{role=\"rollout\"}",
+          "legendFormat": "gpu {{gpu}} \u00b7 {{role}} \u00b7 {{NodeAddress}}",
+          "range": true,
+          "instant": false
+        },
+        {
+          "refId": "B",
+          "expr": "(ray_verl_gpu_phase{role!=\"rollout\"} unless on (gpu, NodeAddress) (ray_verl_gpu_phase{role=\"rollout\"} == 1)) or (ray_verl_gpu_phase{role!=\"rollout\"} * 0 and on (gpu, NodeAddress) (ray_verl_gpu_phase{role=\"rollout\"} == 1))",
+          "legendFormat": "gpu {{gpu}} \u00b7 {{role}} \u00b7 {{NodeAddress}}",
+          "range": true,
+          "instant": false
         }
       ]
     },
@@ -60,7 +232,12 @@
       "type": "timeseries",
       "title": "GPU utilization (%)",
       "description": "Ray's per-GPU utilization (NVML), sampled every few seconds. GpuIndex matches the gpu tag of the phase lanes above.",
-      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 11 },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 0,
+        "y": 11
+      },
       "id": 2,
       "datasource": null,
       "fieldConfig": {
@@ -72,7 +249,9 @@
             "showPoints": "never",
             "spanNulls": true
           },
-          "color": { "mode": "palette-classic" },
+          "color": {
+            "mode": "palette-classic"
+          },
           "unit": "percent",
           "min": 0,
           "max": 100
@@ -80,14 +259,21 @@
         "overrides": []
       },
       "options": {
-        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
           "refId": "A",
           "expr": "ray_node_gpus_utilization",
-          "legendFormat": "gpu {{GpuIndex}} · {{ip}}",
+          "legendFormat": "gpu {{GpuIndex}} \u00b7 {{ip}}",
           "range": true
         }
       ]
@@ -96,7 +282,12 @@
       "type": "timeseries",
       "title": "GPU memory used (%)",
       "description": "Per-GPU VRAM in use (Ray gram metrics).",
-      "gridPos": { "h": 9, "w": 12, "x": 12, "y": 11 },
+      "gridPos": {
+        "h": 9,
+        "w": 12,
+        "x": 12,
+        "y": 11
+      },
       "id": 3,
       "datasource": null,
       "fieldConfig": {
@@ -108,7 +299,9 @@
             "showPoints": "never",
             "spanNulls": true
           },
-          "color": { "mode": "palette-classic" },
+          "color": {
+            "mode": "palette-classic"
+          },
           "unit": "percent",
           "min": 0,
           "max": 100
@@ -116,14 +309,266 @@
         "overrides": []
       },
       "options": {
-        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
-        "tooltip": { "mode": "multi", "sort": "desc" }
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
       },
       "targets": [
         {
           "refId": "A",
           "expr": "100 * ray_node_gram_used / (ray_node_gram_used + ray_node_gram_available)",
-          "legendFormat": "gpu {{GpuIndex}} · {{ip}}",
+          "legendFormat": "gpu {{GpuIndex}} \u00b7 {{ip}}",
+          "range": true
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "GPU $gpu \u00b7 utilization by phase",
+      "description": "One panel per GPU (repeats over the $gpu variable). The utilization line is split into one series per phase -- each query returns the utilization samples only while that GPU is in that phase -- so the line changes color as the GPU moves through gen / logprob / update / weight-sync. Colors match the phase timeline at the top.\n\nA GPU's two lanes are collapsed into one 'effective' phase: whichever lane is doing real work wins (rollout gen beats trainer idle; trainer update beats rollout sleep). If every lane is idle or sleeping, the GPU shows idle/sleep.",
+      "repeat": "gpu",
+      "repeatDirection": "h",
+      "maxPerRow": 2,
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 20
+      },
+      "id": 4,
+      "datasource": null,
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "fillOpacity": 8,
+            "showPoints": "always",
+            "pointSize": 4,
+            "spanNulls": false,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            }
+          },
+          "color": {
+            "mode": "fixed",
+            "fixedColor": "#808080"
+          },
+          "unit": "percent",
+          "min": 0,
+          "max": 100
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "idle"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#808080"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "gen"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#ffffff"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "logprob_fwd"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#e6194B"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "ref_fwd"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#f032e6"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "values_fwd"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#fffac8"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "update_actor"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#3cb44b"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "update_critic"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#4363d8"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "weight_sync"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#42d4f4"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "sleep"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "mode": "fixed",
+                  "fixedColor": "#000000"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "label_replace(ray_node_gpus_utilization{GpuIndex=~\"$gpu\", ip=~\"$node\"}, \"gpu\", \"$1\", \"GpuIndex\", \"(.+)\") and on (gpu, ip) (label_replace((max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\", role=\"rollout\"} == 1) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"} != 0 != 8) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"})) == 0, \"ip\", \"$1\", \"NodeAddress\", \"(.+)\") or label_replace((max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\", role=\"rollout\"} offset $__interval == 1) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"} offset $__interval != 0 != 8) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"} offset $__interval)) == 0, \"ip\", \"$1\", \"NodeAddress\", \"(.+)\"))",
+          "legendFormat": "idle",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "expr": "label_replace(ray_node_gpus_utilization{GpuIndex=~\"$gpu\", ip=~\"$node\"}, \"gpu\", \"$1\", \"GpuIndex\", \"(.+)\") and on (gpu, ip) (label_replace((max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\", role=\"rollout\"} == 1) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"} != 0 != 8) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"})) == 1, \"ip\", \"$1\", \"NodeAddress\", \"(.+)\") or label_replace((max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\", role=\"rollout\"} offset $__interval == 1) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"} offset $__interval != 0 != 8) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"} offset $__interval)) == 1, \"ip\", \"$1\", \"NodeAddress\", \"(.+)\"))",
+          "legendFormat": "gen",
+          "range": true
+        },
+        {
+          "refId": "C",
+          "expr": "label_replace(ray_node_gpus_utilization{GpuIndex=~\"$gpu\", ip=~\"$node\"}, \"gpu\", \"$1\", \"GpuIndex\", \"(.+)\") and on (gpu, ip) (label_replace((max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\", role=\"rollout\"} == 1) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"} != 0 != 8) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"})) == 2, \"ip\", \"$1\", \"NodeAddress\", \"(.+)\") or label_replace((max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\", role=\"rollout\"} offset $__interval == 1) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"} offset $__interval != 0 != 8) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"} offset $__interval)) == 2, \"ip\", \"$1\", \"NodeAddress\", \"(.+)\"))",
+          "legendFormat": "logprob_fwd",
+          "range": true
+        },
+        {
+          "refId": "D",
+          "expr": "label_replace(ray_node_gpus_utilization{GpuIndex=~\"$gpu\", ip=~\"$node\"}, \"gpu\", \"$1\", \"GpuIndex\", \"(.+)\") and on (gpu, ip) (label_replace((max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\", role=\"rollout\"} == 1) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"} != 0 != 8) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"})) == 3, \"ip\", \"$1\", \"NodeAddress\", \"(.+)\") or label_replace((max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\", role=\"rollout\"} offset $__interval == 1) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"} offset $__interval != 0 != 8) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"} offset $__interval)) == 3, \"ip\", \"$1\", \"NodeAddress\", \"(.+)\"))",
+          "legendFormat": "ref_fwd",
+          "range": true
+        },
+        {
+          "refId": "E",
+          "expr": "label_replace(ray_node_gpus_utilization{GpuIndex=~\"$gpu\", ip=~\"$node\"}, \"gpu\", \"$1\", \"GpuIndex\", \"(.+)\") and on (gpu, ip) (label_replace((max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\", role=\"rollout\"} == 1) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"} != 0 != 8) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"})) == 4, \"ip\", \"$1\", \"NodeAddress\", \"(.+)\") or label_replace((max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\", role=\"rollout\"} offset $__interval == 1) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"} offset $__interval != 0 != 8) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"} offset $__interval)) == 4, \"ip\", \"$1\", \"NodeAddress\", \"(.+)\"))",
+          "legendFormat": "values_fwd",
+          "range": true
+        },
+        {
+          "refId": "F",
+          "expr": "label_replace(ray_node_gpus_utilization{GpuIndex=~\"$gpu\", ip=~\"$node\"}, \"gpu\", \"$1\", \"GpuIndex\", \"(.+)\") and on (gpu, ip) (label_replace((max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\", role=\"rollout\"} == 1) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"} != 0 != 8) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"})) == 5, \"ip\", \"$1\", \"NodeAddress\", \"(.+)\") or label_replace((max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\", role=\"rollout\"} offset $__interval == 1) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"} offset $__interval != 0 != 8) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"} offset $__interval)) == 5, \"ip\", \"$1\", \"NodeAddress\", \"(.+)\"))",
+          "legendFormat": "update_actor",
+          "range": true
+        },
+        {
+          "refId": "G",
+          "expr": "label_replace(ray_node_gpus_utilization{GpuIndex=~\"$gpu\", ip=~\"$node\"}, \"gpu\", \"$1\", \"GpuIndex\", \"(.+)\") and on (gpu, ip) (label_replace((max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\", role=\"rollout\"} == 1) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"} != 0 != 8) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"})) == 6, \"ip\", \"$1\", \"NodeAddress\", \"(.+)\") or label_replace((max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\", role=\"rollout\"} offset $__interval == 1) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"} offset $__interval != 0 != 8) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"} offset $__interval)) == 6, \"ip\", \"$1\", \"NodeAddress\", \"(.+)\"))",
+          "legendFormat": "update_critic",
+          "range": true
+        },
+        {
+          "refId": "H",
+          "expr": "label_replace(ray_node_gpus_utilization{GpuIndex=~\"$gpu\", ip=~\"$node\"}, \"gpu\", \"$1\", \"GpuIndex\", \"(.+)\") and on (gpu, ip) (label_replace((max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\", role=\"rollout\"} == 1) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"} != 0 != 8) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"})) == 7, \"ip\", \"$1\", \"NodeAddress\", \"(.+)\") or label_replace((max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\", role=\"rollout\"} offset $__interval == 1) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"} offset $__interval != 0 != 8) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"} offset $__interval)) == 7, \"ip\", \"$1\", \"NodeAddress\", \"(.+)\"))",
+          "legendFormat": "weight_sync",
+          "range": true
+        },
+        {
+          "refId": "I",
+          "expr": "label_replace(ray_node_gpus_utilization{GpuIndex=~\"$gpu\", ip=~\"$node\"}, \"gpu\", \"$1\", \"GpuIndex\", \"(.+)\") and on (gpu, ip) (label_replace((max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\", role=\"rollout\"} == 1) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"} != 0 != 8) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"})) == 8, \"ip\", \"$1\", \"NodeAddress\", \"(.+)\") or label_replace((max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\", role=\"rollout\"} offset $__interval == 1) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"} offset $__interval != 0 != 8) or max by (gpu, NodeAddress) (ray_verl_gpu_phase{NodeAddress=~\"$node\"} offset $__interval)) == 8, \"ip\", \"$1\", \"NodeAddress\", \"(.+)\"))",
+          "legendFormat": "sleep",
           "range": true
         }
       ]
@@ -131,12 +576,18 @@
   ],
   "refresh": "10s",
   "schemaVersion": 39,
-  "tags": ["verl", "gpu", "rl"],
-  "templating": { "list": [] },
-  "time": { "from": "now-1h", "to": "now" },
+  "tags": [
+    "verl",
+    "gpu",
+    "rl"
+  ],
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
   "timepicker": {},
   "timezone": "browser",
-  "title": "verl · per-GPU phase & utilization",
+  "title": "verl \u00b7 per-GPU phase & utilization",
   "uid": "verl-gpu-phase",
   "version": 1,
   "weekStart": ""

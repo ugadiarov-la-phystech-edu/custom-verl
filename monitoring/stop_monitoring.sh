@@ -5,6 +5,9 @@
 # likewise persists under its homepath.
 set -uo pipefail
 
+# Keep in step with start_monitoring.sh: `ray metrics shutdown-prometheus` resolves the
+# running Prometheus through Ray's temp root, so it must see the same RAY_TMPDIR.
+export RAY_TMPDIR="${RAY_TMPDIR:-/tmp/ray}"
 MONITORING_HOME="${VERL_MONITORING_HOME:-${HOME}/.verl-monitoring}"
 GRAFANA_PID_FILE="${MONITORING_HOME}/grafana.pid"
 PROM_PID_FILE="${MONITORING_HOME}/prometheus.pid"
