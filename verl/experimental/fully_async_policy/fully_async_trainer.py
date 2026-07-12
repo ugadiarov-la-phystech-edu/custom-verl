@@ -20,6 +20,7 @@ from datetime import datetime
 from typing import Any
 
 import ray
+import torch
 from omegaconf import OmegaConf, open_dict
 from tqdm import tqdm
 
@@ -396,6 +397,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         # Use queue mode, no need for traditional dataloader iterator
         # Initialize to get the first batch of data
+        self._train_clock_start()
         while True:
             try:
                 await self.fit_step()
@@ -527,9 +529,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             step=self.current_param_version,
         )
 
-        # Log aggregated training metrics
         self.logger.log(
-            data=self.metrics_aggregator.get_aggregated_metrics(),
+            data={
+                **self.metrics_aggregator.get_aggregated_metrics(),
+                "training/train_time_s": self._train_clock_advance(),
+            },
             step=self.current_param_version,
         )
         self.metrics_aggregator.reset()
@@ -547,12 +551,16 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # Skip validation if not needed and not validation before training
         if not need_validate and not val_before_train:
             return
+        self._train_clock_advance()
+        if val_before_train:
+            self.logger.log(data={"training/train_time_s": self.train_time_s}, step=self.current_param_version)
         # Execute validation
         if self.config.async_training.use_trainer_do_validate:
             await self._trainer_side_validate()
         else:
             val_metrics = await self.rollouter.do_validate.remote()
             self.logger.log(data=val_metrics, step=self.current_param_version)
+        self._train_clock_skip()
 
     async def _trainer_side_validate(self):
         """Run trainer-side validation using hybrid rollout replicas."""
@@ -617,10 +625,12 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         ):
             if esi_close_to_expiration:
                 print("Force saving checkpoint: ESI instance expiration approaching.")
+            self._train_clock_advance()
             with marked_timer("save_checkpoint", timing_raw, color="green"):
                 # sleep replicas to avoid OOM during checkpoint saving
                 self._save_checkpoint()
                 self.last_ckpt_version = self.current_param_version
+            self._train_clock_skip()
 
     def _fit_postprocess_step(self):
         self.global_steps += 1
@@ -688,6 +698,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 max_ckpt_to_keep=max_critic_ckpt_to_keep,
             )
         ray.get(self.rollouter.save_checkpoint.remote(local_global_step_folder))
+
+        torch.save({"train_time_s": self.train_time_s}, os.path.join(local_global_step_folder, "train_time.pt"))
+
         # latest checkpointed iteration tracker (for atomic usage)
         local_latest_checkpointed_iteration = os.path.join(
             self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
@@ -745,6 +758,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self.critic_wg.load_checkpoint(
                 critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
             )
+
+        train_time_local_path = os.path.join(global_step_folder, "train_time.pt")
+        if os.path.exists(train_time_local_path):
+            self.train_time_s = float(torch.load(train_time_local_path, weights_only=False)["train_time_s"])
+            print(f"[FullyAsyncTrainer] Resuming training-time clock at {self.train_time_s:.1f}s")
 
         return self.current_param_version
 

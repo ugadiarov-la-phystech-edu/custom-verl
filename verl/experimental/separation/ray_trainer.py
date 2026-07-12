@@ -290,6 +290,8 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         )
 
         self.global_steps = 0
+        self.train_time_s = 0.0
+        self._train_clock_mark = None
 
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
@@ -303,6 +305,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
+            val_metrics["training/train_time_s"] = self.train_time_s
             self.logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 return
@@ -323,6 +326,7 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
         )
         self.next_step_profile = False
 
+        self._train_clock_start()
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
                 self.epoch = epoch
@@ -739,6 +743,9 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
 
         steps_duration = timing_raw["step"]
         self.max_steps_duration = max(self.max_steps_duration, steps_duration)
+
+        paused_s = timing_raw.get("testing", 0.0) + timing_raw.get("save_checkpoint", 0.0)
+        metrics["training/train_time_s"] = self._train_clock_advance(paused_s)
 
         # TODO: make a canonical logger that supports various backend
         self.logger.log(data=metrics, step=self.global_steps)

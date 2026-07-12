@@ -366,6 +366,8 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
         )
 
         self.global_steps = 0
+        self.train_time_s = 0.0
+        self._train_clock_mark = None
 
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
@@ -377,6 +379,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
+            val_metrics["training/train_time_s"] = self.train_time_s
             self.logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 return
@@ -399,6 +402,7 @@ class OneStepOffRayTrainer(SeparateRayPPOTrainer):
 
         # across epoch iterator
         continuous_iterator = self._create_continuous_iterator()
+        self._train_clock_start()
         # Start the first asynchronous generation task.
         batch_data_future = asyncio.create_task(self._async_gen_next_batch(continuous_iterator))
         while batch_data_future is not None:
