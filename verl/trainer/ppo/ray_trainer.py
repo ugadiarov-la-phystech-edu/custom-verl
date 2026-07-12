@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import time
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -298,6 +299,13 @@ class RayPPOTrainer:
     managing actor rollouts, critic training, and reward computation with Ray backend.
     Supports various model architectures including FSDP, Megatron, vLLM, and SGLang integration.
     """
+
+    # Training-time clock (training/train_time_s): cumulative wall time spent training, with
+    # validation and checkpoint saving excluded, so validation scores can be plotted against
+    # pure training time. Class-level defaults so every subclass has the fields regardless of
+    # its __init__ chain; _load_checkpoint restores train_time_s on resume.
+    train_time_s = 0.0
+    _train_clock_mark = None
 
     # TODO: support each role have individual ray_worker_group_cls,
     # i.e., support different backend of different role
@@ -1303,8 +1311,32 @@ class RayPPOTrainer:
         # sleep all replicas to load checkpoint
         self.checkpoint_manager.sleep_replicas()
 
+    def _train_clock_start(self):
+        """Start the training-time clock; call right before training-batch sampling begins."""
+        self._train_clock_mark = time.time()
+
+    def _train_clock_advance(self, paused_s: float = 0.0) -> float:
+        """Bank the wall time since the last mark, minus paused_s (validation / checkpoint
+        saving), as training time. No-op before the clock is started. Returns the total."""
+        if self._train_clock_mark is not None:
+            now = time.time()
+            self.train_time_s += now - self._train_clock_mark - paused_s
+            self._train_clock_mark = now
+        return self.train_time_s
+
+    def _train_clock_skip(self):
+        """Discard the wall time since the last mark (a pause that must not count as training)."""
+        if self._train_clock_mark is not None:
+            self._train_clock_mark = time.time()
+
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
+
+        # Snapshot the training-time clock now, before the slow weight save, so the persisted
+        # value excludes checkpoint-save time but includes the in-progress step's training time.
+        train_time_snapshot_s = self.train_time_s + (
+            time.time() - self._train_clock_mark if self._train_clock_mark is not None else 0.0
+        )
 
         # path: given_path + `/global_step_{global_steps}` + `/actor`
         local_global_step_folder = os.path.join(
@@ -1355,6 +1387,9 @@ class RayPPOTrainer:
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         dataloader_state_dict = self.train_dataloader.state_dict()
         torch.save(dataloader_state_dict, dataloader_local_path)
+
+        # save the training-time clock so training/train_time_s continues across resume
+        torch.save({"train_time_s": train_time_snapshot_s}, os.path.join(local_global_step_folder, "train_time.pt"))
 
         # latest checkpointed iteration tracker (for atomic usage)
         if (
@@ -1438,6 +1473,12 @@ class RayPPOTrainer:
                 self.train_dataloader.load_state_dict(dataloader_state_dict)
         else:
             print(f"Warning: No dataloader state found at {dataloader_local_path}, will start from scratch")
+
+        # restore the training-time clock (training/train_time_s metric)
+        train_time_local_path = os.path.join(global_step_folder, "train_time.pt")
+        if os.path.exists(train_time_local_path):
+            self.train_time_s = float(torch.load(train_time_local_path, weights_only=False)["train_time_s"])
+            print(f"Resuming training-time clock at {self.train_time_s:.1f}s")
 
     def _start_profiling(self, do_profile: bool) -> None:
         """Start profiling for all worker groups if profiling is enabled."""
@@ -1713,6 +1754,9 @@ class RayPPOTrainer:
         )
 
         self.global_steps = 0
+        # Reset the training-time clock; _load_checkpoint restores train_time_s on resume.
+        self.train_time_s = 0.0
+        self._train_clock_mark = None
 
         # load checkpoint and update weights before doing anything
         self._load_checkpoint()
@@ -1728,6 +1772,9 @@ class RayPPOTrainer:
             val_metrics = self._validate()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
+            # Give the pre-training validation point a training-time coordinate (0.0, or the
+            # restored clock on resume) so score-vs-train-time plots include it.
+            val_metrics["training/train_time_s"] = self.train_time_s
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 self._shutdown_dump_executor()
@@ -1754,6 +1801,8 @@ class RayPPOTrainer:
         # Partial-rollout carry-over substitutes its own per-step source (carried groups + fresh prompts);
         # _carry_first_step triggers the one-time cold-start over-sample on the first step.
         self._carry_first_step = True
+        # Training-time clock starts here: the loop below immediately samples from the train set.
+        self._train_clock_start()
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
             for batch_dict in self._carry_epoch_source() if self._partial_rollout else self.train_dataloader:
                 if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
@@ -2094,11 +2143,16 @@ class RayPPOTrainer:
                 steps_duration = timing_raw["step"]
                 self.max_steps_duration = max(self.max_steps_duration, steps_duration)
 
+                # Advance the training-time clock: everything since the previous step boundary
+                # counts as training except validation ("testing") and checkpoint saving.
+                paused_s = timing_raw.get("testing", 0.0) + timing_raw.get("save_checkpoint", 0.0)
+
                 # training metrics
                 metrics.update(
                     {
                         "training/global_step": self.global_steps,
                         "training/epoch": epoch,
+                        "training/train_time_s": self._train_clock_advance(paused_s),
                     }
                 )
                 # collect metrics

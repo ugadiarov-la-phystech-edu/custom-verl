@@ -20,6 +20,7 @@ from datetime import datetime
 from typing import Any
 
 import ray
+import torch
 from omegaconf import OmegaConf, open_dict
 from tqdm import tqdm
 
@@ -396,6 +397,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         # Use queue mode, no need for traditional dataloader iterator
         # Initialize to get the first batch of data
+        # Training-time clock starts here: the first fit_step immediately pulls samples produced
+        # from the train set. train_time_s itself is restored by load_checkpoint on resume.
+        self._train_clock_start()
         while True:
             try:
                 await self.fit_step()
@@ -527,9 +531,14 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             step=self.current_param_version,
         )
 
-        # Log aggregated training metrics
+        # Log aggregated training metrics. training/train_time_s lands on the same param-version
+        # step axis as the validation metrics, enabling score-vs-train-time plots. Validation for
+        # this param version runs after this point, so the clock value here already excludes it.
         self.logger.log(
-            data=self.metrics_aggregator.get_aggregated_metrics(),
+            data={
+                **self.metrics_aggregator.get_aggregated_metrics(),
+                "training/train_time_s": self._train_clock_advance(),
+            },
             step=self.current_param_version,
         )
         self.metrics_aggregator.reset()
@@ -547,12 +556,20 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # Skip validation if not needed and not validation before training
         if not need_validate and not val_before_train:
             return
+        # Bank training time up to here; validation must not count towards the clock.
+        self._train_clock_advance()
+        if val_before_train:
+            # Give the pre-training validation point a training-time coordinate (0.0, or the
+            # restored clock on resume) so score-vs-train-time plots include it.
+            self.logger.log(data={"training/train_time_s": self.train_time_s}, step=self.current_param_version)
         # Execute validation
         if self.config.async_training.use_trainer_do_validate:
             await self._trainer_side_validate()
         else:
             val_metrics = await self.rollouter.do_validate.remote()
             self.logger.log(data=val_metrics, step=self.current_param_version)
+        # Discard the validation pause from the training-time clock.
+        self._train_clock_skip()
 
     async def _trainer_side_validate(self):
         """Run trainer-side validation using hybrid rollout replicas."""
@@ -617,10 +634,14 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         ):
             if esi_close_to_expiration:
                 print("Force saving checkpoint: ESI instance expiration approaching.")
+            # Bank training time up to here; checkpoint saving must not count towards the clock.
+            self._train_clock_advance()
             with marked_timer("save_checkpoint", timing_raw, color="green"):
                 # sleep replicas to avoid OOM during checkpoint saving
                 self._save_checkpoint()
                 self.last_ckpt_version = self.current_param_version
+            # Discard the checkpoint-save pause from the training-time clock.
+            self._train_clock_skip()
 
     def _fit_postprocess_step(self):
         self.global_steps += 1
@@ -688,6 +709,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 max_ckpt_to_keep=max_critic_ckpt_to_keep,
             )
         ray.get(self.rollouter.save_checkpoint.remote(local_global_step_folder))
+
+        # save the training-time clock so training/train_time_s continues across resume
+        # (_fit_save_checkpoint banks the clock right before calling us, so no mark adjustment)
+        torch.save({"train_time_s": self.train_time_s}, os.path.join(local_global_step_folder, "train_time.pt"))
+
         # latest checkpointed iteration tracker (for atomic usage)
         local_latest_checkpointed_iteration = os.path.join(
             self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
@@ -745,6 +771,12 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self.critic_wg.load_checkpoint(
                 critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
             )
+
+        # restore the training-time clock (training/train_time_s metric)
+        train_time_local_path = os.path.join(global_step_folder, "train_time.pt")
+        if os.path.exists(train_time_local_path):
+            self.train_time_s = float(torch.load(train_time_local_path, weights_only=False)["train_time_s"])
+            print(f"[FullyAsyncTrainer] Resuming training-time clock at {self.train_time_s:.1f}s")
 
         return self.current_param_version
 
