@@ -35,6 +35,7 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.v1.engine.async_llm import AsyncLLM
 
 from verl.plugin.platform import get_platform
+from verl.utils import gpu_phase
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.device import get_resource_name, get_visible_devices_keyword, is_torch_npu_available
 from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
@@ -134,6 +135,9 @@ class vLLMHttpServer:
         self.node_rank = node_rank
         self.gpus_per_node = gpus_per_node
         self.nnodes = nnodes
+        # Physical GPU ids this server occupies on its node, used to tag the per-GPU phase metric
+        # so the rollout gen/sleep window lines up with ray_node_gpus_utilization{GpuIndex}.
+        self._phase_gpu_ids = [g for g in (cuda_visible_devices or "").split(",") if g.strip()]
         # model weights version, set by ServerAdapter when update weights.
         self.global_steps = None
         self._warned_missing_spec_decode_stats = False
@@ -614,6 +618,9 @@ class vLLMHttpServer:
         )
 
     async def wake_up(self, tags: list[str] | None = None):
+        # Engine awake => this replica's GPUs are generating. Mark before the node-rank guard so
+        # every node's GPUs are tagged (non-master nodes wake via the DP-coordinator broadcast).
+        gpu_phase.set_phase_gpus(self._phase_gpu_ids, gpu_phase.GEN, role="rollout", rank=self.replica_rank)
         if self.node_rank != 0:
             return
 
@@ -635,6 +642,9 @@ class vLLMHttpServer:
             logger.info("skip wake_up in standalone mode")
 
     async def sleep(self):
+        # Engine slept => this replica's GPUs are idle for generation (e.g. training the actor in
+        # colocated mode). Mark before the guard so all nodes' GPUs reflect the sleep.
+        gpu_phase.set_phase_gpus(self._phase_gpu_ids, gpu_phase.SLEEP, role="rollout", rank=self.replica_rank)
         if self.node_rank != 0 or not self.config.free_cache_engine:
             return
 
