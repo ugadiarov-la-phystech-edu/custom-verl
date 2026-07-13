@@ -16,6 +16,7 @@ from functools import partial, wraps
 from types import FunctionType
 
 from verl.protocol import DataProtoFuture, _padding_size_key
+from verl.utils import gpu_phase
 from verl.utils.py_functional import DynamicEnum
 from verl.utils.transferqueue_utils import tqbridge
 
@@ -422,18 +423,31 @@ def register(dispatch_mode=Dispatch.ALL_TO_ALL, execute_mode=Execute.ALL, blocki
     _check_execute_mode(execute_mode=execute_mode)
 
     def decorator(func):
+        phase_code = gpu_phase.METHOD_PHASE.get(getattr(func, "__name__", None))
         func = tqbridge(dispatch_mode=dispatch_mode)(func)
 
         @wraps(func)
         def inner(*args, **kwargs):
             if materialize_futures:
                 args, kwargs = _materialize_futures(*args, **kwargs)
+            if phase_code is not None and args and gpu_phase.enabled():
+                gpu_phase.set_phase(args[0], phase_code)
+                try:
+                    return func(*args, **kwargs)
+                finally:
+                    gpu_phase.set_phase(args[0], gpu_phase.IDLE)
             return func(*args, **kwargs)
 
         @wraps(func)
         async def async_inner(*args, **kwargs):
             if materialize_futures:
                 args, kwargs = _materialize_futures(*args, **kwargs)
+            if phase_code is not None and args and gpu_phase.enabled():
+                gpu_phase.set_phase(args[0], phase_code)
+                try:
+                    return await func(*args, **kwargs)
+                finally:
+                    gpu_phase.set_phase(args[0], gpu_phase.IDLE)
             return await func(*args, **kwargs)
 
         wrapper = async_inner if inspect.iscoroutinefunction(func) else inner
