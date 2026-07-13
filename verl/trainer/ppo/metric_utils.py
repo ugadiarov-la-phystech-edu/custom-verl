@@ -109,6 +109,8 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
             - response_length/mean, max, min, clip_ratio: Statistics about response lengths
             - prompt_length/mean, max, min, clip_ratio: Statistics about prompt lengths
             - num_turns/mean, max, min: Statistics about the number of multi-turn conversations
+            - groups/*: Per-uid-group all-correct/all-wrong counts and ratios
+              (see compute_group_reward_metrics)
     """
     sequence_score = batch.batch["token_level_scores"].sum(-1)
     sequence_reward = batch.batch["token_level_rewards"].sum(-1)
@@ -265,7 +267,67 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
         metrics["tool_call_counts/max"] = tool_call_counts.max()
         metrics["tool_call_counts/mean"] = tool_call_counts.mean()
 
+    metrics.update(compute_group_reward_metrics(batch))
+
     return metrics
+
+
+def compute_group_reward_metrics(batch: DataProto) -> dict[str, Any]:
+    """
+    Computes per-prompt-group reward uniformity metrics for group-based advantage estimators
+    (e.g. GRPO), where the ``rollout.n`` samples sharing ``non_tensor_batch["uid"]`` form a group.
+
+    A group is all-correct / all-wrong when every sample in it is correct / wrong. Per-sample
+    correctness comes from ``non_tensor_batch["acc"]`` when the reward function provides it
+    (e.g. math verifiers); otherwise a sample counts as correct when its sequence score
+    (sum of ``token_level_scores``) is positive. Uniform groups have zero within-group reward
+    variance, so under GRPO they produce zero advantages and contribute no gradient signal.
+
+    Args:
+        batch: A DataProto with ``non_tensor_batch["uid"]`` and either ``non_tensor_batch["acc"]``
+            or ``batch["token_level_scores"]``.
+
+    Returns:
+        A dictionary with:
+            - groups/count: number of groups in the batch
+            - groups/all_correct: number of groups where every sample is correct
+            - groups/all_correct_ratio: all-correct groups / all groups
+            - groups/all_wrong: number of groups where every sample is wrong
+            - groups/all_wrong_ratio: all-wrong groups / all groups
+        Empty when the batch has no ``uid`` grouping or no correctness signal.
+    """
+    uids = batch.non_tensor_batch.get("uid")
+    if uids is None or len(uids) == 0:
+        return {}
+
+    correct = None
+    acc = batch.non_tensor_batch.get("acc")
+    if acc is not None:
+        try:
+            correct = np.asarray(acc, dtype=np.float64) > 0.5
+        except (TypeError, ValueError):
+            correct = None  # non-numeric extra info; fall back to sequence scores
+    if correct is None:
+        if "token_level_scores" not in batch.batch:
+            return {}
+        correct = (batch.batch["token_level_scores"].sum(-1) > 0).cpu().numpy()
+
+    group_total: dict[Any, int] = defaultdict(int)
+    group_correct: dict[Any, int] = defaultdict(int)
+    for uid, is_correct in zip(uids, correct):
+        group_total[uid] += 1
+        group_correct[uid] += int(is_correct)
+
+    n_groups = len(group_total)
+    all_correct = sum(1 for uid, total in group_total.items() if group_correct[uid] == total)
+    all_wrong = sum(1 for uid in group_total if group_correct[uid] == 0)
+    return {
+        "groups/count": n_groups,
+        "groups/all_correct": all_correct,
+        "groups/all_correct_ratio": all_correct / n_groups,
+        "groups/all_wrong": all_wrong,
+        "groups/all_wrong_ratio": all_wrong / n_groups,
+    }
 
 
 def compute_timing_metrics(batch: DataProto, timing_raw: dict[str, float]) -> dict[str, Any]:
