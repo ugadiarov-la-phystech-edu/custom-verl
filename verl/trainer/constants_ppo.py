@@ -63,4 +63,10 @@ def get_ppo_ray_runtime_env():
     for key in list(runtime_env["env_vars"].keys()):
         if os.environ.get(key) is not None:
             runtime_env["env_vars"].pop(key, None)
+    # Per-GPU phase monitoring (verl.utils.gpu_phase) is configured on the driver, but Ray
+    # workers inherit env from the raylet, which may predate these exports when the cluster
+    # was started standalone (monitoring "Option A"). Forward the driver's values explicitly.
+    for key in ("VERL_GPU_PHASE_MONITOR", "VERL_GPU_PHASE_HEARTBEAT_S"):
+        if os.environ.get(key) is not None:
+            runtime_env["env_vars"][key] = os.environ[key]
     return runtime_env

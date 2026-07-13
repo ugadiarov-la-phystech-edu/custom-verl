@@ -183,7 +183,9 @@ if curl -sf http://localhost:9090/-/ready >/dev/null 2>&1; then
         echo "  Restart it: bash $(dirname "${BASH_SOURCE[0]}")/stop_monitoring.sh && $0"
     fi
 else
-    PROM_BIN="$(ls -d "${MONITORING_HOME}"/prometheus-*/prometheus 2>/dev/null | sort -V | tail -1)"
+    # `|| true`: on a fresh install the glob matches nothing and ls fails; without the guard
+    # set -euo pipefail would abort here instead of reaching the Ray-launcher fallback below.
+    PROM_BIN="$(ls -d "${MONITORING_HOME}"/prometheus-*/prometheus 2>/dev/null | sort -V | tail -1 || true)"
     if [ -n "${PROM_BIN}" ] && [ -x "${PROM_BIN}" ]; then
         # Same data dir the Ray launcher uses (its CWD default), so history is continuous.
         nohup "${PROM_BIN}" \
