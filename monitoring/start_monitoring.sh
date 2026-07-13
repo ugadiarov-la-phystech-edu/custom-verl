@@ -119,7 +119,7 @@ if curl -sf http://localhost:9090/-/ready >/dev/null 2>&1; then
         echo "  Restart it: bash $(dirname "${BASH_SOURCE[0]}")/stop_monitoring.sh && $0"
     fi
 else
-    PROM_BIN="$(ls -d "${MONITORING_HOME}"/prometheus-*/prometheus 2>/dev/null | sort -V | tail -1)"
+    PROM_BIN="$(ls -d "${MONITORING_HOME}"/prometheus-*/prometheus 2>/dev/null | sort -V | tail -1 || true)"
     if [ -n "${PROM_BIN}" ] && [ -x "${PROM_BIN}" ]; then
         nohup "${PROM_BIN}" \
             --config.file "${STABLE_PROM_CFG}" \

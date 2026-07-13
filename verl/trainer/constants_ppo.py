@@ -63,4 +63,7 @@ def get_ppo_ray_runtime_env():
     for key in list(runtime_env["env_vars"].keys()):
         if os.environ.get(key) is not None:
             runtime_env["env_vars"].pop(key, None)
+    for key in ("VERL_GPU_PHASE_MONITOR", "VERL_GPU_PHASE_HEARTBEAT_S"):
+        if os.environ.get(key) is not None:
+            runtime_env["env_vars"][key] = os.environ[key]
     return runtime_env
