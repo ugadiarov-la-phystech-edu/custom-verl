@@ -82,6 +82,64 @@ def _env_flag(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in ("1", "true", "yes")
 
 
+def validate_partial_rollout_config(config, oversample_discard: bool = False) -> None:
+    """Validate the trainer config for partial-rollout carry-over (VERL_PARTIAL_ROLLOUT=1).
+    Raises ``ValueError`` on any incompatible setting. ``gen_batch_size`` may be any value
+    strictly greater than ``train_batch_size`` — a non-integer multiple k is supported (the
+    cold-start over-sample buffers the surplus groups of the last dataloader batch it pulls)."""
+    tbs = config.data.train_batch_size
+    gen_bs = config.data.get("gen_batch_size", tbs)
+    if oversample_discard:
+        raise ValueError(
+            "VERL_PARTIAL_ROLLOUT=1 and VERL_OVERSAMPLE_DISCARD=1 are mutually exclusive: both "
+            "consume the over-sampled long-tail (discard throws it away, partial-rollout carries "
+            "it forward). Set exactly one."
+        )
+    if config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
+        raise ValueError(
+            "VERL_PARTIAL_ROLLOUT=1 is incompatible with adv_estimator=remax "
+            "(REMAX's greedy-baseline slice cannot be reconciled with the per-uid carry gate)."
+        )
+    if gen_bs <= tbs:
+        raise ValueError(
+            "VERL_PARTIAL_ROLLOUT=1 requires data.gen_batch_size > data.train_batch_size (got "
+            f"gen_batch_size={gen_bs}, train_batch_size={tbs}); "
+            "otherwise there is no over-sampled tail to carry."
+        )
+    agent_cfg = config.actor_rollout_ref.rollout.get("agent", {})
+    if agent_cfg.get("default_agent_loop") != "single_turn_agent" or agent_cfg.get("agent_loop_config_path"):
+        raise ValueError(
+            "VERL_PARTIAL_ROLLOUT=1 currently supports only the single-turn agent loop "
+            "(partial capture of a mid-tool-call multi-turn rollout is not defined). Got "
+            f"default_agent_loop={agent_cfg.get('default_agent_loop')!r}, "
+            f"agent_loop_config_path={agent_cfg.get('agent_loop_config_path')!r}."
+        )
+    if not config.actor_rollout_ref.rollout.get("calculate_log_probs", False):
+        raise ValueError(
+            "VERL_PARTIAL_ROLLOUT=1 requires actor_rollout_ref.rollout.calculate_log_probs=True: "
+            "carried responses mix policy versions, so per-token rollout log-probs are needed as "
+            "the behavior-policy denominator (Layer-1 correctness). Enable it (and optionally "
+            "algorithm.rollout_correction for rollout importance sampling)."
+        )
+    agent_num_workers = config.actor_rollout_ref.rollout.agent.num_workers
+    if gen_bs % agent_num_workers != 0:
+        raise ValueError(
+            "VERL_PARTIAL_ROLLOUT=1 requires actor_rollout_ref.rollout.agent.num_workers to divide "
+            f"data.gen_batch_size (got num_workers={agent_num_workers}, gen_batch_size={gen_bs}): "
+            "the carry pool always holds exactly gen_batch_size prompt-groups at generation time and "
+            "AgentLoopManager splits it into num_workers equal chunks, which must land on group "
+            "boundaries (all rollout.n rollouts of a group must reach the same worker for the "
+            "completion gate to see the group)."
+        )
+    rollout_cfg = config.actor_rollout_ref.rollout
+    if rollout_cfg.get("name") == "vllm" and rollout_cfg.get("scheduling_policy", "fcfs") != "priority":
+        print(
+            "[partial_rollout] Hint: set actor_rollout_ref.rollout.scheduling_policy=priority so "
+            "carried partials are scheduled ahead of fresh requests and retire in one extra step "
+            "instead of being aborted repeatedly (fcfs is correct but slower to drain the carry pool)."
+        )
+
+
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
     """Apply KL penalty to the token-level rewards.
 
@@ -389,68 +447,9 @@ class RayPPOTrainer:
 
         self._partial_rollout = _env_flag("VERL_PARTIAL_ROLLOUT")
         self._carry_pool: dict = {}
+        self._carry_leftover: Optional[DataProto] = None
         if self._partial_rollout:
-            if self._oversample_discard:
-                raise ValueError(
-                    "VERL_PARTIAL_ROLLOUT=1 and VERL_OVERSAMPLE_DISCARD=1 are mutually exclusive: both "
-                    "consume the over-sampled long-tail (discard throws it away, partial-rollout carries "
-                    "it forward). Set exactly one."
-                )
-            if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
-                raise ValueError(
-                    "VERL_PARTIAL_ROLLOUT=1 is incompatible with adv_estimator=remax "
-                    "(REMAX's greedy-baseline slice cannot be reconciled with the per-uid carry gate)."
-                )
-            gen_bs = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
-            if gen_bs <= self.config.data.train_batch_size:
-                raise ValueError(
-                    "VERL_PARTIAL_ROLLOUT=1 requires data.gen_batch_size > data.train_batch_size (got "
-                    f"gen_batch_size={gen_bs}, train_batch_size={self.config.data.train_batch_size}); "
-                    "otherwise there is no over-sampled tail to carry."
-                )
-            agent_cfg = self.config.actor_rollout_ref.rollout.get("agent", {})
-            if agent_cfg.get("default_agent_loop") != "single_turn_agent" or agent_cfg.get("agent_loop_config_path"):
-                raise ValueError(
-                    "VERL_PARTIAL_ROLLOUT=1 currently supports only the single-turn agent loop "
-                    "(partial capture of a mid-tool-call multi-turn rollout is not defined). Got "
-                    f"default_agent_loop={agent_cfg.get('default_agent_loop')!r}, "
-                    f"agent_loop_config_path={agent_cfg.get('agent_loop_config_path')!r}."
-                )
-            if not self.config.actor_rollout_ref.rollout.get("calculate_log_probs", False):
-                raise ValueError(
-                    "VERL_PARTIAL_ROLLOUT=1 requires actor_rollout_ref.rollout.calculate_log_probs=True: "
-                    "carried responses mix policy versions, so per-token rollout log-probs are needed as "
-                    "the behavior-policy denominator (Layer-1 correctness). Enable it (and optionally "
-                    "algorithm.rollout_correction for rollout importance sampling)."
-                )
-            if (
-                self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
-                % (self.config.data.train_batch_size)
-                != 0
-            ):
-                raise ValueError(
-                    "VERL_PARTIAL_ROLLOUT=1 requires data.gen_batch_size to be an integer multiple of "
-                    f"data.train_batch_size (got gen_batch_size={gen_bs}, "
-                    f"train_batch_size={self.config.data.train_batch_size}); the cold-start over-sample "
-                    "pulls gen_batch_size/train_batch_size dataloader batches on the first step."
-                )
-            agent_num_workers = self.config.actor_rollout_ref.rollout.agent.num_workers
-            if self.config.data.train_batch_size % agent_num_workers != 0:
-                raise ValueError(
-                    "VERL_PARTIAL_ROLLOUT=1 requires actor_rollout_ref.rollout.agent.num_workers to divide "
-                    f"data.train_batch_size (got num_workers={agent_num_workers}, "
-                    f"train_batch_size={self.config.data.train_batch_size}): the carry pool is always a "
-                    "multiple of train_batch_size prompt-groups and AgentLoopManager splits it into "
-                    "num_workers equal chunks, which must land on group boundaries (all rollout.n rollouts "
-                    "of a group must reach the same worker for the completion gate to see the group)."
-                )
-            rollout_cfg = self.config.actor_rollout_ref.rollout
-            if rollout_cfg.get("name") == "vllm" and rollout_cfg.get("scheduling_policy", "fcfs") != "priority":
-                print(
-                    "[partial_rollout] Hint: set actor_rollout_ref.rollout.scheduling_policy=priority so "
-                    "carried partials are scheduled ahead of fresh requests and retire in one extra step "
-                    "instead of being aborted repeatedly (fcfs is correct but slower to drain the carry pool)."
-                )
+            validate_partial_rollout_config(self.config, oversample_discard=self._oversample_discard)
 
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
@@ -530,8 +529,8 @@ class RayPPOTrainer:
         total_training_steps = len(self.train_dataloader) * self.config.trainer.total_epochs
         if getattr(self, "_partial_rollout", False):
             tbs = self.config.data.train_batch_size
-            k = self.config.data.get("gen_batch_size", tbs) // tbs
-            total_training_steps -= k - 1
+            gen_bs = self.config.data.get("gen_batch_size", tbs)
+            total_training_steps -= (gen_bs + tbs - 1) // tbs - 1
 
         if self.config.trainer.total_training_steps is not None:
             total_training_steps = self.config.trainer.total_training_steps
@@ -751,25 +750,41 @@ class RayPPOTrainer:
 
     def _carry_epoch_source(self):
         """Yield one ``fresh-groups`` DataProto per training step for partial-rollout carry-over (one
-        epoch's worth). Each step draws ``train_batch_size`` fresh groups; the very first step of training
-        draws ``gen_batch_size`` (``k`` batches) to bootstrap the over-sampled pool. Uses a single
-        iterator so no sample is double-consumed; relies on ``self._carry_first_step`` for the one-time
-        cold-start over-sample."""
+        epoch's worth). Each step draws exactly ``train_batch_size`` fresh groups; the very first step
+        of training draws ``gen_batch_size`` to bootstrap the over-sampled pool. ``gen_batch_size``
+        need not be an integer multiple of ``train_batch_size``: the cold start pulls
+        ``ceil(gen/tbs)`` dataloader batches and stashes the surplus groups in
+        ``self._carry_leftover``, which later draws consume before pulling the next batch (so no
+        sample is double-consumed or skipped). The leftover persists across epochs; a draw that cannot
+        be filled completely ends the epoch (keeping every yield full-sized preserves the pool ==
+        gen_batch_size groups invariant the agent-loop worker chunking relies on), stashing whatever
+        was pulled for the next epoch's iterator. Relies on ``self._carry_first_step`` for the
+        one-time cold-start over-sample."""
         tbs = self.config.data.train_batch_size
-        k = self.config.data.get("gen_batch_size", tbs) // tbs
+        gen_bs = self.config.data.get("gen_batch_size", tbs)
         data_iter = iter(self.train_dataloader)
         while True:
-            n_pull = k if self._carry_first_step else 1
-            parts = []
+            need = gen_bs if self._carry_first_step else tbs
+            parts = [] if self._carry_leftover is None else [self._carry_leftover]
+            self._carry_leftover = None
+            have = sum(len(p) for p in parts)
             try:
-                for _ in range(n_pull):
-                    parts.append(DataProto.from_single_dict(next(data_iter)))
+                while have < need:
+                    part = DataProto.from_single_dict(next(data_iter))
+                    parts.append(part)
+                    have += len(part)
             except StopIteration:
                 pass
-            self._carry_first_step = False
-            if not parts:
+            if have < need:
+                if parts:
+                    self._carry_leftover = parts[0] if len(parts) == 1 else DataProto.concat(parts)
                 break
-            yield parts[0] if len(parts) == 1 else DataProto.concat(parts)
+            self._carry_first_step = False
+            merged = parts[0] if len(parts) == 1 else DataProto.concat(parts)
+            if have > need:
+                self._carry_leftover = merged.select_idxs(list(range(need, have)))
+                merged = merged.select_idxs(list(range(need)))
+            yield merged
 
     def _carry_build_gen_batch(self, new_groups: DataProto) -> DataProto:
         """Register the fresh groups in the carry pool, then build the rollout-level generation batch:
@@ -1740,6 +1755,7 @@ class RayPPOTrainer:
         next_step_profile = False
 
         self._carry_first_step = True
+        self._carry_leftover = None
         self._train_clock_start()
         for epoch in range(current_epoch, self.config.trainer.total_epochs):
             for batch_dict in self._carry_epoch_source() if self._partial_rollout else self.train_dataloader:
