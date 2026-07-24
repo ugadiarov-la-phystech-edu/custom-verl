@@ -214,14 +214,14 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "ray_verl_gpu_phase{role=\"rollout\"}",
+          "expr": "max by (gpu, role, NodeAddress) (ray_verl_gpu_phase{role=\"rollout\"})",
           "legendFormat": "gpu {{gpu}} \u00b7 {{role}} \u00b7 {{NodeAddress}}",
           "range": true,
           "instant": false
         },
         {
           "refId": "B",
-          "expr": "(ray_verl_gpu_phase{role!=\"rollout\"} unless on (gpu, NodeAddress) (ray_verl_gpu_phase{role=\"rollout\"} == 1)) or (ray_verl_gpu_phase{role!=\"rollout\"} * 0 and on (gpu, NodeAddress) (ray_verl_gpu_phase{role=\"rollout\"} == 1))",
+          "expr": "max by (gpu, role, NodeAddress) ((ray_verl_gpu_phase{role!=\"rollout\"} unless on (gpu, NodeAddress) (ray_verl_gpu_phase{role=\"rollout\"} == 1)) or (ray_verl_gpu_phase{role!=\"rollout\"} * 0 and on (gpu, NodeAddress) (ray_verl_gpu_phase{role=\"rollout\"} == 1)))",
           "legendFormat": "gpu {{gpu}} \u00b7 {{role}} \u00b7 {{NodeAddress}}",
           "range": true,
           "instant": false
