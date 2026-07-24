@@ -46,6 +46,7 @@ from pydantic import BaseModel, ConfigDict
 from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
 
+from verl.experimental.agent_loop.batch_gate import classify_discarded_rollouts
 from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.protocol import DataProto
 from verl.tools.tool_registry import load_all_tools
@@ -614,11 +615,28 @@ class AgentLoopWorker:
 
         carry = bool(batch.meta_info.get("partial_carry", False))
         if not carry:
-            for t in pending:
-                t.cancel()
-            if not done_signal.done():
-                done_signal.cancel()
-            await asyncio.gather(*pending, done_signal, return_exceptions=True)
+            if batch.meta_info.get("gate_abort", False):
+                if not done_signal.done():
+                    done_signal.cancel()
+                leftover = list(pending)
+                gathered = await asyncio.gather(*leftover, done_signal, return_exceptions=True)
+                for t, res in zip(leftover, gathered[:-1], strict=True):
+                    if isinstance(res, BaseException):
+                        continue
+                    results[task_to_row[t]] = res
+                accepted_set = set(accepted_rows)
+                token_counts = {
+                    i: int(res.response_mask.sum().item()) for i, res in results.items() if i not in accepted_set
+                }
+                await batch_gate.report_discard.remote(
+                    classify_discarded_rollouts(group_rows, accepted_rows, token_counts)
+                )
+            else:
+                for t in pending:
+                    t.cancel()
+                if not done_signal.done():
+                    done_signal.cancel()
+                await asyncio.gather(*pending, done_signal, return_exceptions=True)
 
             if not accepted_rows:
                 return None
@@ -1222,6 +1240,7 @@ class AgentLoopManager:
         """
         target = prompts.meta_info.get("keep_complete_groups", 0)
         partial_carry = bool(prompts.meta_info.get("partial_carry", False))
+        classify_discarded = bool(prompts.meta_info.get("classify_discarded", False))
         batch_gate = None
         if target and target > 0:
             from verl.experimental.agent_loop.batch_gate import BatchGate
@@ -1229,7 +1248,8 @@ class AgentLoopManager:
             batch_gate = BatchGate.remote(target)
 
         abort_task = None
-        if partial_carry and batch_gate is not None and self.server_manager is not None:
+        if batch_gate is not None and (partial_carry or classify_discarded) and self.server_manager is not None:
+            prompts.meta_info["gate_abort"] = True
 
             async def _abort_when_done():
                 await batch_gate.wait_until_done.remote()
@@ -1257,6 +1277,9 @@ class AgentLoopManager:
         timing = self._performance_metrics(metrics, output)
 
         output.meta_info = {"timing": timing, **outputs[0].meta_info}
+        if batch_gate is not None and classify_discarded:
+            output.meta_info["rollout_discard_stats"] = await batch_gate.get_discard_stats.remote()
+            output.meta_info["engine_aborted"] = abort_task is not None
         return output
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:

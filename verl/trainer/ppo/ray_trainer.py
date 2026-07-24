@@ -875,12 +875,17 @@ class RayPPOTrainer:
         for col in ("uid", "__carry_role__", "prefix_response_ids", "prefix_logprobs", "carry_done", "agent_name"):
             gen_batch_output.non_tensor_batch.pop(col, None)
 
+        n_zero_token_rollouts = sum(1 for e in survivors.values() for r in e["rollouts"] if len(r["ids"]) == 0)
+        n_zero_token_groups = sum(1 for e in survivors.values() if all(len(r["ids"]) == 0 for r in e["rollouts"]))
+
         carry_metrics = {
             "rollout_carry/carried_groups": len(survivors),
             "rollout_carry/harvested_groups": len(ordered),
             "rollout_carry/pool_groups": len(self._carry_pool_uids),
             "rollout_carry/force_finished_rollouts": n_force_finished,
             "rollout_carry/retried_groups": n_retried_groups,
+            "rollout_carry/zero_token_groups": n_zero_token_groups,
+            "rollout_carry/zero_token_rollouts": n_zero_token_rollouts,
         }
         if carry_depths:
             carry_metrics["rollout_carry/carry_depth_mean"] = float(np.mean(carry_depths))
@@ -1808,6 +1813,7 @@ class RayPPOTrainer:
                         num_sampled_prompts = len(gen_batch_output)
                         if self._oversample_discard:
                             combined_gen_batch.meta_info["keep_complete_groups"] = self.config.data.train_batch_size
+                            combined_gen_batch.meta_info["classify_discarded"] = True
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
@@ -1819,7 +1825,8 @@ class RayPPOTrainer:
                             self.llm_server_manager.reset_batch_stats()
                         combined_gen_output = self.async_rollout_manager.generate_sequences(combined_gen_batch)
                         if self._oversample_discard:
-                            self.llm_server_manager.abort_all_requests()
+                            if not combined_gen_output.meta_info.pop("engine_aborted", False):
+                                self.llm_server_manager.abort_all_requests()
                             self.llm_server_manager.resume_generation()
                         if self._partial_rollout:
                             self.llm_server_manager.resume_generation()
@@ -1836,6 +1843,9 @@ class RayPPOTrainer:
                         batch, gen_batch_output, carry_metrics = self._carry_harvest(combined_gen_output)
                         metrics.update(carry_metrics)
                     elif self._oversample_discard:
+                        discard_stats = combined_gen_output.meta_info.pop("rollout_discard_stats", None)
+                        if discard_stats:
+                            metrics.update({f"rollout_discard/{k}": v for k, v in discard_stats.items()})
                         gen_batch_output = combined_gen_output
                         ordered_uids = list(dict.fromkeys(gen_batch_output.non_tensor_batch["uid"].tolist()))
                         uid_to_row = {uid: row for row, uid in enumerate(batch.non_tensor_batch["uid"])}

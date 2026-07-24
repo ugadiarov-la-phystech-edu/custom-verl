@@ -16,14 +16,17 @@ Tests for partial-rollout carry-over (VERL_PARTIAL_ROLLOUT=1) fresh-prompt sourc
 RayPPOTrainer, with mixed (non-integer) gen_batch_size / train_batch_size ratios.
 
 Covers `_carry_epoch_source` (cold-start over-sample, leftover buffering across steps and
-epochs, exact sample accounting) and `validate_partial_rollout_config` (the config gate,
-including the num_workers-divides-gen_batch_size requirement).
+epochs, exact sample accounting), `_carry_harvest` metrics (zero-token / never-started
+carried groups), and `validate_partial_rollout_config` (the config gate, including the
+num_workers-divides-gen_batch_size requirement).
 """
 
+import numpy as np
 import pytest
 import torch
 from omegaconf import OmegaConf
 
+from verl.protocol import DataProto
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer, validate_partial_rollout_config
 
 
@@ -156,6 +159,81 @@ def test_cold_start_spans_epochs_on_tiny_dataset():
     draws = _run_epochs(trainer, epochs=1)
     assert [len(d) for d in draws] == [6, 2]
     assert draws[0] == [0, 1, 2, 3, 0, 1]
+
+
+# ---------------------------------------------------------------------------
+# _carry_harvest metrics
+# ---------------------------------------------------------------------------
+
+
+class _FakeTokenizer:
+    eos_token_id = 2
+
+
+def test_carry_harvest_counts_zero_token_groups():
+    # Pool of 4 groups with n=2 rollouts each. A is harvested; B was aborted mid-generation
+    # (one rollout finished, one never started); C never started at all; D comes back
+    # malformed (one rollout errored) and is retried from its previous (empty) state.
+    trainer = RayPPOTrainer.__new__(RayPPOTrainer)
+    trainer.config = OmegaConf.create({"actor_rollout_ref": {"rollout": {"n": 2}}})
+    trainer.tokenizer = _FakeTokenizer()
+    pool_uids = ["A", "B", "C", "D"]
+    pool_batch = DataProto.from_single_dict({"prompt": torch.tensor([[10], [20], [30], [40]])})
+    trainer._carry_pool = {
+        uid: {
+            "batch_row": pool_batch.select_idxs([row]),
+            "rollouts": [{"ids": [], "logprobs": [], "finished": False} for _ in range(2)],
+            "depth": 0,
+        }
+        for row, uid in enumerate(pool_uids)
+    }
+    trainer._carry_pool_batch = pool_batch
+    trainer._carry_pool_uids = pool_uids
+
+    responses = torch.tensor(
+        [
+            [5, 6, 2, 0],  # A rollout 0: harvested
+            [7, 2, 0, 0],  # A rollout 1: harvested
+            [9, 2, 0, 0],  # B rollout 0: finished naturally (group still waits for rollout 1)
+            [0, 0, 0, 0],  # B rollout 1: never started
+            [0, 0, 0, 0],  # C rollout 0: never started
+            [0, 0, 0, 0],  # C rollout 1: never started
+            [4, 4, 4, 4],  # D rollout 0 (rollout 1 errored -> whole group retried)
+        ]
+    )
+    combined = DataProto.from_single_dict(
+        {
+            "responses": responses,
+            "response_mask": (responses != 0).to(torch.int64),
+            "uid": np.array(["A", "A", "B", "B", "C", "C", "D"], dtype=object),
+            "__carry_role__": np.array(
+                ["harvest", "harvest", "carry", "carry", "carry", "carry", "carry"], dtype=object
+            ),
+            "stop_reason": np.array(
+                ["completed", "completed", "completed", "aborted", "aborted", "aborted", "aborted"], dtype=object
+            ),
+        }
+    )
+
+    batch, gen_batch_output, m = trainer._carry_harvest(combined)
+
+    assert m["rollout_carry/harvested_groups"] == 1
+    assert m["rollout_carry/carried_groups"] == 3
+    assert m["rollout_carry/pool_groups"] == 4
+    assert m["rollout_carry/retried_groups"] == 1
+    assert m["rollout_carry/force_finished_rollouts"] == 0
+    # B rollout 1, both C rollouts, and retried D's kept empty state -> 5 zero-token rollouts.
+    assert m["rollout_carry/zero_token_rollouts"] == 5
+    # C never produced a token; D's kept previous state is also all-empty -> 2 never-started groups.
+    assert m["rollout_carry/zero_token_groups"] == 2
+
+    assert set(trainer._carry_pool) == {"B", "C", "D"}
+    b_rollouts = trainer._carry_pool["B"]["rollouts"]
+    assert b_rollouts[0] == {"ids": [9, 2], "logprobs": None, "finished": True}
+    assert b_rollouts[1] == {"ids": [], "logprobs": None, "finished": False}
+    assert trainer._carry_pool["D"]["rollouts"][0]["ids"] == []
+    assert len(gen_batch_output) == 2
+    assert batch.batch["prompt"].tolist() == [[10]]
 
 
 # ---------------------------------------------------------------------------
