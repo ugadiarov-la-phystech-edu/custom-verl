@@ -28,12 +28,52 @@ import asyncio
 import ray
 
 
+def classify_discarded_rollouts(
+    group_rows: dict, accepted_rows: list[int], token_counts: dict[int, int]
+) -> dict[str, int]:
+    """Classify the discarded prompt-groups of one worker chunk into "never started" (the engine
+    produced zero tokens before the abort) vs "aborted with partial output".
+
+    Args:
+        group_rows: uid -> row indices of that group's rollouts in the chunk.
+        accepted_rows: rows of the groups accepted by the gate (whole groups).
+        token_counts: row -> number of LLM-generated tokens the rollout returned on abort.
+            Rows without a result (errored/cancelled) are absent, so their group is never
+            classified as "never started".
+    """
+    accepted = set(accepted_rows)
+    stats = {
+        "discarded_groups": 0,
+        "never_started_groups": 0,
+        "discarded_rollouts": 0,
+        "never_started_rollouts": 0,
+        "discarded_tokens": 0,
+    }
+    for rows in group_rows.values():
+        if any(i in accepted for i in rows):
+            continue
+        counts = [token_counts.get(i) for i in rows]
+        stats["discarded_groups"] += 1
+        stats["discarded_rollouts"] += len(rows)
+        stats["never_started_rollouts"] += sum(1 for c in counts if c == 0)
+        stats["discarded_tokens"] += sum(c for c in counts if c)
+        if counts and all(c == 0 for c in counts):
+            stats["never_started_groups"] += 1
+    return stats
+
+
 class GateCounter:
     """Ray-free accept-counter logic (unit-testable without a Ray runtime)."""
 
     def __init__(self, target: int):
         self.target = target
         self.count = 0
+        self.discard_stats: dict[str, int] = {}
+
+    def report_discard(self, stats: dict[str, int]) -> None:
+        """Accumulate one worker's discarded-rollout stats (summed across workers)."""
+        for key, value in stats.items():
+            self.discard_stats[key] = self.discard_stats.get(key, 0) + int(value)
 
     def offer(self) -> bool:
         """Accept one group if still under ``target``; otherwise reject."""
@@ -68,6 +108,14 @@ class BatchGate:
         if self._counter.done:
             self._done.set()
         return accepted
+
+    def report_discard(self, stats: dict) -> None:
+        """Accumulate one worker's discarded-rollout stats (see ``classify_discarded_rollouts``)."""
+        self._counter.report_discard(stats)
+
+    def get_discard_stats(self) -> dict:
+        """Global discarded-rollout stats summed over every worker's ``report_discard``."""
+        return dict(self._counter.discard_stats)
 
     async def wait_until_done(self) -> None:
         """Resolve once ``target`` groups have been accepted globally."""

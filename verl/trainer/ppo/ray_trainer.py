@@ -930,12 +930,19 @@ class RayPPOTrainer:
         for col in ("uid", "__carry_role__", "prefix_response_ids", "prefix_logprobs", "carry_done", "agent_name"):
             gen_batch_output.non_tensor_batch.pop(col, None)
 
+        # Carried rollouts with no accumulated tokens were never scheduled by the engine before the
+        # abort ("never started"), as opposed to aborted mid-generation with partial output.
+        n_zero_token_rollouts = sum(1 for e in survivors.values() for r in e["rollouts"] if len(r["ids"]) == 0)
+        n_zero_token_groups = sum(1 for e in survivors.values() if all(len(r["ids"]) == 0 for r in e["rollouts"]))
+
         carry_metrics = {
             "rollout_carry/carried_groups": len(survivors),
             "rollout_carry/harvested_groups": len(ordered),
             "rollout_carry/pool_groups": len(self._carry_pool_uids),
             "rollout_carry/force_finished_rollouts": n_force_finished,
             "rollout_carry/retried_groups": n_retried_groups,
+            "rollout_carry/zero_token_groups": n_zero_token_groups,
+            "rollout_carry/zero_token_rollouts": n_zero_token_rollouts,
         }
         if carry_depths:
             carry_metrics["rollout_carry/carry_depth_mean"] = float(np.mean(carry_depths))
@@ -1881,6 +1888,10 @@ class RayPPOTrainer:
                             # Keep only the fastest train_batch_size complete groups; discard the rest.
                             # gen_batch holds the over-sampled k*train_batch_size prompts (gen_batch_size).
                             combined_gen_batch.meta_info["keep_complete_groups"] = self.config.data.train_batch_size
+                            # Abort the long-tail at gate-fill and classify each discarded rollout
+                            # (never-started vs aborted-with-partial-output) before dropping it;
+                            # counts come back in meta_info["rollout_discard_stats"].
+                            combined_gen_batch.meta_info["classify_discarded"] = True
 
                 is_last_step = self.global_steps >= self.total_training_steps
                 with marked_timer("step", timing_raw):
@@ -1894,10 +1905,13 @@ class RayPPOTrainer:
                             self.llm_server_manager.reset_batch_stats()
                         combined_gen_output = self.async_rollout_manager.generate_sequences(combined_gen_batch)
                         if self._oversample_discard:
-                            # Flush the discarded long-tail's in-flight vLLM requests, then re-arm the
-                            # engine (abort_all_requests leaves it paused on vLLM >= 0.12). Must run
-                            # before sleep_replicas while the engine is still awake.
-                            self.llm_server_manager.abort_all_requests()
+                            # The manager normally aborts the discarded long-tail at gate-fill (to
+                            # classify the partials), leaving the engine paused; if it could not
+                            # (no server manager), flush the long-tail here instead. Either way
+                            # re-arm the engine (abort_all_requests leaves it paused on vLLM >=
+                            # 0.12) before sleep_replicas while the engine is still awake.
+                            if not combined_gen_output.meta_info.pop("engine_aborted", False):
+                                self.llm_server_manager.abort_all_requests()
                             self.llm_server_manager.resume_generation()
                         if self._partial_rollout:
                             # The manager already aborted the long-tail (to capture partials for carry);
@@ -1920,6 +1934,9 @@ class RayPPOTrainer:
                         batch, gen_batch_output, carry_metrics = self._carry_harvest(combined_gen_output)
                         metrics.update(carry_metrics)
                     elif self._oversample_discard:
+                        discard_stats = combined_gen_output.meta_info.pop("rollout_discard_stats", None)
+                        if discard_stats:
+                            metrics.update({f"rollout_discard/{k}": v for k, v in discard_stats.items()})
                         # combined_gen_output holds only the surviving train_batch_size groups (uid
                         # attached). Select the matching prompts from the over-sampled batch, in
                         # surviving-group order, so the positional union below aligns each rollout with

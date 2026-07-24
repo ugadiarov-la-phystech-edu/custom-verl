@@ -46,6 +46,7 @@ from pydantic import BaseModel, ConfigDict
 from tensordict import TensorDict
 from transformers import AutoProcessor, AutoTokenizer
 
+from verl.experimental.agent_loop.batch_gate import classify_discarded_rollouts
 from verl.experimental.agent_loop.utils import resolve_config_path
 from verl.protocol import DataProto
 from verl.tools.tool_registry import load_all_tools
@@ -616,13 +617,36 @@ class AgentLoopWorker:
 
         carry = bool(batch.meta_info.get("partial_carry", False))
         if not carry:
-            # Over-sample + discard: cancel the long-tail; their in-flight vLLM requests are flushed by
-            # the trainer's abort_all_requests() once generation returns.
-            for t in pending:
-                t.cancel()
-            if not done_signal.done():
-                done_signal.cancel()
-            await asyncio.gather(*pending, done_signal, return_exceptions=True)
+            if batch.meta_info.get("gate_abort", False):
+                # Over-sample + discard with classification: the manager fires a global abort once
+                # the gate's target is reached, so the pending generate() calls return with the
+                # tokens produced so far. Await them, count each discarded rollout's tokens
+                # (0 = never scheduled by the engine, >0 = aborted with partial output), report
+                # the counts through the shared gate, then drop the rollouts as before.
+                if not done_signal.done():
+                    done_signal.cancel()
+                leftover = list(pending)
+                gathered = await asyncio.gather(*leftover, done_signal, return_exceptions=True)
+                for t, res in zip(leftover, gathered[:-1], strict=True):
+                    if isinstance(res, BaseException):
+                        continue  # errored/cancelled rollout: token count unknown, left unclassified
+                    results[task_to_row[t]] = res
+                accepted_set = set(accepted_rows)
+                token_counts = {
+                    i: int(res.response_mask.sum().item()) for i, res in results.items() if i not in accepted_set
+                }
+                await batch_gate.report_discard.remote(
+                    classify_discarded_rollouts(group_rows, accepted_rows, token_counts)
+                )
+            else:
+                # No server-side abort available: cancel the long-tail; their in-flight vLLM
+                # requests are flushed by the trainer's abort_all_requests() once generation
+                # returns.
+                for t in pending:
+                    t.cancel()
+                if not done_signal.done():
+                    done_signal.cancel()
+                await asyncio.gather(*pending, done_signal, return_exceptions=True)
 
             if not accepted_rows:
                 # This worker's groups all lost the global race (the target was filled by other
@@ -1239,18 +1263,24 @@ class AgentLoopManager:
         # the global count is exact (not a per-worker approximation).
         target = prompts.meta_info.get("keep_complete_groups", 0)
         partial_carry = bool(prompts.meta_info.get("partial_carry", False))
+        classify_discarded = bool(prompts.meta_info.get("classify_discarded", False))
         batch_gate = None
         if target and target > 0:
             from verl.experimental.agent_loop.batch_gate import BatchGate
 
             batch_gate = BatchGate.remote(target)
 
-        # Partial-rollout carry-over: instead of cancelling the slow long-tail, the workers wait for
-        # their pending generate() calls to return so they can carry the partial tokens forward. Those
-        # calls only return once the engine is aborted, so fire a single global abort the moment the
-        # gate's target of complete groups is reached (concurrently with gathering the workers).
+        # Instead of cancelling the slow long-tail, the workers wait for their pending generate()
+        # calls to return; those calls only return once the engine is aborted, so fire a single
+        # global abort the moment the gate's target of complete groups is reached (concurrently
+        # with gathering the workers). Two callers need the flushed partials:
+        # - partial carry: to carry the partial tokens forward to the next step;
+        # - over-sample + discard with classification: to count each discarded rollout's tokens
+        #   (never-started vs aborted-with-partial-output) before dropping it.
         abort_task = None
-        if partial_carry and batch_gate is not None and self.server_manager is not None:
+        if batch_gate is not None and (partial_carry or classify_discarded) and self.server_manager is not None:
+            # Tell the workers the abort is armed, i.e. awaiting the long-tail cannot hang.
+            prompts.meta_info["gate_abort"] = True
 
             async def _abort_when_done():
                 await batch_gate.wait_until_done.remote()
@@ -1285,6 +1315,11 @@ class AgentLoopManager:
         timing = self._performance_metrics(metrics, output)
 
         output.meta_info = {"timing": timing, **outputs[0].meta_info}
+        if batch_gate is not None and classify_discarded:
+            output.meta_info["rollout_discard_stats"] = await batch_gate.get_discard_stats.remote()
+            # Whether the long-tail was already flushed here (engine left paused): the trainer
+            # then only re-arms the engine instead of aborting a second time.
+            output.meta_info["engine_aborted"] = abort_task is not None
         return output
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
