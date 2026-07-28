@@ -216,6 +216,12 @@ class SeparateRayPPOTrainer(RayPPOTrainer):
                     OmegaConf.select(self.config.global_profiler.global_tool_config.nsys, "worker_nsight_options")
                 )
         wg_kwargs["device_name"] = self.device_name
+        # trainer.worker_env reaches only the worker groups spawned here (training side),
+        # via Ray runtime_env — rollout-side processes must not inherit settings like
+        # expandable_segments, which vLLM's sleep-mode allocator rejects.
+        worker_env = OmegaConf.select(self.config.trainer, "worker_env")
+        if worker_env:
+            wg_kwargs["worker_env"] = {k: str(v) for k, v in OmegaConf.to_container(worker_env, resolve=True).items()}
 
         for resource_pool, class_dict in self.resource_pool_to_cls.items():
             worker_dict_cls = create_colocated_worker_cls(class_dict=class_dict)
