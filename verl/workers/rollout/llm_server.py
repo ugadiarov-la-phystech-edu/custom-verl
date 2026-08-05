@@ -64,6 +64,22 @@ class GlobalRequestLoadBalancer:
         self._servers: dict[str, ray.actor.ActorHandle] = dict(servers)
         self._inflight_requests: dict[str, int] = {sid: 0 for sid in servers}
         self._request_id_to_server: LRUCache = LRUCache(maxsize=max_cache_size)
+        # Train-generation gate for validation windows (fully-async mode): while closed,
+        # FullyAsyncLLMServerClient holds train requests (initial submissions and
+        # partial-rollout resumes) before submitting to the engine; validation requests
+        # bypass the gate. Toggled by the rollouter around do_validate.
+        self._train_generation_paused = False
+
+    def pause_train_generation(self) -> None:
+        """Close the train-generation gate (validation window starts)."""
+        self._train_generation_paused = True
+
+    def resume_train_generation(self) -> None:
+        """Reopen the train-generation gate (validation window over)."""
+        self._train_generation_paused = False
+
+    def is_train_generation_paused(self) -> bool:
+        return self._train_generation_paused
 
     def acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
         """Acquire a server for the given request (sticky + least-loaded).
@@ -199,6 +215,11 @@ class LLMServerClient:
         Returns:
             TokenOutput | DiffusionOutput: token or diffusion output
         """
+        # Internal routing marker (validation batches); never a real engine sampling param.
+        # Strip on a copy: multi-turn agent loops reuse the caller's dict across turns, so the
+        # marker must survive in it for every turn's gate check.
+        if "verl_validate" in sampling_params:
+            sampling_params = {k: v for k, v in sampling_params.items() if k != "verl_validate"}
         server_id, server = await self._acquire_server(request_id)
         try:
             multimodal_kwargs = {}

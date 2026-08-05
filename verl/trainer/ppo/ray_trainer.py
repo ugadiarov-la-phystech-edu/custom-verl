@@ -1357,14 +1357,25 @@ class RayPPOTrainer:
         if self._train_clock_mark is not None:
             self._train_clock_mark = time.time()
 
+    def _train_clock_snapshot(self) -> float:
+        """Training-time clock value to persist in a checkpoint: banked time plus the in-progress
+        step's training time, minus any validation pause already inside the time-since-mark delta.
+        Separation-family trainers validate before saving within the same step and keep this
+        step's timers in self.timing_raw, so its "testing" entry must be subtracted; the colocated
+        loop saves before validating and uses a local timing_raw, making the getattr default a
+        no-op there."""
+        if self._train_clock_mark is None:
+            return self.train_time_s
+        paused_s = getattr(self, "timing_raw", {}).get("testing", 0.0)
+        return self.train_time_s + time.time() - self._train_clock_mark - paused_s
+
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
 
         # Snapshot the training-time clock now, before the slow weight save, so the persisted
-        # value excludes checkpoint-save time but includes the in-progress step's training time.
-        train_time_snapshot_s = self.train_time_s + (
-            time.time() - self._train_clock_mark if self._train_clock_mark is not None else 0.0
-        )
+        # value excludes checkpoint-save and same-step validation time but includes the
+        # in-progress step's training time.
+        train_time_snapshot_s = self._train_clock_snapshot()
 
         # path: given_path + `/global_step_{global_steps}` + `/actor`
         local_global_step_folder = os.path.join(

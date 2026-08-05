@@ -15,7 +15,7 @@ import asyncio
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -37,6 +37,16 @@ class RolloutSample:
 
     # Processing metadata
     rollout_status: dict[str, Any]
+
+    # Virtual-timeline stamps for the trainer's cumulative_training_time metric:
+    # wall-clock when the sample was pushed to the message queue, and the rollouter's
+    # total validation- and checkpoint-caused generation pauses before that moment.
+    # enqueue_time - validation_pause_before - checkpoint_pause_before is when the
+    # sample would have been ready in an identical run with neither validation nor
+    # checkpointing.
+    enqueue_time: Optional[float] = None
+    validation_pause_before: float = 0.0
+    checkpoint_pause_before: float = 0.0
 
 
 def prepare_single_generation_data(batch_dict, config) -> DataProto:

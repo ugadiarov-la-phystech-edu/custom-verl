@@ -82,6 +82,16 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         """
         prompt_ids = normalize_token_ids(prompt_ids)
 
+        # Marker set by AgentLoopWorker for validation batches; the base client strips it
+        # before the engine sees the params. Read without popping: multi-turn agent loops pass
+        # the same dict on every turn, and a popped marker would make later turns of a
+        # validation request hold at the train gate below — deadlocking the validation window.
+        # Train requests (no marker) hold at the load balancer's train gate while the rollouter
+        # has generation paused for validation — this covers both submissions already dispatched
+        # before the pause and partial-rollout resumes, which would otherwise re-enter the
+        # engine mid-validation.
+        is_validate = bool(sampling_params.get("verl_validate", False))
+
         limit_key = None
         if "max_tokens" in sampling_params:
             limit_key = "max_tokens"
@@ -97,6 +107,9 @@ class FullyAsyncLLMServerClient(LLMServerClient):
         min_global_steps, max_global_steps = None, None
 
         while True:
+            if not is_validate:
+                while await self._load_balancer.is_train_generation_paused.remote():
+                    await asyncio.sleep(0.5)
             # 1. generate tokens
             output = await super().generate(
                 request_id=request_id,
@@ -503,6 +516,16 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.idle_start_time = time.time()
         self.step_start_time = time.time()
 
+        # Wall-clock anchor for the trainer's fully_async/timing/cumulative_training_time
+        # metric: set once, at the first draw from the training dataloader (val_before_train
+        # runs are excluded). Validation- and checkpoint-caused generation pauses accumulate
+        # only after the anchor exists. Both actors run on one node (NNODES=1), so mixing
+        # rollouter and trainer time.time() stamps is safe.
+        self.first_sample_time = None
+        self.cumulative_validation_time = 0.0
+        self.cumulative_checkpoint_pause = 0.0
+        self._validation_pause_start = None
+
         # Concurrency control
         # Modified by self.pause() or self._should_pause_generation()
         self.paused = False
@@ -610,6 +633,56 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         with marked_timer("rollouter/validate_time", timing_raw, color="green"):
             val_metrics: dict = self._validate()
         return timing_raw | val_metrics
+
+    async def pause_generation_for_validation(self):
+        """Cleanly stop training-sample generation for a validation window.
+
+        Three layers, so the pause is complete rather than best-effort:
+        1. Pause the processor (no new sample submissions).
+        2. Close the load balancer's train gate, so submissions already dispatched to
+           agent-loop workers and partial-rollout resumes hold instead of re-entering
+           the engine mid-validation.
+        3. Abort in-flight engine requests (the partial-rollout retry loop continues
+           them once the gate reopens) and re-arm the engine so validation requests
+           can be served.
+
+        The window until resume_generation_after_validation() is validation-caused
+        generation pause; it accumulates (once the first-sample anchor exists) for the
+        virtual-timeline cumulative_training_time metric.
+        """
+        async with self.lock:
+            self.paused = True
+            self._resume_event.clear()
+            self._validation_pause_start = time.time()
+        llm_server_manager = getattr(self, "llm_server_manager", None)
+        if llm_server_manager is not None:
+            await llm_server_manager.global_load_balancer.pause_train_generation.remote()
+            replicas = llm_server_manager.get_replicas()
+            await asyncio.gather(*[r.abort_all_requests() for r in replicas])
+            await asyncio.gather(*[r.resume_generation() for r in replicas])
+
+    async def resume_generation_after_validation(self) -> dict:
+        """Reopen generation after a validation window. Returns the virtual-time state
+        so the trainer can refresh its cached totals in the same round trip."""
+        llm_server_manager = getattr(self, "llm_server_manager", None)
+        if llm_server_manager is not None:
+            await llm_server_manager.global_load_balancer.resume_train_generation.remote()
+        async with self.lock:
+            if self._validation_pause_start is not None:
+                if self.first_sample_time is not None:
+                    self.cumulative_validation_time += time.time() - self._validation_pause_start
+                self._validation_pause_start = None
+            self.paused = False
+            self._resume_event.set()
+        return self.get_virtual_time_state()
+
+    def get_virtual_time_state(self) -> dict:
+        """Anchor and cumulative generation-pause totals for the trainer's virtual timeline."""
+        return {
+            "first_sample_time": self.first_sample_time,
+            "cumulative_validation_time": self.cumulative_validation_time,
+            "cumulative_checkpoint_pause": self.cumulative_checkpoint_pause,
+        }
 
     async def save_checkpoint(self, local_global_step_folder: str):
         # WARNING!: Due to the asynchronous nature, there are some in-flight samples
@@ -819,6 +892,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         continuous_iterator = self._create_continuous_iterator()
 
         for epoch, batch_dict in continuous_iterator:
+            if self.first_sample_time is None:
+                self.first_sample_time = time.time()
+                print(f"[FullyAsyncRollouter][Feed] First training sample drawn, t0={self.first_sample_time}")
             # Similar to _prepare_generate_batch: Separate data
             full_batch = prepare_single_generation_data(batch_dict, self.config)
 
@@ -947,6 +1023,13 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
         )
         rollout_sample.rollout_status = await self.get_statistics()
+
+        # Stamp the sample for the trainer's virtual (no-validation-no-checkpoint) timeline:
+        # enqueue_time - validation_pause_before - checkpoint_pause_before is when this sample
+        # would have been ready in an identical run that never paused generation.
+        rollout_sample.enqueue_time = time.time()
+        rollout_sample.validation_pause_before = self.cumulative_validation_time
+        rollout_sample.checkpoint_pause_before = self.cumulative_checkpoint_pause
 
         success = await self.message_queue_client.put_sample(
             sample=ray.cloudpickle.dumps(rollout_sample),

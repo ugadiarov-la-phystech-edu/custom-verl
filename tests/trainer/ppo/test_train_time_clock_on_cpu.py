@@ -97,8 +97,9 @@ def test_skip_discards_pause():
 
 
 def test_checkpoint_snapshot_includes_in_progress_step():
-    # _save_checkpoint snapshots train_time_s plus the time since the last mark, so a
-    # mid-step save persists the current step's training time without stopping the clock.
+    # _save_checkpoint persists _train_clock_snapshot(): train_time_s plus the time since the
+    # last mark, so a mid-step save persists the current step's training time without stopping
+    # the clock.
     trainer = _make_trainer()
     clock = _FakeClock()
     with patch.object(ray_trainer_module, "time", clock):
@@ -106,10 +107,35 @@ def test_checkpoint_snapshot_includes_in_progress_step():
         clock.advance(100.0)
         trainer._train_clock_advance()
         clock.advance(40.0)  # in-progress step at the moment _save_checkpoint runs
-        snapshot = trainer.train_time_s + (clock.time() - trainer._train_clock_mark)
-        assert snapshot == 140.0
+        assert trainer._train_clock_snapshot() == 140.0
         # the live clock itself is unaffected by the snapshot
         assert trainer._train_clock_advance() == 140.0
+
+
+def test_checkpoint_snapshot_before_clock_start():
+    # A snapshot taken before the clock starts (e.g. val_only paths) is just the banked value.
+    trainer = _make_trainer()
+    assert trainer._train_clock_snapshot() == 0.0
+
+
+def test_checkpoint_snapshot_excludes_same_step_validation():
+    # One-step-off (and separation) fit_step order is validate -> save -> advance, with this
+    # step's timers in self.timing_raw. The snapshot must subtract the "testing" pause that is
+    # already inside the time-since-mark delta, or every resume would inflate the restored
+    # clock by one validation duration.
+    trainer = _make_trainer()
+    clock = _FakeClock()
+    with patch.object(ray_trainer_module, "time", clock):
+        trainer._train_clock_start()
+        clock.advance(100.0)
+        trainer._train_clock_advance()  # previous step boundary
+        clock.advance(40.0)  # this step's compute
+        clock.advance(25.0)  # validation, recorded by marked_timer("testing", self.timing_raw)
+        trainer.timing_raw = {"testing": 25.0}
+        assert trainer._train_clock_snapshot() == 140.0
+        # end-of-step advance subtracts the same pause once from the live clock, agreeing
+        # with the persisted snapshot
+        assert trainer._train_clock_advance(paused_s=25.0) == 140.0
 
 
 def test_subclasses_inherit_clock():

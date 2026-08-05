@@ -520,6 +520,10 @@ class AgentLoopWorker:
             sampling_params["top_p"] = config.val_kwargs.top_p
             sampling_params["top_k"] = config.val_kwargs.top_k
             sampling_params["temperature"] = config.val_kwargs.temperature
+            # Routing marker so the server client can let validation requests bypass the
+            # train-generation gate during fully-async validation pauses. Popped by the
+            # client before the params reach the engine.
+            sampling_params["verl_validate"] = True
 
         # by default, we assume it's a single turn agent
         if "agent_name" not in batch.non_tensor_batch:
