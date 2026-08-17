@@ -109,13 +109,16 @@ class BaseEngine:
         """
         raise NotImplementedError
 
-    def train_batch(self, data: TensorDict, loss_function: Callable) -> Any:
+    def train_batch(self, data: TensorDict, loss_function: Callable, pre_optimizer_step_hook: Callable = None) -> Any:
         """
         Perform a training step on a batch of data.
 
         Args:
             data: The input data for training, typically containing tensors and metadata.
             loss_function: A function that computes the loss and metrics given a batch and predictions.
+            pre_optimizer_step_hook: Optional callable ``hook(engine, data, outputs) -> context manager``
+                invoked after the backward pass with the mini-batch's aggregated metrics; the returned
+                context wraps ``optimizer_step()`` (e.g. to scale the learning rate for this step only).
 
         Returns:
             dict[str, torch.Tensor]: A dictionary containing the aggregated training metrics for the batch.
@@ -124,11 +127,20 @@ class BaseEngine:
 
         self.optimizer_zero_grad()
         outputs = self.forward_backward_batch(data, loss_function, forward_only=False)
-        grad_norm = self.optimizer_step()
+        step_ctx = pre_optimizer_step_hook(self, data, outputs) if pre_optimizer_step_hook is not None else None
+        if step_ctx is not None:
+            with step_ctx:
+                grad_norm = self.optimizer_step()
+        else:
+            grad_norm = self.optimizer_step()
         if self.is_mp_src_rank_with_outputs():
             assert "grad_norm" not in outputs["metrics"]
             outputs["metrics"]["grad_norm"] = grad_norm
         return outputs
+
+    def get_optimizer_param_groups(self):
+        """Return the optimizer's parameter groups (for LR manipulation by step hooks)."""
+        raise NotImplementedError
 
     def infer_batch(self, data: TensorDict, loss_function: Optional[Callable] = None) -> Any:
         """

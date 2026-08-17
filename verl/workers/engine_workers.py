@@ -146,6 +146,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
             self.flops_counter = None
 
         self.loss_fn = None
+        self.optimizer_step_hook = None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def to(self, device, model=True, optimizer=True, grad=True):
@@ -160,6 +161,11 @@ class TrainingWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_loss_fn(self, loss_fn):
         self.loss_fn = loss_fn
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def set_optimizer_step_hook(self, hook):
+        """Install a pre-optimizer-step hook (see BaseEngine.train_batch)."""
+        self.optimizer_step_hook = hook
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def reset(self):
@@ -216,6 +222,10 @@ class TrainingWorker(Worker, DistProfilerExtension):
             if k.startswith("mtp_losses"):
                 flatten_v = [sublist[0] for sublist in v]  # sublist should be single element
                 final_metrics[k] = sum(flatten_v) / len(flatten_v)
+        # Structured entries (list[dict]) are built from DP-all-reduced values and are
+        # identical on every rank; keep rank 0's copy instead of averaging dicts.
+        if "staleness/ess" in final_metrics and dp_group is not None:
+            final_metrics["staleness/ess"] = final_metrics["staleness/ess"][0]
         # compute mfu
         if global_token_num is not None and self.flops_counter is not None:
             estimated_flops, promised_flops = self.flops_counter.estimate_flops(
@@ -297,6 +307,8 @@ class TrainingWorker(Worker, DistProfilerExtension):
                     global_token_num=NonTensorData(global_token_num),
                     update_lr_scheduler=batch_idx == total_num_iterations - 1,
                     disable_auto_offload=True,
+                    # counts across epochs; consumed by optimizer-step hooks (staleness/ess entries)
+                    minibatch_idx=batch_idx,
                 )
                 actor_output = self.train_batch(mini_batch_td)
                 output_lst.append(actor_output)
@@ -308,12 +320,17 @@ class TrainingWorker(Worker, DistProfilerExtension):
                     for key, val in output.items():
                         # flattn dp and micro batch
                         if isinstance(val, list):
+                            if val and isinstance(val[0], dict):
+                                # structured entries (e.g. staleness/ess): keep the dicts intact
+                                continue
                             output[key] = (
                                 Metric.aggregate_dp(val)
                                 if isinstance(val[0], Metric)
                                 else list(chain.from_iterable(val))
                             )
                     append_to_dict(metrics, output)
+                # append_to_dict extends per mini-batch, so structured keys are already
+                # flat lists of dicts (one entry per mini-batch x epoch)
 
                 output = tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()
             else:
@@ -347,7 +364,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
             self.engine.train_mode(disable_auto_offload=disable_auto_offload),
             Timer(name="train_batch", logger=None) as timer,
         ):
-            output = self.engine.train_batch(data, loss_function=self.loss_fn)
+            output = self.engine.train_batch(
+                data, loss_function=self.loss_fn, pre_optimizer_step_hook=self.optimizer_step_hook
+            )
             # containing loss, model_output and metrics
             # for training, we only care about loss and metrics
         delta_time = timer.last
@@ -585,6 +604,12 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.actor = TrainingWorker(config=actor_training_config)
             self.actor.reset()
             self.actor.set_loss_fn(self.loss_fn)
+            ess_config = getattr(actor_config, "ess_scaling", None)
+            if ess_config is not None and ess_config.enable:
+                assert not self.distillation_enabled, "ESS LR scaling is not supported with distillation"
+                from verl.workers.utils.ess import make_ess_optimizer_step_hook
+
+                self.actor.set_optimizer_step_hook(make_ess_optimizer_step_hook(ess_config))
             self.set_dispatch_collect(mesh_name="actor", **self.actor.get_dispatch_collect())
 
         # 3. build rollout engine

@@ -34,6 +34,7 @@ from .optimizer import OptimizerConfig
 
 __all__ = [
     "PolicyLossConfig",
+    "ESSScalingConfig",
     "RouterReplayConfig",
     "ActorConfig",
     "FSDPActorConfig",
@@ -97,6 +98,32 @@ class PolicyLossConfig(BaseConfig):
     kl_cov_ratio: float = 0.0002
     ppo_kl_coef: float = 0.1
     rollout_correction: RolloutCorrectionConfig = field(default_factory=RolloutCorrectionConfig)
+
+
+@dataclass
+class ESSScalingConfig(BaseConfig):
+    """Effective-sample-size guided learning-rate scaling (VCPO, arXiv:2602.17616).
+
+    The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
+
+    Args:
+        enable (bool): Whether to enable ESS based learning-rate scaling.
+        scaling_rule (str): Rule for the learning-rate multiplier: "sqrt" or "linear".
+        base_ess_ratio (Optional[float]): Reference (on-policy) ESS ratio; the multiplier is
+            rule(min(1, ess_ratio / base)). None = auto-calibrate from the first update's measured
+            ESS ratio, delivered back per batch via meta_info["ess_base_override"] (fully-async
+            replay trainer only).
+        use_clipped (bool): Use ESS ratios derived from clipped IS weights instead of unclipped ones.
+        trigger_ratio (Optional[float]): Intervention threshold on ess_ratio / base: scaling engages
+            only for mini-batches where the ratio falls below this value; at or above it the update
+            runs at full nominal lr. None = engage whenever the ratio is below 1.
+    """
+
+    enable: bool = False
+    scaling_rule: str = "sqrt"
+    base_ess_ratio: Optional[float] = None
+    use_clipped: bool = False
+    trigger_ratio: Optional[float] = None
 
 
 @dataclass
@@ -184,6 +211,7 @@ class ActorConfig(BaseConfig):
     rollout_n: int = MISSING  # must be override by sampling config
     model_config: HFModelConfig = field(default_factory=BaseConfig)
     router_replay: RouterReplayConfig = field(default_factory=RouterReplayConfig)
+    ess_scaling: ESSScalingConfig = field(default_factory=ESSScalingConfig)
 
     # Store global batch info for loss aggregation:
     # dp_size: data parallel size

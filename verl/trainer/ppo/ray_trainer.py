@@ -63,6 +63,7 @@ from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
 from verl.utils.import_utils import deprecated, load_class_from_fqn
 from verl.utils.metric import reduce_metrics
+from verl.utils.metric.utils import STRUCTURED_METRIC_KEYS
 from verl.utils.py_functional import rename_dict
 from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
@@ -1325,9 +1326,15 @@ class RayPPOTrainer:
         )
         actor_output = self.actor_rollout_wg.update_actor(batch_td)
         actor_output = tu.get(actor_output, "metrics")
+        # structured contract keys keep their names (driver-side consumers match on them)
+        structured = {k: actor_output.pop(k) for k in list(actor_output) if k in STRUCTURED_METRIC_KEYS}
         actor_output = rename_dict(actor_output, "actor/")
+        actor_output.update(structured)
         # modify key name
         actor_output["perf/mfu/actor"] = actor_output.pop("actor/mfu")
+        pearson_key = "training/rollout_actor_probs_pearson_corr"
+        if f"actor/{pearson_key}" in actor_output:
+            actor_output[pearson_key] = actor_output.pop(f"actor/{pearson_key}")
         actor_output = DataProto.from_single_dict(data={}, meta_info={"metrics": actor_output})
 
         return actor_output

@@ -38,6 +38,18 @@ class RolloutSample:
     # Processing metadata
     rollout_status: dict[str, Any]
 
+    # Replay-buffer bookkeeping: the model version that generated the oldest
+    # trajectory of this group (min of the group's min_global_steps), stamped
+    # by the rollouter at insertion time.
+    group_version: int = 0
+
+    # Virtual-clock stamps for the cumulative_training_time metric: wall time
+    # at enqueue, and the rollouter's cumulative validation / checkpoint-save
+    # pause totals at that moment (see FullyAsyncTrainer._open_virtual_step).
+    enqueue_time: float = 0.0
+    validation_pause_before: float = 0.0
+    checkpoint_pause_before: float = 0.0
+
 
 def prepare_single_generation_data(batch_dict, config) -> DataProto:
     """

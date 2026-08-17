@@ -513,6 +513,28 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.pending_queue = asyncio.Queue(maxsize=128)
         self.active_tasks = set()
 
+        # ---- Replay-buffer / VCPO port ----
+        replay_cfg = config.async_training.get("replay_buffer", None)
+        self.replay_mode = bool(replay_cfg is not None and replay_cfg.get("enable", False))
+        self.norm_adv_by_std_in_grpo = bool(config.algorithm.get("norm_adv_by_std_in_grpo", True))
+        # Stop-the-world accounting: pause generation for the whole validation /
+        # checkpoint-save window so both are pure time translations of the
+        # pipeline (excluded from cumulative_training_time via sample stamps).
+        self.serialize_validation = bool(config.async_training.get("serialize_validation", False))
+        self.groups_completed_total = 0
+        self.all_correct_groups_total = 0
+        self.all_wrong_groups_total = 0
+        self.dropped_unscorable_groups = 0
+        # Virtual-clock accumulators, stamped onto every enqueued RolloutSample.
+        self.first_sample_time = None
+        self.cumulative_validation_time = 0.0
+        self.cumulative_checkpoint_pause = 0.0
+        self._save_pause_start = None
+        # Hard (externally requested) pause for stop-the-world validation /
+        # checkpoint saves: unlike a staleness-quota pause, the monitor loop
+        # must never auto-resume it.
+        self._hard_paused = False
+
     def _init_async_objects(self):
         # Initialize asyncio synchronization primitives.
         # `lock` protects shared state: paused / active_tasks / staleness_samples / timing fields.
@@ -538,7 +560,13 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 / (self.required_samples * self.config.async_training.trigger_parameter_sync_step)
             )
 
-            self.max_concurrent_samples = len(self.llm_server_manager.get_replicas()) * 16
+            num_replicas = len(self.llm_server_manager.get_replicas())
+            bsz_per_dp_rank = self.config.async_training.get("bsz_per_dp_rank", None)
+            if bsz_per_dp_rank is not None:
+                # explicit per-replica concurrency budget (prompt groups in flight per replica)
+                self.max_concurrent_samples = int(bsz_per_dp_rank) * num_replicas
+            else:
+                self.max_concurrent_samples = num_replicas * 16
             self.max_concurrent_samples = min(self.max_concurrent_samples, self.max_required_samples)
             self.max_queue_size = self.max_required_samples
 
@@ -602,11 +630,66 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         """Stop rollout profiling on all replicas before the next weight sync."""
         await self.llm_server_manager.stop_profile()
 
-    def do_validate(self):
-        """Run validation and return metrics"""
+    async def _pause_generation_and_drain(self):
+        """Pause the processor loop and wait for all in-flight generation tasks
+        to finish (stop-the-world bracket for validation / checkpoint saves)."""
+        async with self.lock:
+            self.paused = True
+            self._hard_paused = True
+            self._resume_event.clear()
+        while True:
+            async with self.lock:
+                active = {t for t in self.active_tasks if not t.done()}
+            if not active:
+                break
+            await asyncio.wait(active, return_when=asyncio.ALL_COMPLETED)
+
+    async def _resume_generation(self):
+        async with self.lock:
+            self.paused = False
+            self._hard_paused = False
+            self._resume_event.set()
+
+    def get_first_sample_time(self):
+        """Wall time of the first processed training sample (virtual-clock anchor)."""
+        return self.first_sample_time
+
+    async def begin_save_pause(self):
+        """Freeze generation for a checkpoint save; the elapsed pause is
+        accounted into cumulative_checkpoint_pause at end_save_pause and
+        excluded from cumulative_training_time via the sample stamps. The
+        clock starts at drain begin (when submission freezes), matching the
+        trainer-side accounting of the save window."""
+        self._save_pause_start = time.time()
+        await self._pause_generation_and_drain()
+
+    async def end_save_pause(self):
+        if self._save_pause_start is not None and self.first_sample_time is not None:
+            self.cumulative_checkpoint_pause += time.time() - self._save_pause_start
+        self._save_pause_start = None
+        await self._resume_generation()
+
+    async def do_validate(self):
+        """Run validation and return metrics. With serialize_validation the
+        generation pipeline is fully paused for the validation window and the
+        pause is accounted into cumulative_validation_time."""
         timing_raw = {}
-        with marked_timer("rollouter/validate_time", timing_raw, color="green"):
-            val_metrics: dict = self._validate()
+        pause_start = None
+        if self.serialize_validation:
+            # The pause clock starts when submission freezes (drain begin), not
+            # after the drain: the trainer accounts the whole window the same
+            # way, and the sample stamps must subtract the same interval from
+            # the producer timeline.
+            pause_start = time.time()
+            await self._pause_generation_and_drain()
+        try:
+            with marked_timer("rollouter/validate_time", timing_raw, color="green"):
+                val_metrics: dict = self._validate()
+        finally:
+            if pause_start is not None:
+                if self.first_sample_time is not None:
+                    self.cumulative_validation_time += time.time() - pause_start
+                await self._resume_generation()
         return timing_raw | val_metrics
 
     async def save_checkpoint(self, local_global_step_folder: str):
@@ -930,8 +1013,56 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                     task_set=self.active_tasks,
                 )
 
+    def _score_group(self, rollout_sample: RolloutSample):
+        """Per-trajectory scalar rewards of the completed group from the
+        streaming reward loop's rm_scores (reward at the last response token).
+        Returns None when scoring is impossible (no scores or group of 1)."""
+        batch = rollout_sample.full_batch
+        if batch is None or len(batch) <= 1 or "rm_scores" not in batch.batch.keys():
+            return None
+        return batch.batch["rm_scores"].sum(dim=-1)
+
+    def _prepare_replay_group(self, rollout_sample: RolloutSample) -> bool:
+        """Replay-mode insertion gate (DAPO filter_groups rule). Scores the
+        group, drops degenerate groups (all n responses identically rewarded:
+        GRPO's group-centered advantages are exactly zero), and for kept groups
+        freezes the GRPO statistics (per-trajectory reward and advantage
+        scalars, mirroring compute_grpo_outcome_advantage: epsilon 1e-6) and
+        stamps the group model version (min of the trajectories'
+        min_global_steps). Returns True if the group should be enqueued."""
+        scores = self._score_group(rollout_sample)
+        self.groups_completed_total += 1
+        if scores is None:
+            # Without scores the frozen advantages the trainer relies on cannot
+            # be computed — drop rather than enqueue an untrainable group.
+            self.dropped_unscorable_groups += 1
+            print(f"[FullyAsyncRollouter][Replay] group {rollout_sample.sample_id} unscorable, dropping")
+            return False
+        if bool((scores == scores[0]).all().item()):
+            if float(scores[0].item()) > 0:
+                self.all_correct_groups_total += 1
+            else:
+                self.all_wrong_groups_total += 1
+            return False
+        scores_f = scores.float()
+        mean = torch.mean(scores_f)
+        std = torch.std(scores_f)
+        if self.norm_adv_by_std_in_grpo:
+            advantages = (scores_f - mean) / (std + 1e-6)
+        else:
+            advantages = scores_f - mean
+        batch = rollout_sample.full_batch
+        batch.non_tensor_batch["reward_scalar"] = np.array(scores_f.tolist(), dtype=np.float32)
+        batch.non_tensor_batch["advantage_scalar"] = np.array(advantages.tolist(), dtype=np.float32)
+        min_steps = batch.non_tensor_batch.get("min_global_steps", None)
+        if min_steps is not None:
+            rollout_sample.group_version = int(min(int(v) for v in min_steps))
+        return True
+
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
         """Process a single sample streamingly"""
+        if self.first_sample_time is None:
+            self.first_sample_time = time.time()
         # Calling asynchronous generation methods
         ret = await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
         rollout_sample.full_batch = ret
@@ -939,6 +1070,19 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
         )
         rollout_sample.rollout_status = await self.get_statistics()
+
+        if self.replay_mode and not self._prepare_replay_group(rollout_sample):
+            # Dropped group: free its staleness-quota slot so the drop licenses
+            # a replacement generation within the same budget.
+            async with self.lock:
+                self.staleness_samples -= 1
+            self.processed_sample_count += 1
+            return
+
+        # Virtual-clock stamps (see FullyAsyncTrainer._open_virtual_step).
+        rollout_sample.enqueue_time = time.time()
+        rollout_sample.validation_pause_before = self.cumulative_validation_time
+        rollout_sample.checkpoint_pause_before = self.cumulative_checkpoint_pause
 
         success = await self.message_queue_client.put_sample(
             sample=ray.cloudpickle.dumps(rollout_sample),
@@ -1068,11 +1212,17 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 last_stats_time = current_time
 
             # Trigger rollout recovery
-            if self.paused and not await self._should_pause_generation():
-                async with self.lock:
-                    self.paused = False
-                    print("[FullyAsyncRollouter][ShouldPause] resume rollouter.")
-                    self._resume_event.set()
+            await self._maybe_auto_resume()
+
+    async def _maybe_auto_resume(self):
+        """Resume a staleness-quota pause once the quota clears. Never
+        auto-resume a hard pause: those bracket stop-the-world validation /
+        checkpoint saves and end only via _resume_generation()."""
+        if self.paused and not self._hard_paused and not await self._should_pause_generation():
+            async with self.lock:
+                self.paused = False
+                print("[FullyAsyncRollouter][ShouldPause] resume rollouter.")
+                self._resume_event.set()
 
     async def _should_pause_generation(self) -> bool:
         """Determine whether the build should be paused"""

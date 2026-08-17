@@ -139,6 +139,13 @@ actor_rollout_ref:
       mode: disabled
       record_file: null
       replay_file: null
+    ess_scaling:
+      _target_: verl.workers.config.ESSScalingConfig
+      enable: false
+      scaling_rule: sqrt
+      base_ess_ratio: null
+      use_clipped: false
+      trigger_ratio: null
     qat:
       enable: false
       mode: w4a16

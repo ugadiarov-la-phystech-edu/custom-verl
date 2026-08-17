@@ -57,7 +57,9 @@ policy_loss:
   # # Required when using verl.utils.omega_conf_to_dataclass to instantiate dataclass configs
   _target_: verl.workers.config.PolicyLossConfig
 
-  # Loss function mode: vanilla / clip-cov / kl-cov /gpg from https://arxiv.org/abs/2505.22617
+  # Loss function mode: vanilla / clip-cov / kl-cov /gpg from https://arxiv.org/abs/2505.22617,
+  # or seq_adv_post_scale (VCPO sequence-level score loss: unit-advantage clipping with
+  # per-sequence advantage post-scaling and truncated token IS vs the behavior policy)
   loss_mode: "vanilla"
 
   # Ratio of tokens to be clipped for clip-cov loss
@@ -285,6 +287,33 @@ router_replay:
   # File path to load recorded routing decisions for replay
   # Required when mode is 'replay'
   replay_file: null
+
+# Effective-sample-size guided learning-rate scaling (VCPO, arXiv:2602.17616):
+# scale the optimizer LR by rule(min(1, ess_ratio / base_ess_ratio)) per mini-batch,
+# where ess_ratio is the Kish effective sample size of sequence-level IS ratios
+# against the behavior (rollout) policy divided by the sequence count
+ess_scaling:
+
+  # Target dataclass for this configuration
+  _target_: verl.workers.config.ESSScalingConfig
+
+  # Whether to enable ESS based learning-rate scaling
+  enable: false
+
+  # Rule for the learning-rate multiplier: "sqrt" or "linear"
+  scaling_rule: sqrt
+
+  # Reference (on-policy) ESS ratio. null = auto-calibrate from the first update's
+  # measured ESS ratio (fully-async replay trainer only)
+  base_ess_ratio: null
+
+  # Use ESS ratios derived from clipped IS weights instead of unclipped ones
+  use_clipped: false
+
+  # Intervention threshold on ess_ratio / base: scaling engages only for mini-batches
+  # where the ratio falls BELOW this value; at or above it the update runs at full
+  # nominal lr. null = engage whenever the ratio is below 1
+  trigger_ratio: null
 
 # QAT (Quantization-Aware Training) configuration
 # When enabled:

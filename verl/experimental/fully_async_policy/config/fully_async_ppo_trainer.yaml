@@ -25,6 +25,43 @@ async_training:
   # whether to use trainer do_validate
   use_trainer_do_validate: False
 
+  # Stop-the-world validation: pause generation for the whole validation window
+  # so it is a pure time translation of the pipeline (excluded from
+  # fully_async/timing/cumulative_training_time)
+  serialize_validation: False
+
+  # Freeze generation for the whole checkpoint save (same accounting as above)
+  pause_generation_during_save: False
+
+  # Persist the message-queue contents in checkpoints and restore them on resume
+  save_queue_state: True
+
+  # Per-replica in-flight prompt-group budget for the rollouter
+  # (max_concurrent_samples = bsz_per_dp_rank * num_replicas). null = replicas * 16
+  bsz_per_dp_rank: null
+
+  # Trainer-local replay buffer of prompt groups (VCPO replay training loop):
+  # each update trains on every unseen group plus a staleness-decayed sample of
+  # already-used groups, with frozen insertion-time rewards/advantages
+  replay_buffer:
+
+    # Whether to enable the replay-buffer training loop
+    # (requires trigger_parameter_sync_step=1 and require_batches=1)
+    enable: False
+
+    # Staleness decay time-constant of the replay sampling score 2^(-staleness/tau)
+    tau: 16
+
+    # Evict groups staler than this many model updates
+    staleness_threshold: 64
+
+    # Pause training while the buffer holds fewer than this many mini-batches
+    # of groups (fractional values allowed)
+    requires_mini_batches: 1
+
+    # Seed of the replay sampling RNG (persisted in checkpoints)
+    sampling_seed: 1234
+
 # Rollout config
 rollout:
 

@@ -718,6 +718,10 @@ class FSDPEngine(BaseEngine):
         lr = self.lr_scheduler.get_last_lr()[0]  # only return the first group
         return lr
 
+    def get_optimizer_param_groups(self):
+        """Return the optimizer's parameter groups (for LR manipulation by step hooks)."""
+        return self.optimizer.param_groups
+
     def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
         """
         Move FSDP model and/or optimizer to CPU or GPU with offload support.

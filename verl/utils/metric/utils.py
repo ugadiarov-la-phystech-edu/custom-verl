@@ -21,6 +21,11 @@ from typing import Any, Optional, Union
 import numpy as np
 import torch
 
+# Metric keys carrying structured list[dict] payloads that must survive
+# reduce_metrics unreduced (consumed as-is by driver-side logic, e.g. the
+# fully-async trainer's ESS auto-base calibration).
+STRUCTURED_METRIC_KEYS = frozenset({"staleness/ess"})
+
 
 def reduce_metrics(metrics: dict[str, Union["Metric", list[Any]]]) -> dict[str, Any]:
     """
@@ -47,6 +52,15 @@ def reduce_metrics(metrics: dict[str, Union["Metric", list[Any]]]) -> dict[str, 
         {"loss": 2.0, "accuracy": 0.8, "max_reward": 8.0, "min_error": 0.05}
     """
     for key, val in metrics.items():
+        if key in STRUCTURED_METRIC_KEYS:
+            # structured entries (list[dict], possibly nested one level from
+            # per-worker packing) pass through unreduced for driver-side consumers
+            if isinstance(val, list):
+                flat: list[Any] = []
+                for item in val:
+                    flat.extend(item) if isinstance(item, list) else flat.append(item)
+                metrics[key] = flat
+            continue
         if isinstance(val, Metric):
             metrics[key] = val.aggregate()
         elif "max" in key:

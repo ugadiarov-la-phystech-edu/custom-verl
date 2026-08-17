@@ -545,3 +545,27 @@ class TestProcessValidationMetrics(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestStructuredMetricKeys(unittest.TestCase):
+    """Structured list[dict] metrics (e.g. staleness/ess) must pass through
+    reduce_metrics unreduced for driver-side consumers."""
+
+    def test_list_of_dicts_passes_through(self):
+        entry = {"minibatch_idx": 0, "minibatch_ess_ratio": 0.5}
+        metrics = {"staleness/ess": [entry], "loss": [1.0, 3.0]}
+        result = reduce_metrics(metrics)
+        self.assertEqual(result["staleness/ess"], [entry])
+        self.assertEqual(result["loss"], 2.0)
+
+    def test_nested_list_of_dicts_is_flattened_one_level(self):
+        e0, e1 = {"minibatch_idx": 0}, {"minibatch_idx": 1}
+        metrics = {"staleness/ess": [[e0], [e1]]}
+        result = reduce_metrics(metrics)
+        self.assertEqual(result["staleness/ess"], [e0, e1])
+
+    def test_non_structured_keys_unaffected(self):
+        metrics = {"max_reward": [5.0, 8.0], "min_error": [0.1, 0.05]}
+        result = reduce_metrics(metrics)
+        self.assertEqual(result["max_reward"], 8.0)
+        self.assertEqual(result["min_error"], 0.05)

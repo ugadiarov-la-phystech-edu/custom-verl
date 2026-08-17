@@ -1369,6 +1369,80 @@ def compute_policy_loss_vanilla(
     return pg_loss, pg_metrics
 
 
+@register_policy_loss("seq_adv_post_scale")  # type: ignore[arg-type]
+def compute_policy_loss_seq_adv_post_scale(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    loss_agg_mode: str = "seq-mean-token-mean",
+    config: Optional[ActorConfig] = None,
+    rollout_is_weights: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """
+    Sequence-level score-loss with per-sequence advantage post-scaling (VCPO per-traj semantics).
+
+    The clipped surrogate is computed with UNIT advantages — the PPO ratio is anchored on the
+    update's own forward (``old_log_prob`` is ignored; the ratio is identically 1 at update
+    start) and clip-branch selection behaves as if the advantage were +1. Each sequence's
+    per-token loss is then scaled by that sequence's constant advantage (recovered as the
+    masked mean of its ``advantages`` row) BEFORE aggregation, so a zero advantage contributes
+    exactly zero gradient and negative advantages flip the sign without flipping the clip
+    branch. Off-policy correction (e.g. truncated token-level IS against the behavior policy)
+    arrives via ``rollout_is_weights``.
+
+    Args:
+        old_log_prob (torch.Tensor): Ignored (kept for the registry signature).
+        log_prob (torch.Tensor):
+            Log-probabilities of actions under the current policy, shape (batch_size, response_length).
+        advantages (torch.Tensor):
+            Advantage estimates, constant per sequence, shape (batch_size, response_length).
+        response_mask (torch.Tensor):
+            Mask indicating which tokens to include in the loss, shape (batch_size, response_length).
+        loss_agg_mode (str, optional):
+            Aggregation mode for `agg_loss`. The reference configuration uses "seq-mean-token-mean".
+        config: `(verl.trainer.config.ActorConfig)`:
+            config for the actor.
+        rollout_is_weights: `(torch.Tensor)`:
+            optional per-token importance-sampling weights, shape (batch_size, response_length).
+    """
+    assert config is not None
+    assert not isinstance(config, AlgoConfig)
+    clip_ratio = config.clip_ratio
+    cliprange_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
+    cliprange_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
+
+    # ratio anchored on the update's own forward: identically 1 at update start
+    negative_approx_kl = torch.clamp(log_prob - log_prob.detach(), min=-20.0, max=20.0)
+    ratio = torch.exp(negative_approx_kl)
+    ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
+
+    # clipped surrogate with unit advantages (branch selection as if A=+1)
+    pg_losses1 = -ratio
+    pg_losses2 = -torch.clamp(ratio, 1 - cliprange_low, 1 + cliprange_high)
+    pg_losses = torch.maximum(pg_losses1, pg_losses2)
+    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
+
+    if rollout_is_weights is not None:
+        pg_losses = pg_losses * rollout_is_weights
+
+    # per-sequence constant advantage, applied after clipping
+    mask_f = response_mask.to(advantages.dtype)
+    adv_scalars = (advantages * mask_f).sum(-1) / mask_f.sum(-1).clamp_min(1.0)
+    pg_losses = adv_scalars.unsqueeze(-1) * pg_losses
+
+    pg_loss = agg_loss(
+        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
+    )
+
+    pg_metrics = {
+        "actor/pg_clipfrac": pg_clipfrac.detach().item(),
+        "actor/ppo_kl": ppo_kl.detach().item(),
+        "actor/seq_adv_scalar_mean": adv_scalars.mean().detach().item(),
+    }
+    return pg_loss, pg_metrics
+
+
 @register_policy_loss("dppo_tv")
 def compute_policy_loss_dppo_tv(
     old_log_prob: torch.Tensor,

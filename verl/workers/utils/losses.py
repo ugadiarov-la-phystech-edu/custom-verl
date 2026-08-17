@@ -19,9 +19,11 @@ from tensordict import TensorDict
 from verl.trainer.ppo.core_algos import agg_loss, compute_value_loss, get_policy_loss_fn, kl_penalty
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
+from verl.utils.debug.metrics import rollout_actor_probs_pearson_corr
 from verl.utils.metric import AggregationType, Metric
 from verl.utils.torch_functional import masked_mean, masked_sum
 from verl.workers.config import ActorConfig, CriticConfig
+from verl.workers.utils.ess import compute_seq_is_sums
 from verl.workers.utils.padding import no_padding_2_padding
 
 
@@ -82,12 +84,31 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
     metrics = {}
 
+    loss_mode = config.policy_loss.get("loss_mode", "vanilla")
+    if loss_mode == "seq_adv_post_scale" and (config.entropy_coeff != 0 or config.use_kl_loss):
+        raise NotImplementedError(
+            "seq_adv_post_scale supports pure policy-gradient losses only "
+            "(entropy_coeff must be 0 and use_kl_loss must be False)"
+        )
+    ess_cfg = getattr(config, "ess_scaling", None)
+    ess_enabled = ess_cfg is not None and ess_cfg.enable
+    # both the ESS brake and the seq_adv_post_scale loss measure the live policy
+    # against the behavior (rollout) policy
+    need_rollout_log_probs = ess_enabled or loss_mode == "seq_adv_post_scale"
+
     # select fields and convert to padded tensor
     fields = ["response_mask", "old_log_probs", "advantages"]
     if "rollout_is_weights" in data:
         fields.append("rollout_is_weights")
     if "ref_log_prob" in data:
         fields.append("ref_log_prob")
+    if need_rollout_log_probs:
+        if "rollout_log_probs" not in data:
+            raise ValueError(
+                "ess_scaling.enable / loss_mode=seq_adv_post_scale require rollout_log_probs in the batch "
+                "(set actor_rollout_ref.rollout.calculate_log_probs=True)"
+            )
+        fields.append("rollout_log_probs")
     data = data.select(*fields).to_padded_tensor()
 
     response_mask = data["response_mask"].to(bool)
@@ -96,9 +117,37 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     advantages = data["advantages"]
     rollout_is_weights = data.get("rollout_is_weights", None)
 
-    loss_agg_mode = config.loss_agg_mode
+    if need_rollout_log_probs:
+        rollout_log_probs = data["rollout_log_probs"]
+        corr_cfg = config.policy_loss.get("rollout_correction", None)
+        raw_threshold = corr_cfg.get("rollout_is_threshold", None) if corr_cfg is not None else None
+        try:
+            rollout_is_threshold = float(raw_threshold) if raw_threshold is not None else None
+        except (TypeError, ValueError):
+            rollout_is_threshold = None
 
-    loss_mode = config.policy_loss.get("loss_mode", "vanilla")
+        if ess_enabled:
+            # reserved plain-float partial sums, consumed (popped) by the
+            # ESS optimizer-step hook before the DP metric allgather
+            metrics.update(compute_seq_is_sums(log_prob, rollout_log_probs, response_mask, rollout_is_threshold))
+
+        if loss_mode == "seq_adv_post_scale" and rollout_is_weights is None:
+            # token-level truncated IS weights vs the behavior policy, anchored on
+            # this update's own forward (the deferred-correction semantics)
+            with torch.no_grad():
+                token_log_ratio = (log_prob.detach().float() - rollout_log_probs.float()).clamp(-20.0, 20.0)
+                token_is = torch.exp(token_log_ratio)
+                if rollout_is_threshold is not None and rollout_is_threshold > 0:
+                    token_is = torch.clamp(token_is, max=rollout_is_threshold)
+                rollout_is_weights = token_is.to(log_prob.dtype)
+
+        if corr_cfg is not None and corr_cfg.get("log_probs_pearson_corr", False):
+            # per-micro-batch diagnostic, mean-reduced on the driver
+            metrics["training/rollout_actor_probs_pearson_corr"] = rollout_actor_probs_pearson_corr(
+                log_prob.detach(), rollout_log_probs, response_mask
+            )
+
+    loss_agg_mode = config.loss_agg_mode
 
     policy_loss_fn = get_policy_loss_fn(loss_mode)
     pg_loss, pg_metrics = policy_loss_fn(
@@ -127,6 +176,8 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         entropy_coeff = config.entropy_coeff
         policy_loss -= entropy_coeff * entropy_loss
         metrics["actor/entropy_loss"] = Metric(value=entropy_loss, aggregation=metric_aggregation)
+        # dashboard-parity alias: the aggregated entropy of the update batch
+        metrics["actor/entropy"] = Metric(value=entropy_loss.detach(), aggregation=metric_aggregation)
 
     # add kl loss
     if config.use_kl_loss:

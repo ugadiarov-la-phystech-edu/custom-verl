@@ -252,5 +252,30 @@ class TestActorConfig(unittest.TestCase):
         self.assertIn("must be >= n_gpus", str(cm.exception))
 
 
+class TestFSDPActorStrategySync(unittest.TestCase):
+    """actor.strategy is the single source of truth for the engine backend:
+    __post_init__ copies it onto engine (= fsdp_config) so engine_workers
+    selects the right FSDP version."""
+
+    def test_actor_strategy_propagates_to_engine(self):
+        config = FSDPActorConfig(strategy="fsdp2", use_dynamic_bsz=True, rollout_n=1)
+        self.assertEqual(config.engine.strategy, "fsdp2")
+        self.assertIs(config.engine, config.fsdp_config)
+
+    def test_fsdp_config_only_override_is_clobbered(self):
+        """Documented trap: setting ONLY fsdp_config.strategy=fsdp2 while
+        actor.strategy stays at the default 'fsdp' runs FSDP1 — launch scripts
+        must set actor.strategy=fsdp2."""
+        from verl.workers.config import FSDPEngineConfig
+
+        config = FSDPActorConfig(
+            use_dynamic_bsz=True,
+            rollout_n=1,
+            fsdp_config=FSDPEngineConfig(strategy="fsdp2"),
+        )
+        self.assertEqual(config.strategy, "fsdp")
+        self.assertEqual(config.engine.strategy, "fsdp")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -102,6 +102,55 @@ class MessageQueue:
             self.total_consumed += 1
             return data, len(self.queue)
 
+    async def get_available_samples(self) -> list[Any]:
+        """Drain everything currently in the queue without blocking (used by the
+        replay-buffer trainer to move all buffered groups at once)."""
+        async with self._lock:
+            drained = list(self.queue)
+            self.queue.clear()
+            self.total_consumed += len(drained)
+            return drained
+
+    async def save_state(self, ckpt_dir: str) -> None:
+        """Persist the queue contents and counters to `message_queue.pt` under
+        ckpt_dir. Samples are already cloudpickled bytes, so the snapshot is a
+        plain list of bytes plus counters."""
+        import os
+
+        import torch
+
+        async with self._lock:
+            state = {
+                "samples": list(self.queue),
+                "total_produced": self.total_produced,
+                "total_consumed": self.total_consumed,
+                "dropped_samples": self.dropped_samples,
+            }
+        path = os.path.join(ckpt_dir, "message_queue.pt")
+        torch.save(state, path)
+        print(f"[MessageQueue] saved {len(state['samples'])} samples to {path}")
+
+    async def load_state(self, ckpt_dir: str) -> None:
+        """Restore queue contents saved by save_state. Missing file is a no-op
+        (fresh queue)."""
+        import os
+
+        import torch
+
+        path = os.path.join(ckpt_dir, "message_queue.pt")
+        if not os.path.exists(path):
+            print(f"[MessageQueue] no state at {path}; starting empty")
+            return
+        state = torch.load(path, weights_only=False)
+        async with self._lock:
+            for sample in state.get("samples", []):
+                self.queue.append(sample)
+            self.total_produced = int(state.get("total_produced", len(self.queue)))
+            self.total_consumed = int(state.get("total_consumed", 0))
+            self.dropped_samples = int(state.get("dropped_samples", 0))
+            self._consumer_condition.notify_all()
+        print(f"[MessageQueue] restored {len(state.get('samples', []))} samples from {path}")
+
     async def get_queue_size(self) -> int:
         """Get current queue length"""
         async with self._lock:
@@ -199,6 +248,21 @@ class MessageQueueClient:
         """Get single sample from queue, wait until one is available (async)"""
         future = self.queue_actor.get_sample.remote()
         return await asyncio.wrap_future(future.future())
+
+    async def get_available_samples(self) -> list[Any]:
+        """Drain everything currently buffered without blocking (async)"""
+        future = self.queue_actor.get_available_samples.remote()
+        return await asyncio.wrap_future(future.future())
+
+    async def save_state(self, ckpt_dir: str) -> None:
+        future = self.queue_actor.save_state.remote(ckpt_dir)
+        return await asyncio.wrap_future(future.future())
+
+    def save_state_sync(self, ckpt_dir: str) -> None:
+        ray.get(self.queue_actor.save_state.remote(ckpt_dir))
+
+    def load_state_sync(self, ckpt_dir: str) -> None:
+        ray.get(self.queue_actor.load_state.remote(ckpt_dir))
 
     async def get_queue_size(self) -> int:
         """Get queue size (async)"""

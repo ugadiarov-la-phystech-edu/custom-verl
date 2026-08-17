@@ -13,13 +13,17 @@
 # limitations under the License.
 
 import asyncio
+import json
 import logging
+import math
 import os
 import time
 from datetime import datetime
 from typing import Any
 
+import numpy as np
 import ray
+import torch
 from omegaconf import OmegaConf, open_dict
 from tqdm import tqdm
 
@@ -30,14 +34,17 @@ from verl.experimental.fully_async_policy.detach_utils import (
     assemble_batch_from_rollout_samples,
 )
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
+from verl.experimental.fully_async_policy.replay_buffer import ReplayBuffer
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.ppo import core_algos
+from verl.trainer.ppo.metric_utils import compute_data_metrics, compute_throughout_metrics, compute_timing_metrics
 from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
+from verl.utils.metric import reduce_metrics
 from verl.utils.tracking import Tracking
 
 logger = logging.getLogger(__name__)
@@ -163,6 +170,52 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # Uses naive backend to sync weights from trainer to hybrid rollout replicas.
         # Initialized in _setup_hybrid_checkpoint_manager_and_sleep() via set_rollouter().
         self.hybrid_checkpoint_manager = None
+
+        # ==================== Replay-buffer training loop (VCPO port) ====================
+        replay_cfg = config.async_training.get("replay_buffer", None)
+        self.replay_enable = bool(replay_cfg is not None and replay_cfg.get("enable", False))
+        if self.replay_enable:
+            assert self.trigger_parameter_sync_step == 1, "replay mode syncs weights after every update"
+            assert self.require_batches == 1, "replay mode consumes one mini-batch per update"
+            self.replay_buffer = ReplayBuffer(
+                tau=float(replay_cfg.get("tau", 16)),
+                staleness_threshold=int(replay_cfg.get("staleness_threshold", 64)),
+                seed=int(replay_cfg.get("sampling_seed", 1234)),
+            )
+            self.replay_requires_mini_batches = float(replay_cfg.get("requires_mini_batches", 1))
+            self.replay_warmup_updates = math.ceil(self.replay_requires_mini_batches)
+            self.replay_updates_done = 0
+            self.rollout_done = False
+            # Auto-calibrated ESS reference: with ess_scaling.enable=True and
+            # base_ess_ratio=null, the first update runs unscaled and its measured
+            # (on-policy, staleness-0 warm-up) ESS ratio becomes the base, passed
+            # to the actor via meta_info["ess_base_override"] and persisted in
+            # replay_buffer.pt across restarts.
+            actor_cfg = config.actor_rollout_ref.actor
+            self.replay_ess_auto_base = bool(
+                actor_cfg.ess_scaling.get("enable", False) and actor_cfg.ess_scaling.get("base_ess_ratio", None) is None
+            )
+            self.replay_ess_use_clipped = bool(actor_cfg.ess_scaling.get("use_clipped", False))
+            self.replay_ess_base = None
+        self.pause_generation_during_save = bool(config.async_training.get("pause_generation_during_save", False))
+        self.save_queue_state = bool(config.async_training.get("save_queue_state", True))
+
+        # Virtual clock for the cumulative_training_time metric: the wall time an
+        # identical run with neither validation nor checkpointing would have
+        # needed (see _add_cumulative_time_metrics).
+        self.rollouter_first_sample_time = None
+        self.cumulative_save_time = 0.0
+        self.cumulative_validation_time = 0.0
+        self.virtual_free_time = None
+        self._step_virtual_start = None
+        self._step_actual_start = None
+        self._step_valid_time = 0.0
+        self._step_save_time = 0.0
+        # Offsets restored from timing_state.json on resume.
+        self.timing_wall_offset = 0.0
+        self.timing_validation_offset = 0.0
+        self.timing_save_offset = 0.0
+        self.virtual_training_time_offset = 0.0
 
     async def _setup_checkpoint_manager(self):
         """Setup checkpoint manager after rollouter is initialized"""
@@ -385,6 +438,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             raise ValueError("MessageQueue client not set. Call set_message_queue_client() first.")
         if self.rollouter is None:
             raise ValueError("rollouter not set. Call set_rollouter() first.")
+
+        if self.replay_enable:
+            return await self._fit_replay()
 
         self.max_steps_duration = 0
 
@@ -746,6 +802,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
             )
 
+        self._load_replay_checkpoint_extras(global_step_folder)
+
         return self.current_param_version
 
     def _collect_metrics_from_samples(self, batch, metrics):
@@ -765,3 +823,471 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             for key, value in batch.meta_info.items():
                 if key.startswith("fully_async") or key.startswith("timing_s"):
                     metrics[key] = value
+
+    # ==================== Replay-buffer training loop (VCPO port) ====================
+
+    async def _drain_queue_into_buffer(self) -> int:
+        """Move everything currently in the transport queue into the replay
+        buffer without blocking. Returns the number of groups added."""
+        drained = await self.message_queue_client.get_available_samples()
+        added = 0
+        for raw in drained:
+            if raw is None:
+                self.rollout_done = True
+                continue
+            self.replay_buffer.add(ray.cloudpickle.loads(raw), self.current_param_version)
+            added += 1
+        return added
+
+    async def _wait_one_sample_into_buffer(self) -> bool:
+        """Block for one sample from the transport queue and add it to the
+        buffer. Returns False when the termination sentinel arrived instead."""
+        result = await self.message_queue_client.get_sample()
+        if result is None:
+            self.rollout_done = True
+            return False
+        sample, _ = result
+        if sample is None:
+            self.rollout_done = True
+            return False
+        self.replay_buffer.add(ray.cloudpickle.loads(sample), self.current_param_version)
+        return True
+
+    async def _acquire_replay_minibatch(self):
+        """Compose the next mini-batch of groups from the replay buffer.
+
+        Warm-up (first ceil(requires_mini_batches) updates): wait until
+        mini_size *unseen* groups are buffered and use exactly those, oldest
+        first. Steady state: pause only while the buffer holds fewer than
+        requires_mini_batches x mini_size groups (fractional values allowed),
+        then compose all unseen groups (oldest first, capped) plus a
+        score-weighted sample of used ones. Returns (entries, info) or
+        (None, None) when generation has finished and the buffer cannot
+        support another mini-batch."""
+        mini_size = self.required_samples
+        watermark = self.replay_requires_mini_batches * mini_size
+        await self._drain_queue_into_buffer()
+        if self.replay_updates_done < self.replay_warmup_updates:
+            while self.replay_buffer.new_count() < mini_size:
+                if self.rollout_done:
+                    print(
+                        f"[FullyAsyncTrainer][Replay] rollout finished during warm-up with "
+                        f"{self.replay_buffer.new_count()}/{mini_size} unseen groups; stopping"
+                    )
+                    return None, None
+                await self._wait_one_sample_into_buffer()
+            entries = self.replay_buffer.take_oldest_new(mini_size)
+            info = {
+                "n_new": mini_size,
+                "n_replayed": 0,
+                "staleness": [e.staleness(self.current_param_version) for e in entries],
+            }
+        else:
+            while self.replay_buffer.size() < watermark:
+                if self.rollout_done:
+                    print(
+                        f"[FullyAsyncTrainer][Replay] rollout finished with buffer "
+                        f"{self.replay_buffer.size()} < watermark {watermark}; stopping"
+                    )
+                    return None, None
+                await self._wait_one_sample_into_buffer()
+            entries, info = self.replay_buffer.compose_minibatch(mini_size, self.current_param_version)
+        # Open the virtual (no-validation-no-save) step: only the unseen
+        # entries' arrival stamps gate this step — replayed groups were ready
+        # long ago (a pure-replay mini-batch never waits on generation).
+        consumer_end = time.time()
+        self._open_virtual_step(consumer_end, [e.sample for e in entries if e.is_new])
+        return entries, info
+
+    def _build_replay_batch(self, entries):
+        """Assemble a training DataProto from buffered groups using the frozen
+        insertion-time statistics: advantages broadcast from advantage_scalar
+        and the cached behavior log-probs as the off-policy reference (the
+        seq_adv_post_scale loss anchors its ratio on the update's own forward,
+        so old_log_probs is only an alias to satisfy field selection)."""
+        rollout_samples = [e.sample for e in entries]
+        balance = self._balance_batch if self.config.trainer.balance_batch else None
+        batch = assemble_batch_from_rollout_samples(rollout_samples, self.tokenizer, self.config, balance)
+        if "traj_uid" not in batch.non_tensor_batch and "uid" in batch.non_tensor_batch:
+            uids = batch.non_tensor_batch.get("uid")
+            batch.non_tensor_batch["traj_uid"] = np.array(
+                [f"group-{uid}_traj-{idx}" for idx, uid in enumerate(uids)], dtype=object
+            )
+        response_mask = batch.batch["response_mask"]
+        adv_scalars = torch.from_numpy(np.asarray(batch.non_tensor_batch["advantage_scalar"], dtype=np.float32))
+        advantages = adv_scalars.unsqueeze(-1) * response_mask.float()
+        batch.batch["advantages"] = advantages
+        batch.batch["returns"] = advantages
+        # Sparse last-token rewards from the frozen insertion-time scalars, for
+        # the data metrics (critic/score, critic/rewards) — not used by the loss.
+        reward_scalars = torch.from_numpy(np.asarray(batch.non_tensor_batch["reward_scalar"], dtype=np.float32))
+        token_level_scores = torch.zeros_like(response_mask, dtype=torch.float32)
+        lengths = response_mask.sum(dim=-1).long()
+        valid = lengths > 0
+        rows = torch.arange(response_mask.shape[0])[valid]
+        token_level_scores[rows, (lengths[valid] - 1)] = reward_scalars[valid]
+        batch.batch["token_level_scores"] = token_level_scores
+        batch.batch["token_level_rewards"] = token_level_scores
+        batch.batch["old_log_probs"] = batch.batch["rollout_log_probs"]
+        batch.meta_info["trainer_param_version"] = self.current_param_version
+        if self.replay_ess_auto_base:
+            # None until the first update's measurement is captured; the actor
+            # skips LR scaling while the override is unresolved.
+            batch.meta_info["ess_base_override"] = self.replay_ess_base
+        return batch
+
+    def _capture_ess_base(self, metrics):
+        """Auto-calibration of ess_scaling.base_ess_ratio: capture the first
+        update's measured ESS ratio (the staleness-0 warm-up mini-batch, i.e.
+        the empirical on-policy rho_on) from the actor's structured
+        staleness/ess entries. No-op once captured. The field matches
+        ess_scaling.use_clipped so the reference and the scaling numerator
+        measure the same quantity."""
+        if self.replay_ess_base is not None:
+            return
+        key = "minibatch_ess_ratio_clipped" if self.replay_ess_use_clipped else "minibatch_ess_ratio"
+        entries = metrics.get("staleness/ess") or []
+        values = [float(e[key]) for e in entries if isinstance(e, dict) and e.get(key) is not None]
+        if values:
+            self.replay_ess_base = float(np.mean(values))
+            print(
+                f"[FullyAsyncTrainer][Replay] auto-calibrated ess_scaling.base_ess_ratio="
+                f"{self.replay_ess_base:.4f} from the first update ({key})"
+            )
+
+    def _add_replay_metrics(self, metrics, info, new_version):
+        """Replay/ESS metrics, computed after this update's eviction/rescoring
+        at the post-update model version. The structured staleness/ess entries
+        are consumed into scalars here; the raw staleness lists go to the
+        tensorboard backend only (native histograms) via _fit_replay."""
+        minibatch_staleness = info["staleness"]
+        buffer_staleness = self.replay_buffer.staleness_list(new_version)
+        metrics.update(
+            {
+                "replay/buffer_size": self.replay_buffer.size(),
+                "replay/buffer_new": self.replay_buffer.new_count(),
+                "replay/buffer_max_staleness": float(self.replay_buffer.max_staleness(new_version) or 0),
+                "replay/minibatch_new": info["n_new"],
+                "replay/minibatch_replayed": info["n_replayed"],
+                "replay/minibatch_new_ratio": info["n_new"] / (info["n_new"] + info["n_replayed"]),
+                "replay/minibatch_staleness_mean": float(np.mean(minibatch_staleness)),
+                "replay/minibatch_staleness_max": float(np.max(minibatch_staleness)),
+                "replay/evicted_cum": self.replay_buffer.evicted_total,
+                "replay/evicted_unseen_cum": self.replay_buffer.evicted_unseen_total,
+                "replay/total_added": self.replay_buffer.total_added,
+            }
+        )
+        if buffer_staleness:
+            metrics["replay/buffer_staleness_mean"] = float(np.mean(buffer_staleness))
+        self._replay_hist_payload = {
+            "replay/minibatch_staleness_hist": [float(s) for s in minibatch_staleness],
+            "replay/buffer_staleness_hist": [float(s) for s in buffer_staleness],
+        }
+        # Consume the structured staleness/ess entries into dashboard scalars:
+        # the effective (possibly ESS-braked) lr and the reference the actor
+        # actually resolved and used this update.
+        ess_entries = metrics.pop("staleness/ess", None) or []
+        scaled_lrs = [
+            float(e["ess_scaled_lr"]) for e in ess_entries if isinstance(e, dict) and e.get("ess_scaled_lr") is not None
+        ]
+        if scaled_lrs:
+            metrics["replay/ess_scaled_lr"] = float(np.mean(scaled_lrs))
+            # dashboard-parity alias with the source fork's actor-side scalar
+            metrics["actor/ess_scaled_lr"] = float(np.mean(scaled_lrs))
+        for src_key, dst_key in (
+            ("minibatch_ess_ratio", "staleness/ess_ratio"),
+            ("minibatch_ess_ratio_clipped", "staleness/ess_ratio_clipped"),
+            ("base_ess_ratio", "staleness/base_ess_ratio"),
+        ):
+            values = [float(e[src_key]) for e in ess_entries if isinstance(e, dict) and e.get(src_key) is not None]
+            if values:
+                metrics[dst_key] = float(np.mean(values))
+        if getattr(self, "replay_ess_base", None) is not None:
+            metrics["replay/ess_base"] = self.replay_ess_base
+
+    async def _replay_sync_weights(self, timing_raw):
+        """Parameter sync after every replay update (trigger_parameter_sync_step=1)."""
+        with marked_timer("param_sync", timing_raw):
+            await self.checkpoint_manager.update_weights(global_steps=self.current_param_version)
+        staleness_timing = await asyncio.wrap_future(self.rollouter.reset_staleness.remote().future())
+        return staleness_timing
+
+    async def _replay_maybe_validate(self, metrics):
+        """Stop-the-world validation on the rollout GPUs at the test_freq
+        cadence (in param-version units). The awaited window counts into
+        cumulative_validation_time and is excluded from the virtual clock."""
+        test_freq = self.config.trainer.test_freq
+        if not (test_freq > 0 and self.current_param_version > 0 and self.current_param_version % test_freq == 0):
+            return
+        valid_start = time.time()
+        val_metrics = await self.rollouter.do_validate.remote()
+        valid_time = time.time() - valid_start
+        self.cumulative_validation_time += valid_time
+        self._step_valid_time += valid_time
+        self.logger.log(data=val_metrics, step=self.current_param_version)
+
+    async def _replay_maybe_save(self, timing_raw, force=False):
+        """Checkpoint at the save_freq cadence (param-version units), optionally
+        freezing generation for the whole save (pause_generation_during_save) so
+        the save is a pure time translation of the pipeline."""
+        save_freq = self.config.trainer.save_freq
+        if self.current_param_version == self.last_ckpt_version:
+            return
+        if not (save_freq > 0 and (force or self.current_param_version % save_freq == 0)):
+            return
+        save_start = time.time()
+        if self.pause_generation_during_save:
+            await self.rollouter.begin_save_pause.remote()
+        try:
+            with marked_timer("save_checkpoint", timing_raw, color="green"):
+                self._save_checkpoint()
+                local_global_step_folder = os.path.join(
+                    self.config.trainer.default_local_dir, f"global_step_{self.current_param_version}"
+                )
+                self._save_timing_state(local_global_step_folder, save_start)
+                replay_path = os.path.join(local_global_step_folder, "replay_buffer.pt")
+                torch.save(self._replay_checkpoint_state(), replay_path)
+                print(
+                    f"[FullyAsyncTrainer][Replay] Saved replay buffer "
+                    f"({self.replay_buffer.size()} groups) to {replay_path}"
+                )
+                if self.save_queue_state:
+                    self.message_queue_client.save_state_sync(local_global_step_folder)
+                self.last_ckpt_version = self.current_param_version
+        finally:
+            if self.pause_generation_during_save:
+                await self.rollouter.end_save_pause.remote()
+        save_time = time.time() - save_start
+        self.cumulative_save_time += save_time
+        self._step_save_time += save_time
+
+    def _replay_post_update_maintenance(self, entries):
+        """Post-update buffer maintenance at the version this update just
+        produced (stamped by the subsequent sync): retire the used groups'
+        is_new flag, then evict too-stale groups and decay scores.
+        mark_used runs BEFORE evict so a just-trained group past the staleness
+        bound is not miscounted as evicted-unseen (wasted rollout compute)."""
+        new_version = self.current_param_version + 1
+        self.replay_buffer.mark_used(entries)
+        self.replay_buffer.evict(new_version)
+        self.replay_buffer.recompute_scores(new_version)
+        self.replay_updates_done += 1
+        return new_version
+
+    def _replay_checkpoint_state(self) -> dict:
+        return {
+            "replay_buffer": self.replay_buffer.state_dict(),
+            "replay_updates_done": self.replay_updates_done,
+            "replay_ess_base": self.replay_ess_base,
+        }
+
+    def _load_replay_checkpoint_extras(self, global_step_folder):
+        """Restore replay-buffer, ESS auto-base, timing offsets and queue state
+        saved next to the actor checkpoint. Missing files degrade gracefully."""
+        self._restore_timing_state(global_step_folder)
+        if not self.replay_enable:
+            return
+        replay_path = os.path.join(global_step_folder, "replay_buffer.pt")
+        if os.path.exists(replay_path):
+            state = torch.load(replay_path, weights_only=False)
+            self.replay_buffer.load_state_dict(state["replay_buffer"])
+            self.replay_updates_done = int(state.get("replay_updates_done", 0))
+            self.replay_ess_base = state.get("replay_ess_base", None)
+            print(
+                f"[FullyAsyncTrainer][Replay] Restored replay buffer "
+                f"({self.replay_buffer.size()} groups, ess_base={self.replay_ess_base}) from {replay_path}"
+            )
+        else:
+            print(f"[FullyAsyncTrainer][Replay] No replay_buffer.pt in {global_step_folder}; starting empty")
+        if self.save_queue_state:
+            self.message_queue_client.load_state_sync(global_step_folder)
+
+    # ==================== Virtual clock (cumulative_training_time) ====================
+
+    def _open_virtual_step(self, consumer_end: float, queue_samples: list):
+        """Start this step on the virtual (no-validation-no-save) timeline: at
+        max(trainer free, batch ready), where the batch is ready when its last
+        sample would have arrived without the rollouter's validation and
+        checkpoint-save pauses. Samples restored from an old-format queue
+        snapshot may lack the stamps; fall back to the actual ready time (no
+        pause correction) for them."""
+        virtual_ready_times = [
+            s.enqueue_time - s.validation_pause_before - getattr(s, "checkpoint_pause_before", 0.0)
+            for s in queue_samples
+            if getattr(s, "enqueue_time", 0.0)
+        ]
+        batch_virtual_ready = max(virtual_ready_times) if virtual_ready_times else consumer_end
+        self._step_actual_start = consumer_end
+        if self.virtual_free_time is not None:
+            self._step_virtual_start = max(self.virtual_free_time, batch_virtual_ready)
+        else:
+            self._step_virtual_start = batch_virtual_ready
+
+    def _virtual_now(self, now: float):
+        """Current position on the virtual (no-validation-no-save) timeline.
+
+        Mid-step, the step began at _step_virtual_start and has been busy for
+        the actual elapsed time minus any awaited validation and checkpoint
+        saving; between steps it is wherever the last step ended. None until
+        the first batch arrives."""
+        if self._step_virtual_start is not None:
+            return (
+                self._step_virtual_start
+                + (now - self._step_actual_start)
+                - self._step_valid_time
+                - self._step_save_time
+            )
+        return self.virtual_free_time
+
+    def _advance_virtual_clock(self, now: float = None):
+        """Close the current step on the virtual timeline (called after the
+        checkpoint save, whose duration _virtual_now excludes)."""
+        if self._step_virtual_start is None:
+            return
+        self.virtual_free_time = self._virtual_now(time.time() if now is None else now)
+        self._step_virtual_start = None
+        self._step_actual_start = None
+
+    def _add_cumulative_time_metrics(self, step_data: dict, now: float = None):
+        """cumulative_training_time: the wall clock (since the rollouter's first
+        processed sample) that an identical run with *neither validation nor
+        checkpointing* would have needed to reach this point. Reconstructed by
+        replaying the pipeline schedule on a virtual timeline: each step starts
+        at max(trainer free, batch ready), with sample-ready times shifted back
+        by the rollouter's validation and checkpoint-save pauses, and trainer
+        stalls on awaited validation and checkpoint saving excluded from the
+        busy time. Exact in rollout-bound, trainer-bound and balanced regimes
+        alike (a naive wall - validation - save subtraction over-subtracts
+        whenever validation overlaps saves or backlog training). No-op until
+        the rollouter reports its first processed sample."""
+        if self.rollouter_first_sample_time is None:
+            return
+        now = time.time() if now is None else now
+        wall_time = now - self.rollouter_first_sample_time + self.timing_wall_offset
+        validation_time = self.cumulative_validation_time + self.timing_validation_offset
+        save_time = self.cumulative_save_time + self.timing_save_offset
+        step_data["fully_async/timing/wall_time_since_first_sample"] = wall_time
+        step_data["fully_async/timing/cumulative_validation_time"] = validation_time
+        step_data["fully_async/timing/cumulative_save_time"] = save_time
+        virtual_now = self._virtual_now(now)
+        if virtual_now is not None:
+            step_data["fully_async/timing/cumulative_training_time"] = (
+                virtual_now - self.rollouter_first_sample_time + self.virtual_training_time_offset
+            )
+
+    def _save_timing_state(self, local_global_step_folder, save_start):
+        """Persist the cumulative timing totals so a resumed run continues the
+        fully_async/timing/* metrics instead of restarting them from zero.
+        The snapshot is taken at save_start, so the in-progress save's own
+        duration is excluded — it is exactly the state a resume reconstructs."""
+        virtual_now = self._virtual_now(save_start)
+        if self.rollouter_first_sample_time is not None:
+            wall_time = save_start - self.rollouter_first_sample_time + self.timing_wall_offset
+            validation_time = self.cumulative_validation_time + self.timing_validation_offset
+            save_time = self.cumulative_save_time + self.timing_save_offset
+            if virtual_now is not None:
+                virtual_training_time = (
+                    virtual_now - self.rollouter_first_sample_time + self.virtual_training_time_offset
+                )
+            else:
+                virtual_training_time = self.virtual_training_time_offset
+        else:
+            wall_time = self.timing_wall_offset
+            validation_time = self.timing_validation_offset
+            save_time = self.timing_save_offset
+            virtual_training_time = self.virtual_training_time_offset
+        timing_state = {
+            "wall_time_since_first_sample": wall_time,
+            "cumulative_validation_time": validation_time,
+            "cumulative_save_time": save_time,
+            "cumulative_training_time": virtual_training_time,
+        }
+        with open(os.path.join(local_global_step_folder, "timing_state.json"), "w") as f:
+            json.dump(timing_state, f, indent=2)
+
+    def _restore_timing_state(self, global_step_folder):
+        timing_state_path = os.path.join(global_step_folder, "timing_state.json")
+        if not os.path.exists(timing_state_path):
+            print("[FullyAsyncTrainer] No timing_state.json in checkpoint; timing metrics restart from zero")
+            return
+        with open(timing_state_path) as f:
+            timing_state = json.load(f)
+        self.timing_wall_offset = timing_state.get("wall_time_since_first_sample", 0.0)
+        self.timing_validation_offset = timing_state.get("cumulative_validation_time", 0.0)
+        self.timing_save_offset = timing_state.get("cumulative_save_time", 0.0)
+        self.virtual_training_time_offset = timing_state.get(
+            "cumulative_training_time",
+            self.timing_wall_offset - self.timing_validation_offset - self.timing_save_offset,
+        )
+        print(
+            f"[FullyAsyncTrainer] Restored timing state from {timing_state_path}: "
+            f"cumulative_training_time resumes at {self.virtual_training_time_offset:.1f}s"
+        )
+
+    async def _fit_replay(self):
+        """Replay-buffer training loop: one optimizer update per iteration,
+        weight sync after every update, staleness-based eviction and score
+        decay, warm-up on fresh groups. See replay_buffer.py for the buffer
+        semantics."""
+        self.max_steps_duration = 0
+        timing_raw = {}
+        while True:
+            metrics = {}
+            timing_raw = {}
+            self._step_valid_time = 0.0
+            self._step_save_time = 0.0
+            if self.rollouter_first_sample_time is None:
+                self.rollouter_first_sample_time = await asyncio.wrap_future(
+                    self.rollouter.get_first_sample_time.remote().future()
+                )
+
+            with marked_timer("step", timing_raw):
+                with marked_timer("gen", timing_raw, color="red"):
+                    entries, info = await self._acquire_replay_minibatch()
+                    if entries is None:
+                        break
+                    batch = self._build_replay_batch(entries)
+                    self._collect_metrics_from_samples(batch, metrics)
+                with marked_timer("update_actor", timing_raw, color="red"):
+                    actor_output = self._update_actor(batch)
+                metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
+                if self.replay_ess_auto_base:
+                    self._capture_ess_base(metrics)
+
+            new_version = self._replay_post_update_maintenance(entries)
+            self._add_replay_metrics(metrics, info, new_version)
+
+            # Model versions tick once per UPDATE: sync, then validate/save at
+            # the param-version cadence.
+            self.current_param_version = new_version
+            staleness_timing = await self._replay_sync_weights(timing_raw)
+            metrics.update(staleness_timing)
+            await self._replay_maybe_validate(metrics)
+            await self._replay_maybe_save(timing_raw)
+
+            metrics["training/global_step"] = self.global_steps
+            metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+            metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
+            n_gpus = self.resource_pool_manager.get_n_gpus()
+            metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))
+            metrics.update({f"timing_s/{k}": float(v) for k, v in timing_raw.items()})
+            self._add_cumulative_time_metrics(metrics)
+            time_str = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+            print(
+                f"[FullyAsyncTrainer][Replay] update: {self.replay_updates_done} "
+                f"param_version: {self.current_param_version} "
+                f"buffer: {self.replay_buffer.size()} "
+                f"(new: {self.replay_buffer.new_count()}) {time_str}"
+            )
+            self.logger.log(data=metrics, step=self.current_param_version)
+            hist_payload = getattr(self, "_replay_hist_payload", None)
+            if hist_payload and "tensorboard" in self.config.trainer.logger:
+                self.logger.log(data=hist_payload, step=self.current_param_version, backend=["tensorboard"])
+            if self.progress_bar is not None:
+                self.progress_bar.update(1)
+            self.global_steps += 1
+            self._advance_virtual_clock()
+
+        # Final checkpoint (force) covers whatever the last cadence missed.
+        await self._replay_maybe_save(timing_raw, force=True)
+        print("[FullyAsyncTrainer][Replay] Training finished")
