@@ -30,7 +30,13 @@ RAY_DATA_HOME=${RAY_DATA_HOME:-"${HOME}/verl"}
 MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-8B"}
 CKPTS_DIR=${CKPTS_DIR:-"${RAY_DATA_HOME}/ckpts/${project_name}/${exp_name}"}
 TRAIN_FILE=${TRAIN_FILE:-"${RAY_DATA_HOME}/data/dapo-math-17k.parquet"}
-TEST_FILE=${TEST_FILE:-"${RAY_DATA_HOME}/data/aime-2024.parquet"}
+# Two validation sets, reported separately by data_source:
+#   aime-2024.parquet (data_source=math_dapo) -> val-core/math_dapo/acc/mean@1
+#   math500.parquet   (data_source=math500_dapo) -> val-core/math500_dapo/acc/mean@1
+# Built by examples/data_preprocess/math500.py with the SAME prompt template
+# and "Answer:"-line scorer (math_dapo) as the training set, so validation
+# measures math ability rather than answer-format transfer.
+TEST_FILE=${TEST_FILE:-"['${RAY_DATA_HOME}/data/aime-2024.parquet','${RAY_DATA_HOME}/data/math500.parquet']"}
 
 rollout_mode="async"
 rollout_name="vllm"
