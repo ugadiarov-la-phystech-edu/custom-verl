@@ -174,7 +174,21 @@ epochs=10000000
 # 10 = every 330 groups. Use -1 to disable (0 raises ZeroDivisionError upstream).
 test_freq=${test_freq:-10}
 save_freq=${save_freq:-10}
-max_actor_ckpt_to_keep=1 # keep only the most recent checkpoint
+# Export-only checkpoints, matching the fork's replay arm: weights in HF format,
+# no optimizer/extra state, nothing ever pruned. On this tree 'model' is what
+# triggers bridge.save_hf_weights (megatron_checkpoint_manager.py:753); the
+# 'hf_model' token is kept for intent and for a future dist-checkpointing setup,
+# where it would drive the export instead.
+#   ~16.4 GB per checkpoint (Qwen3-8B = 8,190,735,360 params x 2 B bf16; mbridge
+#   does not cast) + ~16 MB tokenizer/config. dist_ckpt/ is metadata-only.
+#   At save_freq=10 and 2000 param versions that is ~200 checkpoints ~= 3.3 TB.
+#   Lower save_freq (env-overridable) if disk is tight.
+max_actor_ckpt_to_keep=null # keep every checkpoint (null disables both retention trims)
+ckpt_save_contents="['model','hf_model']"
+# Resume is off: these checkpoints carry no optimizer/RNG state, so an auto-resume
+# would silently restore weights only -- and the saves still write
+# latest_checkpointed_iteration.txt, which resume_mode=auto would pick up.
+resume_mode=${resume_mode:-disable}
 
 # ================= Logging =================
 exp_name=${exp_name:-"GRPO-noVCPO-v080 verl-default-loss k-${staleness_threshold} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz}x${num_minibatches_per_update} ppo-epochs-${ppo_epochs} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
@@ -296,6 +310,8 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     trainer.test_freq=${test_freq} \
     trainer.total_epochs=${epochs} \
     trainer.max_actor_ckpt_to_keep=${max_actor_ckpt_to_keep} \
+    trainer.resume_mode=${resume_mode} \
+    "actor_rollout_ref.actor.checkpoint.save_contents=${ckpt_save_contents}" \
     trainer.rollout_data_dir="${log_dir}" \
     trainer.log_val_generations=${log_val_generations} \
     trainer.default_local_dir="${CKPTS_DIR}" \
