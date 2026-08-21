@@ -29,7 +29,7 @@ install_requires = [
     "datasets",
     "dill",
     "hydra-core",
-    "numpy<2.0.0",
+    "numpy>=1.24,<2.3",  # numba (hard vllm dep) caps numpy at <2.3
     "pandas",
     "peft",
     "pyarrow>=19.0.0",
