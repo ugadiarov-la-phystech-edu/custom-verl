@@ -53,7 +53,9 @@ def _capture_overrides(script: Path, tmp_path: Path) -> list[str]:
     stub.write_text('#!/bin/bash\nprintf "%s\\n" "$@"\n')
     stub.chmod(0o755)
 
-    env = dict(os.environ, PATH=f"{stub_dir}:{os.environ.get('PATH', '')}")
+    # SMOKE_VERIFY=0: the smoke script's post-run artifact checks must not run against a
+    # stub `python` that never produced a checkpoint.
+    env = dict(os.environ, PATH=f"{stub_dir}:{os.environ.get('PATH', '')}", SMOKE_VERIFY="0")
     proc = subprocess.run(
         ["bash", str(script)],
         cwd=tmp_path,
