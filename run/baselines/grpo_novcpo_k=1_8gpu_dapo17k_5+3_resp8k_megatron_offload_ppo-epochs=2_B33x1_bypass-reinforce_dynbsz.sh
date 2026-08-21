@@ -20,7 +20,10 @@
 # 66.4 GB peak. Those numbers came with `trainer.worker_env` delivering
 # PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to the trainer workers — that key does
 # NOT exist on this tree, so this arm has one less mitigation available. Starting point
-# below is x1.5 for the actor; lower actor_ppo_max_token_len first if the update OOMs.
+# below is x1 (10240 = one sequence's worth). x1.5 (15360) was tried on this box on
+# 2026-08-21 and OOM'd in the update's backward pass: 9.33 GiB free, 9.36 GiB requested --
+# short by ~30 MiB, with 8.03 GiB "reserved but unallocated", i.e. fragmentation that
+# expandable_segments would reclaim if trainer.worker_env existed on this tree.
 # Stock-verl-v0.8.0, derived from the fork arm
 #   custom_vcpo:recipe/fully_async_policy/shell/vcpo/dapo/opp-epochs_dapo-filter/
 #     grpo_novcpo_k=2_8gpu_dapo17k_5+3_resp8k_megatron_offload_ppo-epochs=2_B33x1.sh
@@ -151,7 +154,7 @@ use_dynamic_bsz=True
 log_prob_micro_bsz_per_gpu=1  # ignored while use_dynamic_bsz=True
 # Token budgets per GPU (the real batch-size knob in dynamic mode). Sequence length here is
 # max_prompt_length + max_response_length = 10240.
-actor_ppo_max_token_len=${actor_ppo_max_token_len:-$(((max_prompt_length + max_response_length) * 3 / 2))}   # x1.5 = 15360
+actor_ppo_max_token_len=${actor_ppo_max_token_len:-$((max_prompt_length + max_response_length))}   # x1 = 10240
 # The rollout/ref log-prob budgets are deliberately NOT set: rollout.yaml and ref.yaml both
 # default to ${oc.select:actor_rollout_ref.actor.ppo_max_token_len_per_gpu,16384}, so they
 # follow the actor budget and satisfy the non-None assert on their own. They would only
