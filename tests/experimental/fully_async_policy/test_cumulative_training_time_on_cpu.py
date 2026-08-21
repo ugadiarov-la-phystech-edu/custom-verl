@@ -867,3 +867,40 @@ def test_pre_anchor_windows_excluded_on_the_trainer_side(tmp_path):
     assert saver.calls == ["save_checkpoint", "timing_state"]
     assert saver.cumulative_save_time == 0.0, "pre-anchor save must not be accumulated"
     assert saver._step_save_time > 0
+
+
+def test_first_step_save_is_accounted(tmp_path):
+    """Regression (caught by the 2-iteration smoke run on 8xH100, 2026-08-21).
+
+    The anchor is fetched from the rollouter, which returns None until it has processed its
+    first sample. If the trainer latches it before generation, step 1 runs anchorless: the
+    pre-anchor guard then drops that step's save from cumulative_save_time and writes an
+    all-zero timing_state.json. Observed: global_step_1/timing_state.json was
+    {0.0, 0.0, 0.0, 0.0} and global_step_2 reported cumulative_save_time=0.0 despite two
+    completed saves.
+    """
+    trainer = _make_save_trainer(tmp_path)
+    trainer.rollouter_first_sample_time = None
+    asyncio.run(trainer._fit_save_checkpoint())
+    assert trainer.cumulative_save_time == 0.0, "pre-anchor saves are deliberately excluded"
+
+    # ... which is why the anchor must be latched before the save runs.
+    trainer2 = _make_save_trainer(tmp_path, save_freq=1, version=1)
+    trainer2.rollouter_first_sample_time = 100.0
+    asyncio.run(trainer2._fit_save_checkpoint())
+    assert trainer2.cumulative_save_time > 0.0, "a step-1 save must be accounted once anchored"
+
+
+def test_anchor_is_latched_after_generation_in_fit_step():
+    """Pin the ordering the regression above depends on.
+
+    `_latch_first_sample_time` must be called *after* `_fit_generate`, because only once a
+    batch has been pulled is the rollouter guaranteed to have an anchor to report. This is a
+    source-order assertion because the ordering, not any single function, is the invariant.
+    """
+    import inspect
+
+    src = inspect.getsource(FullyAsyncTrainer.fit_step)
+    gen = src.index("_fit_generate(")
+    latch = src.index("_latch_first_sample_time(")
+    assert latch > gen, "_latch_first_sample_time must run after _fit_generate"

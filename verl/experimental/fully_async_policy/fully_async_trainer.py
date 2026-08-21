@@ -583,7 +583,6 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # Per-step virtual-clock stalls, excluded from the step's busy time.
         self._step_valid_time = 0.0
         self._step_save_time = 0.0
-        await self._latch_first_sample_time()
         # reward message
         self.future_reward = None
         self.reward_tensor = None
@@ -595,6 +594,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         with marked_timer("step", self.timing_raw):
             batch = await self._fit_generate(None)
+            # Latch the virtual-clock anchor only once a batch exists: the rollouter reports
+            # None until it has processed its first sample, so fetching before generation
+            # leaves step 1 anchorless and silently drops its save from the audit totals.
+            await self._latch_first_sample_time()
             batch = self._fit_compute_reward(batch)
             batch = self._fit_compute_log_prob(batch)
             batch = self._fit_compute_ref_log_prob(batch)
