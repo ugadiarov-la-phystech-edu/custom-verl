@@ -274,7 +274,21 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         """Persist the cumulative timing totals so a resumed run continues the
         fully_async/timing/* metrics instead of restarting them from zero.
         The snapshot is taken at save_start, so the in-progress save's own
-        duration is excluded — it is exactly the state a resume reconstructs."""
+        duration is excluded — it is exactly the state a resume reconstructs.
+
+        Two absolute ISO-8601 timestamps accompany the totals: the virtual-clock
+        anchor (the rollouter's first processed sample, which every duration here
+        is measured from) and the instant this save began. They make a checkpoint
+        placeable against cluster logs, and a null anchor makes it obvious that the
+        durations are bare carried-forward offsets rather than measurements."""
+
+        def _iso(ts):
+            # Local time with an explicit UTC offset: readable next to cluster logs,
+            # still unambiguous. None (no anchor yet) is preserved as JSON null.
+            if ts is None:
+                return None
+            return datetime.fromtimestamp(ts).astimezone().isoformat(timespec="milliseconds")
+
         virtual_now = self._virtual_now(save_start)
         if self.rollouter_first_sample_time is not None:
             wall_time = save_start - self.rollouter_first_sample_time + self.timing_wall_offset
@@ -296,6 +310,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             "cumulative_validation_time": validation_time,
             "cumulative_save_time": save_time,
             "cumulative_training_time": virtual_training_time,
+            "first_sample_time": _iso(self.rollouter_first_sample_time),
+            "checkpoint_save_started": _iso(save_start),
         }
         with open(os.path.join(local_global_step_folder, "timing_state.json"), "w") as f:
             json.dump(timing_state, f, indent=2)

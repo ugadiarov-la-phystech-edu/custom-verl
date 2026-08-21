@@ -410,6 +410,7 @@ done
 if [ -f "${CKPTS_DIR}/global_step_1/timing_state.json" ] && [ -f "${CKPTS_DIR}/global_step_2/timing_state.json" ]; then
     python - "${CKPTS_DIR}/global_step_1/timing_state.json" "${CKPTS_DIR}/global_step_2/timing_state.json" <<'PYEOF'
 import json, sys
+from datetime import datetime
 a, b = (json.load(open(p)) for p in sys.argv[1:3])
 keys = ["wall_time_since_first_sample", "cumulative_validation_time",
         "cumulative_save_time", "cumulative_training_time"]
@@ -430,6 +431,21 @@ chk(b["cumulative_validation_time"] == 0.0, "no validation time accrued (test_fr
     str(b["cumulative_validation_time"]))
 chk(b["cumulative_save_time"] > 0.0, "save time accrued (save_freq=1)",
     str(b["cumulative_save_time"]))
+# The anchor is the origin every duration above is measured from. A null here means the
+# trainer had not latched it yet, so those durations are carried-forward offsets rather
+# than measurements -- the exact failure seen on 2026-08-21 (all-zero global_step_1).
+chk(a.get("first_sample_time") is not None and b.get("first_sample_time") is not None,
+    "first_sample_time recorded in both checkpoints",
+    f'v1={a.get("first_sample_time")} v2={b.get("first_sample_time")}')
+chk(a.get("first_sample_time") == b.get("first_sample_time"),
+    "same anchor in both checkpoints", "anchor changed mid-run")
+try:
+    t1 = datetime.fromisoformat(a["checkpoint_save_started"])
+    t2 = datetime.fromisoformat(b["checkpoint_save_started"])
+    chk(t2 > t1, "checkpoint_save_started ordered v1 < v2", f"{t1} !< {t2}")
+    print(f"  {'saved at':<56s} v1={t1:%H:%M:%S} v2={t2:%H:%M:%S}")
+except (KeyError, TypeError, ValueError) as e:
+    chk(False, "checkpoint_save_started parses as ISO-8601", str(e))
 print(f"  {'v2 totals':<56s} wall={b['wall_time_since_first_sample']:.1f}s "
       f"train={b['cumulative_training_time']:.1f}s save={b['cumulative_save_time']:.1f}s")
 sys.exit(0 if ok else 1)

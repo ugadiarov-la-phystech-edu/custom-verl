@@ -115,11 +115,20 @@ def test_timing_state_checkpoint_roundtrip(tmp_path):
     saver._save_timing_state(str(tmp_path), save_start=150.0)
 
     state = json.loads((tmp_path / "timing_state.json").read_text())
-    assert state == {
+    assert {k: v for k, v in state.items() if not isinstance(v, str)} == {
         "wall_time_since_first_sample": 50.0,
         "cumulative_validation_time": 5.0,
         "cumulative_save_time": 2.0,
         "cumulative_training_time": 35.0,  # virtual: 120 + (150-130) - 5 - 100
+    }
+    # plus the two absolute ISO timestamps (asserted in detail further down)
+    assert set(state) == {
+        "wall_time_since_first_sample",
+        "cumulative_validation_time",
+        "cumulative_save_time",
+        "cumulative_training_time",
+        "first_sample_time",
+        "checkpoint_save_started",
     }
 
     resumed = _make_trainer()
@@ -904,3 +913,82 @@ def test_anchor_is_latched_after_generation_in_fit_step():
     gen = src.index("_fit_generate(")
     latch = src.index("_latch_first_sample_time(")
     assert latch > gen, "_latch_first_sample_time must run after _fit_generate"
+
+
+# ------------------------------------------------- absolute timestamps in timing_state
+
+
+def _read_state(tmp_path, name="ts"):
+    with open(tmp_path / name / "timing_state.json") as f:
+        return json.load(f)
+
+
+def test_timing_state_records_anchor_and_save_instant(tmp_path):
+    """The four totals are all relative to the anchor; without it written down a checkpoint
+    cannot be placed against anything else."""
+    from datetime import datetime
+
+    anchor, save_start = 1_755_787_412.412, 1_755_788_489.001
+    trainer = _make_trainer(first_sample_time=anchor)
+    trainer.virtual_free_time = 900.0
+    folder = tmp_path / "ts"
+    folder.mkdir()
+    trainer._save_timing_state(str(folder), save_start=save_start)
+
+    state = _read_state(tmp_path)
+    # round-trip: the strings must parse back to exactly the instants they were built from
+    assert abs(datetime.fromisoformat(state["first_sample_time"]).timestamp() - anchor) < 1e-3
+    assert abs(datetime.fromisoformat(state["checkpoint_save_started"]).timestamp() - save_start) < 1e-3
+    # ISO-8601 with an explicit offset, so it is unambiguous without knowing the host's tz
+    assert state["first_sample_time"][:4].isdigit() and "T" in state["first_sample_time"]
+    assert state["first_sample_time"][-6] in "+-", "timestamp must carry a UTC offset"
+
+
+def test_checkpoint_save_started_is_save_start_not_now(tmp_path):
+    """The whole file's semantics rest on snapshotting at save_start; the timestamp must
+    follow that, not wall-clock at write time."""
+    from datetime import datetime
+
+    save_start = time.time() - 3600.0  # an hour ago
+    trainer = _make_trainer(first_sample_time=save_start - 10.0)
+    folder = tmp_path / "ts"
+    folder.mkdir()
+    trainer._save_timing_state(str(folder), save_start=save_start)
+
+    written = datetime.fromisoformat(_read_state(tmp_path)["checkpoint_save_started"]).timestamp()
+    assert abs(written - save_start) < 1e-3
+    assert time.time() - written > 3000.0, "wrote 'now' instead of save_start"
+
+
+def test_timing_state_without_anchor_records_null_first_sample(tmp_path):
+    """Regression-adjacent: a checkpoint written before the anchor is latched has four zero
+    totals, which is indistinguishable from a lost anchor unless the file says so."""
+    trainer = _make_trainer(first_sample_time=None)
+    folder = tmp_path / "ts"
+    folder.mkdir()
+    trainer._save_timing_state(str(folder), save_start=1_755_788_489.001)
+
+    state = _read_state(tmp_path)
+    assert state["first_sample_time"] is None, "a missing anchor must be explicit, not omitted"
+    assert state["checkpoint_save_started"] is not None, "the save instant is always known"
+    assert state["wall_time_since_first_sample"] == 0.0
+    assert state["cumulative_training_time"] == 0.0
+
+
+def test_restore_ignores_the_absolute_timestamps(tmp_path):
+    """A resumed run establishes its own anchor; the two timestamps describe the run that
+    wrote them and must not perturb the restored offsets."""
+    anchor = 1_755_787_412.412
+    saver = _make_trainer(first_sample_time=anchor, cumulative_validation_time=5.0, cumulative_save_time=2.0)
+    saver.virtual_free_time = 900.0
+    folder = tmp_path / "ts"
+    folder.mkdir()
+    saver._save_timing_state(str(folder), save_start=anchor + 50.0)
+
+    resumed = _make_trainer()
+    resumed._restore_timing_state(str(folder))
+    assert abs(resumed.timing_wall_offset - 50.0) < 1e-6
+    assert resumed.timing_validation_offset == 5.0
+    assert resumed.timing_save_offset == 2.0
+    # and no attribute was invented from the new keys
+    assert not hasattr(resumed, "first_sample_time")
