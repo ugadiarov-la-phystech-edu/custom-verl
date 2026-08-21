@@ -100,6 +100,17 @@ def test_script_composes(composed, name):
     assert composed[name] is not None
 
 
+@pytest.mark.parametrize("script", SCRIPTS, ids=[s.name for s in SCRIPTS])
+def test_stdout_is_unbuffered(script):
+    """The driver's own prints are small and sit in an unflushed block buffer otherwise.
+
+    Verified on the remote: with fd 1 redirected to a file, a process' stdout only reaches disk once
+    8 KB accumulates, so the driver's startup prints are lost for the life of the run. This does not
+    on its own restore the Ray-forwarded actor output -- that is what the file backend above is for.
+    """
+    assert "export PYTHONUNBUFFERED=1" in script.read_text(), f"{script.name} must export PYTHONUNBUFFERED=1"
+
+
 @pytest.mark.parametrize("name", [s.name for s in SCRIPTS])
 def test_export_only_checkpoint_policy(composed, name):
     """Weights-only checkpoints, kept forever, never resumed from."""

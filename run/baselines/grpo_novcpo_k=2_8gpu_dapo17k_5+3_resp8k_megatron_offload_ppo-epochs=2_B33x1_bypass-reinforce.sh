@@ -63,6 +63,10 @@ set -xeuo pipefail
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export RAY_DISABLE_IMPORT_WARNING=1
+# The driver's stdout is block-buffered into the redirected log file, while stderr is not, so
+# Ray-forwarded console output (the `step:N - ... - val-core/...` metric lines, the startup
+# trace, the config dump) never reaches the launcher log. Unbuffer it.
+export PYTHONUNBUFFERED=1
 export VLLM_USE_V1=1
 export RAY_ADDRESS="local"
 export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
