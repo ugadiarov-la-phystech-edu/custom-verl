@@ -111,7 +111,11 @@ rollout_name="vllm"
 return_raw_chat="True"
 gen_tp=1
 n_resp_per_prompt=${n_resp_per_prompt:-16}
-gpu_memory_utilization=0.9
+# 0.8, not 0.9: the checkpoint engine allocates its weight-sync bucket on the rollout
+# GPUs beside vLLM and needs ~7.5 GB there. Measured on 8xH100 (2026-08-21): at 0.9
+# vLLM held 73.5 of 79.2 GiB, leaving 243 MiB, and the first sync OOM'd on a 2 GiB
+# bucket; at 0.8 it holds ~62 GB, leaving ~17 GB. Env-overridable for other hardware.
+gpu_memory_utilization=${gpu_memory_utilization:-0.8}
 enable_chunked_prefill=True
 calculate_log_probs=True
 
