@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -163,6 +164,160 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # Uses naive backend to sync weights from trainer to hybrid rollout replicas.
         # Initialized in _setup_hybrid_checkpoint_manager_and_sleep() via set_rollouter().
         self.hybrid_checkpoint_manager = None
+
+        # Stop-the-world checkpoint saves: freeze generation for the whole save
+        # window so it is a pure time translation of the pipeline.
+        self.pause_generation_during_save = bool(config.async_training.get("pause_generation_during_save", False))
+
+        # ---- Virtual clock (fully_async/timing/cumulative_training_time) ----
+        # Anchor and pause totals reported by the rollouter.
+        self.rollouter_first_sample_time = None
+        self.cumulative_save_time = 0.0
+        self.cumulative_validation_time = 0.0
+        # Position on the virtual (no-validation-no-save) timeline.
+        self.virtual_free_time = None
+        self._step_virtual_start = None
+        self._step_actual_start = None
+        self._step_valid_time = 0.0
+        self._step_save_time = 0.0
+        # Offsets restored from timing_state.json so a resumed run continues the
+        # metrics instead of restarting them from zero.
+        self.timing_wall_offset = 0.0
+        self.timing_validation_offset = 0.0
+        self.timing_save_offset = 0.0
+        self.virtual_training_time_offset = 0.0
+
+    # ==================== Virtual clock (cumulative_training_time) ====================
+
+    async def _latch_first_sample_time(self):
+        """Fetch the rollouter's virtual-clock anchor once. The rollouter returns
+        None until it has processed its first sample; a later None must never
+        clobber a latched value."""
+        if self.rollouter_first_sample_time is not None or self.rollouter is None:
+            return
+        first_sample_time = await self.rollouter.get_first_sample_time.remote()
+        if first_sample_time is not None:
+            self.rollouter_first_sample_time = first_sample_time
+
+    def _open_virtual_step(self, consumer_end: float, queue_samples: list):
+        """Start this step on the virtual (no-validation-no-save) timeline: at
+        max(trainer free, batch ready), where the batch is ready when its last
+        sample would have arrived without the rollouter's validation and
+        checkpoint-save pauses. Samples restored from an old-format queue
+        snapshot may lack the stamps; fall back to the actual ready time (no
+        pause correction) for them."""
+        virtual_ready_times = [
+            s.enqueue_time - s.validation_pause_before - getattr(s, "checkpoint_pause_before", 0.0)
+            for s in queue_samples
+            if getattr(s, "enqueue_time", 0.0)
+        ]
+        batch_virtual_ready = max(virtual_ready_times) if virtual_ready_times else consumer_end
+        self._step_actual_start = consumer_end
+        if self.virtual_free_time is not None:
+            self._step_virtual_start = max(self.virtual_free_time, batch_virtual_ready)
+        else:
+            self._step_virtual_start = batch_virtual_ready
+
+    def _virtual_now(self, now: float):
+        """Current position on the virtual (no-validation-no-save) timeline.
+
+        Mid-step, the step began at _step_virtual_start and has been busy for
+        the actual elapsed time minus any awaited validation and checkpoint
+        saving; between steps it is wherever the last step ended. None until
+        the first batch arrives."""
+        if self._step_virtual_start is not None:
+            return (
+                self._step_virtual_start
+                + (now - self._step_actual_start)
+                - self._step_valid_time
+                - self._step_save_time
+            )
+        return self.virtual_free_time
+
+    def _advance_virtual_clock(self, now: float = None):
+        """Close the current step on the virtual timeline (called after the
+        checkpoint save, whose duration _virtual_now excludes)."""
+        if self._step_virtual_start is None:
+            return
+        self.virtual_free_time = self._virtual_now(time.time() if now is None else now)
+        self._step_virtual_start = None
+        self._step_actual_start = None
+
+    def _add_cumulative_time_metrics(self, step_data: dict, now: float = None):
+        """cumulative_training_time: the wall clock (since the rollouter's first
+        processed sample) that an identical run with *neither validation nor
+        checkpointing* would have needed to reach this point. Reconstructed by
+        replaying the pipeline schedule on a virtual timeline: each step starts
+        at max(trainer free, batch ready), with sample-ready times shifted back
+        by the rollouter's validation and checkpoint-save pauses, and trainer
+        stalls on awaited validation and checkpoint saving excluded from the
+        busy time. Exact in rollout-bound, trainer-bound and balanced regimes
+        alike (a naive wall - validation - save subtraction over-subtracts
+        whenever validation overlaps saves or backlog training). No-op until
+        the rollouter reports its first processed sample."""
+        if self.rollouter_first_sample_time is None:
+            return
+        now = time.time() if now is None else now
+        wall_time = now - self.rollouter_first_sample_time + self.timing_wall_offset
+        validation_time = self.cumulative_validation_time + self.timing_validation_offset
+        save_time = self.cumulative_save_time + self.timing_save_offset
+        step_data["fully_async/timing/wall_time_since_first_sample"] = wall_time
+        step_data["fully_async/timing/cumulative_validation_time"] = validation_time
+        step_data["fully_async/timing/cumulative_save_time"] = save_time
+        virtual_now = self._virtual_now(now)
+        if virtual_now is not None:
+            step_data["fully_async/timing/cumulative_training_time"] = (
+                virtual_now - self.rollouter_first_sample_time + self.virtual_training_time_offset
+            )
+
+    def _save_timing_state(self, local_global_step_folder, save_start):
+        """Persist the cumulative timing totals so a resumed run continues the
+        fully_async/timing/* metrics instead of restarting them from zero.
+        The snapshot is taken at save_start, so the in-progress save's own
+        duration is excluded — it is exactly the state a resume reconstructs."""
+        virtual_now = self._virtual_now(save_start)
+        if self.rollouter_first_sample_time is not None:
+            wall_time = save_start - self.rollouter_first_sample_time + self.timing_wall_offset
+            validation_time = self.cumulative_validation_time + self.timing_validation_offset
+            save_time = self.cumulative_save_time + self.timing_save_offset
+            if virtual_now is not None:
+                virtual_training_time = (
+                    virtual_now - self.rollouter_first_sample_time + self.virtual_training_time_offset
+                )
+            else:
+                virtual_training_time = self.virtual_training_time_offset
+        else:
+            wall_time = self.timing_wall_offset
+            validation_time = self.timing_validation_offset
+            save_time = self.timing_save_offset
+            virtual_training_time = self.virtual_training_time_offset
+        timing_state = {
+            "wall_time_since_first_sample": wall_time,
+            "cumulative_validation_time": validation_time,
+            "cumulative_save_time": save_time,
+            "cumulative_training_time": virtual_training_time,
+        }
+        with open(os.path.join(local_global_step_folder, "timing_state.json"), "w") as f:
+            json.dump(timing_state, f, indent=2)
+
+    def _restore_timing_state(self, global_step_folder):
+        timing_state_path = os.path.join(global_step_folder, "timing_state.json")
+        if not os.path.exists(timing_state_path):
+            print("[FullyAsyncTrainer] No timing_state.json in checkpoint; timing metrics restart from zero")
+            return
+        with open(timing_state_path) as f:
+            timing_state = json.load(f)
+        self.timing_wall_offset = timing_state.get("wall_time_since_first_sample", 0.0)
+        self.timing_validation_offset = timing_state.get("cumulative_validation_time", 0.0)
+        self.timing_save_offset = timing_state.get("cumulative_save_time", 0.0)
+        self.virtual_training_time_offset = timing_state.get(
+            "cumulative_training_time",
+            self.timing_wall_offset - self.timing_validation_offset - self.timing_save_offset,
+        )
+        print(
+            f"[FullyAsyncTrainer] Restored timing state from {timing_state_path}: "
+            f"cumulative_training_time resumes at {self.virtual_training_time_offset:.1f}s"
+        )
 
     async def _setup_checkpoint_manager(self):
         """Setup checkpoint manager after rollouter is initialized"""
@@ -322,6 +477,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         )
 
         queue_samples = [ray.cloudpickle.loads(x) for x in queue_samples]
+        # Open this step on the virtual (no-validation-no-save) timeline.
+        self._open_virtual_step(consumer_end, queue_samples)
         # Assemble batch - now working directly with RolloutSample objects
         if self.config.trainer.balance_batch:
             batch = assemble_batch_from_rollout_samples(queue_samples, self.tokenizer, self.config, self._balance_batch)
@@ -407,7 +564,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         if self.current_param_version % self.config.trainer.test_freq != 0 or self.local_trigger_step > 1:
             await self._fit_update_weights()
             await self._fit_validate()
-        self._fit_save_checkpoint(force=True)
+        await self._fit_save_checkpoint(force=True)
 
     async def fit_step(self, batch_dict: dict = None):
         """
@@ -423,6 +580,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         """
         self.metrics = {"training/global_step": self.global_steps, "training/epoch": self.epoch}
         self.timing_raw = {}
+        # Per-step virtual-clock stalls, excluded from the step's busy time.
+        self._step_valid_time = 0.0
+        self._step_save_time = 0.0
+        await self._latch_first_sample_time()
         # reward message
         self.future_reward = None
         self.reward_tensor = None
@@ -446,9 +607,12 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self._fit_dump_data(batch)
 
         await self._fit_validate()
-        self._fit_save_checkpoint()
+        await self._fit_save_checkpoint()
+        # Close the virtual step after the save, whose duration _virtual_now excludes.
+        self._advance_virtual_clock()
         self._fit_stop_profile(should_profiler=should_profile)
         self._fit_collect_metrics(batch)
+        self._add_cumulative_time_metrics(self.metrics)
         self._fit_postprocess_step()
 
     async def _fit_generate(self, batch: DataProto = None) -> DataProto | None:
@@ -547,7 +711,21 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # Skip validation if not needed and not validation before training
         if not need_validate and not val_before_train:
             return
-        # Execute validation
+        # Execute validation. The trainer is stalled for this whole window, so it
+        # is excluded from the step's busy time on the virtual timeline; with
+        # serialize_validation the rollouter additionally shifts the producer
+        # timeline by the same interval via the sample stamps.
+        valid_start = time.time()
+        try:
+            await self._do_fit_validate(val_before_train=val_before_train)
+        finally:
+            valid_elapsed = time.time() - valid_start
+            if self.rollouter_first_sample_time is not None:
+                # Pre-anchor windows (val_before_train) are excluded on both sides.
+                self.cumulative_validation_time += valid_elapsed
+            self._step_valid_time += valid_elapsed
+
+    async def _do_fit_validate(self, val_before_train=False):
         if self.config.async_training.use_trainer_do_validate:
             await self._trainer_side_validate()
         else:
@@ -595,7 +773,14 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         total_time = time.time() - validate_start
         print(f"[FullyAsyncTrainer] _trainer_side_validate === END === (total: {total_time:.2f}s)")
 
-    def _fit_save_checkpoint(self, force=False):
+    async def _fit_save_checkpoint(self, force=False):
+        """Save a checkpoint, optionally under a stop-the-world generation pause.
+
+        NOTE: this overrides SeparateRayPPOTrainer._fit_save_checkpoint, which is
+        synchronous, because pausing the rollouter is a Ray call. Safe because
+        FullyAsyncTrainer.fit() fully overrides the base fit(); the base's own
+        call site never runs for this class. Any new caller must await it.
+        """
         if self.current_param_version == self.last_ckpt_version:
             return
 
@@ -617,10 +802,26 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         ):
             if esi_close_to_expiration:
                 print("Force saving checkpoint: ESI instance expiration approaching.")
-            with marked_timer("save_checkpoint", timing_raw, color="green"):
-                # sleep replicas to avoid OOM during checkpoint saving
-                self._save_checkpoint()
-                self.last_ckpt_version = self.current_param_version
+            # Snapshot the virtual clock before the pause: the persisted totals must
+            # exclude the in-progress save, which is exactly what a resume rebuilds.
+            save_start = time.time()
+            if self.pause_generation_during_save:
+                # Stop-the-world: freeze generation for the whole save window so it
+                # is a pure time translation of the pipeline.
+                await self.rollouter.begin_save_pause.remote()
+            try:
+                with marked_timer("save_checkpoint", timing_raw, color="green"):
+                    local_global_step_folder = self._save_checkpoint()
+                    self.last_ckpt_version = self.current_param_version
+                if local_global_step_folder is not None:
+                    self._save_timing_state(local_global_step_folder, save_start)
+            finally:
+                save_elapsed = time.time() - save_start
+                if self.rollouter_first_sample_time is not None:
+                    self.cumulative_save_time += save_elapsed
+                self._step_save_time += save_elapsed
+                if self.pause_generation_during_save:
+                    await self.rollouter.end_save_pause.remote()
 
     def _fit_postprocess_step(self):
         self.global_steps += 1
@@ -694,6 +895,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         )
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.current_param_version))
+        return local_global_step_folder
 
     async def load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":
@@ -745,6 +947,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self.critic_wg.load_checkpoint(
                 critic_path, del_local_after_load=self.config.trainer.del_local_ckpt_after_load
             )
+        # Continue the fully_async/timing/* series instead of restarting from zero.
+        self._restore_timing_state(global_step_folder)
 
         return self.current_param_version
 

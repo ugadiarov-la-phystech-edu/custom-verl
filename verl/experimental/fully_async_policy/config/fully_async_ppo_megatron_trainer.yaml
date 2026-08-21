@@ -25,6 +25,15 @@ async_training:
   # whether to use trainer do_validate
   use_trainer_do_validate: False
 
+  # Stop-the-world validation: pause generation for the whole validation window
+  # so it is a pure time translation of the pipeline. Excluded from
+  # fully_async/timing/cumulative_training_time via the per-sample stamps.
+  serialize_validation: False
+
+  # Stop-the-world checkpoint saves: freeze generation for the entire save
+  # instead of letting the queue build a surplus during it.
+  pause_generation_during_save: False
+
 # Rollout config
 rollout:
 

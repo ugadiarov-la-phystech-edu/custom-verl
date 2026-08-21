@@ -38,6 +38,13 @@ class RolloutSample:
     # Processing metadata
     rollout_status: dict[str, Any]
 
+    # Virtual-clock stamps for the cumulative_training_time metric: wall time
+    # at enqueue, and the rollouter's cumulative validation / checkpoint-save
+    # pause totals at that moment (see FullyAsyncTrainer._open_virtual_step).
+    enqueue_time: float = 0.0
+    validation_pause_before: float = 0.0
+    checkpoint_pause_before: float = 0.0
+
 
 def prepare_single_generation_data(batch_dict, config) -> DataProto:
     """

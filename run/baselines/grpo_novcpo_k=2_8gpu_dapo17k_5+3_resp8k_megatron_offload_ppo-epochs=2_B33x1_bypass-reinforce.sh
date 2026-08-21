@@ -40,10 +40,13 @@
 # with these in mind):
 #   * Rollout concurrency cap: fork min(5*bsz_per_dp_rank, 99)=99; upstream hardcodes 16
 #     (fully_async_rollouter.py:541) -> min(5*16, 99)=80.
-#   * No stop-the-world validation/save: the fork's serialize_validation and
-#     pause_generation_during_save have no upstream equivalent. Upstream validates on the
-#     rollout replicas concurrently with training generation, and there is no
-#     cumulative_training_time virtual clock.
+#   * Stop-the-world validation/save ARE enabled here (serialize_validation=True,
+#     pause_generation_during_save=True), backed by the virtual-clock port now in
+#     verl/experimental/fully_async_policy/. Both windows freeze generation and are
+#     excluded from fully_async/timing/cumulative_training_time, so accuracy-vs-
+#     training-time is on the same axis as the fork's runs. NOTE the upstream pause is
+#     drain-based (in-flight generations finish) where the fork's is cancel-based, so a
+#     pause lasts up to one extra generation; the window is excluded either way.
 #   * Both ppo epochs run inside ONE update_actor call (same 2 AdamW steps over the same
 #     528 sequences) instead of the fork's two driver-side calls; the LR scheduler
 #     advances differently (immaterial at lr_decay_style=constant).
@@ -152,6 +155,13 @@ staleness_threshold=${staleness_threshold:-2.0}
 updates_per_param_sync=1
 num_minibatches_per_update=1 # require_batches=1: ONE 33-group mini-batch per trainer step (B-33x1)
 partial_rollout=True
+
+# ================= Stop-the-world accounting =================
+# Freeze the pipeline for validation and for checkpoint saves so both are pure time
+# translations: excluded from fully_async/timing/cumulative_training_time via the
+# per-sample stamps, leaving the trajectory identical to a no-validation-no-save run.
+serialize_validation=${serialize_validation:-True}
+pause_generation_during_save=${pause_generation_during_save:-True}
 
 # ================= PPO epochs =================
 # actor.ppo_epochs=2 -> 2 AdamW updates per trainer step: two passes over the single
@@ -311,4 +321,6 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     async_training.staleness_threshold="${staleness_threshold}" \
     async_training.trigger_parameter_sync_step="${updates_per_param_sync}" \
     async_training.require_batches="${num_minibatches_per_update}" \
-    async_training.partial_rollout="${partial_rollout}" "$@"
+    async_training.partial_rollout="${partial_rollout}" \
+    async_training.serialize_validation="${serialize_validation}" \
+    async_training.pause_generation_during_save="${pause_generation_during_save}" "$@"

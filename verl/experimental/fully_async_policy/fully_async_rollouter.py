@@ -513,6 +513,23 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.pending_queue = asyncio.Queue(maxsize=128)
         self.active_tasks = set()
 
+        # Stop-the-world accounting: pause generation for the whole validation /
+        # checkpoint-save window so both are pure time translations of the
+        # pipeline (excluded from cumulative_training_time via sample stamps).
+        self.serialize_validation = bool(config.async_training.get("serialize_validation", False))
+        # Virtual-clock accumulators, stamped onto every enqueued RolloutSample.
+        # Initialized here rather than in _init_async_objects: get_first_sample_time
+        # may be called by the trainer before the async setup runs.
+        self.first_sample_time = None
+        self.cumulative_validation_time = 0.0
+        self.cumulative_checkpoint_pause = 0.0
+        self._save_pause_start = None
+        self._validation_pause_start = None
+        # Hard (externally requested) pause for stop-the-world validation /
+        # checkpoint saves: unlike a staleness-quota pause, the monitor loop
+        # must never auto-resume it.
+        self._hard_paused = False
+
     def _init_async_objects(self):
         # Initialize asyncio synchronization primitives.
         # `lock` protects shared state: paused / active_tasks / staleness_samples / timing fields.
@@ -567,10 +584,14 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         Returns timing_raw dictionary for metrics.
         """
         async with self.lock:
-            self.paused = False
-            # Wake the drain loop in _processor_worker so it can exit early and resume submitting
-            # new samples to idle replicas instead of waiting for long-tail in-flight tasks.
-            self._resume_event.set()
+            if not self._hard_paused:
+                # A stop-the-world pause (validation / checkpoint save) outranks the
+                # staleness quota: only end_save_pause / do_validate may release it.
+                self.paused = False
+                # Wake the drain loop in _processor_worker so it can exit early and resume
+                # submitting new samples to idle replicas instead of waiting for long-tail
+                # in-flight tasks.
+                self._resume_event.set()
             # every time param change, reset staleness_samples
             self.staleness_samples = len(self.active_tasks) + await self.message_queue_client.get_queue_size()
             timing_raw = {}
@@ -602,11 +623,95 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         """Stop rollout profiling on all replicas before the next weight sync."""
         await self.llm_server_manager.stop_profile()
 
-    def do_validate(self):
-        """Run validation and return metrics"""
+    async def _pause_generation_and_drain(self):
+        """Pause the processor loop and wait for all in-flight generation tasks
+        to finish (stop-the-world bracket for validation / checkpoint saves)."""
+        async with self.lock:
+            self.paused = True
+            self._hard_paused = True
+            self._resume_event.clear()
+        while True:
+            async with self.lock:
+                active = {task for task in self.active_tasks if not task.done()}
+            if not active:
+                break
+            await asyncio.wait(active, return_when=asyncio.ALL_COMPLETED)
+
+    async def _resume_generation(self):
+        """Release a hard pause. Generation only actually resumes if the staleness
+        quota also allows it: re-checking here keeps a stop-the-world bracket from
+        overriding back-pressure that was already in force when the bracket opened."""
+        still_over_quota = await self._should_pause_generation()
+        async with self.lock:
+            self._hard_paused = False
+            if still_over_quota:
+                # Leave the soft (quota) pause in place; _maybe_auto_resume will
+                # lift it once the queue drains.
+                self.paused = True
+                self._resume_event.clear()
+            else:
+                self.paused = False
+                self._resume_event.set()
+
+    def _live_validation_pause(self) -> float:
+        """cumulative_validation_time including any pause still in progress.
+
+        A drain-based pause completes its in-flight generations, so samples are
+        enqueued *during* the pause window. Stamping them with the pre-pause total
+        would leave the trainer's virtual clock re-absorbing the part of the pause
+        that elapsed before they landed."""
+        if self._validation_pause_start is None or self.first_sample_time is None:
+            return self.cumulative_validation_time
+        return self.cumulative_validation_time + (time.time() - self._validation_pause_start)
+
+    def _live_checkpoint_pause(self) -> float:
+        """cumulative_checkpoint_pause including any save pause still in progress."""
+        if self._save_pause_start is None or self.first_sample_time is None:
+            return self.cumulative_checkpoint_pause
+        return self.cumulative_checkpoint_pause + (time.time() - self._save_pause_start)
+
+    def get_first_sample_time(self):
+        """Wall time of the first processed training sample (virtual-clock anchor)."""
+        return self.first_sample_time
+
+    async def begin_save_pause(self):
+        """Freeze generation for a checkpoint save; the elapsed pause is
+        accounted into cumulative_checkpoint_pause at end_save_pause and
+        excluded from cumulative_training_time via the sample stamps. The
+        clock starts at drain begin (when submission freezes), matching the
+        trainer-side accounting of the save window."""
+        self._save_pause_start = time.time()
+        await self._pause_generation_and_drain()
+
+    async def end_save_pause(self):
+        if self._save_pause_start is not None and self.first_sample_time is not None:
+            self.cumulative_checkpoint_pause += time.time() - self._save_pause_start
+        self._save_pause_start = None
+        await self._resume_generation()
+
+    async def do_validate(self):
+        """Run validation and return metrics. With serialize_validation the
+        generation pipeline is fully paused for the validation window and the
+        pause is accounted into cumulative_validation_time."""
         timing_raw = {}
-        with marked_timer("rollouter/validate_time", timing_raw, color="green"):
-            val_metrics: dict = self._validate()
+        pause_start = None
+        if self.serialize_validation:
+            # The pause clock starts when submission freezes (drain begin), not
+            # after the drain: the trainer accounts the whole window the same
+            # way, and the sample stamps must subtract the same interval from
+            # the producer timeline.
+            pause_start = time.time()
+            self._validation_pause_start = pause_start
+            await self._pause_generation_and_drain()
+        try:
+            with marked_timer("rollouter/validate_time", timing_raw, color="green"):
+                val_metrics: dict = self._validate()
+        finally:
+            if pause_start is not None:
+                if self.first_sample_time is not None:
+                    self.cumulative_validation_time += time.time() - pause_start
+                self._validation_pause_start = None
+                await self._resume_generation()
         return timing_raw | val_metrics
 
     async def save_checkpoint(self, local_global_step_folder: str):
@@ -932,6 +1037,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
     async def _process_single_sample_streaming(self, rollout_sample: RolloutSample):
         """Process a single sample streamingly"""
+        if self.first_sample_time is None:
+            # Virtual-clock anchor: wall time of the first processed training
+            # sample. Set once and never overwritten.
+            self.first_sample_time = time.time()
         # Calling asynchronous generation methods
         ret = await self.async_rollout_manager.generate_sequences_single(rollout_sample.full_batch)
         rollout_sample.full_batch = ret
@@ -939,6 +1048,11 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             [f"uid_{rollout_sample.sample_id}"] * len(rollout_sample.full_batch), dtype=object
         )
         rollout_sample.rollout_status = await self.get_statistics()
+
+        # Virtual-clock stamps (see FullyAsyncTrainer._open_virtual_step).
+        rollout_sample.enqueue_time = time.time()
+        rollout_sample.validation_pause_before = self._live_validation_pause()
+        rollout_sample.checkpoint_pause_before = self._live_checkpoint_pause()
 
         success = await self.message_queue_client.put_sample(
             sample=ray.cloudpickle.dumps(rollout_sample),
@@ -1068,11 +1182,20 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 last_stats_time = current_time
 
             # Trigger rollout recovery
-            if self.paused and not await self._should_pause_generation():
-                async with self.lock:
-                    self.paused = False
-                    print("[FullyAsyncRollouter][ShouldPause] resume rollouter.")
-                    self._resume_event.set()
+            await self._maybe_auto_resume()
+
+    async def _maybe_auto_resume(self):
+        """Lift a staleness-quota pause once the quota allows. A hard pause
+        (stop-the-world validation / checkpoint save) is never auto-resumed:
+        only end_save_pause / do_validate may release it."""
+        if self._hard_paused or not self.paused:
+            return
+        if await self._should_pause_generation():
+            return
+        async with self.lock:
+            self.paused = False
+            print("[FullyAsyncRollouter][ShouldPause] resume rollouter.")
+            self._resume_event.set()
 
     async def _should_pause_generation(self) -> bool:
         """Determine whether the build should be paused"""
