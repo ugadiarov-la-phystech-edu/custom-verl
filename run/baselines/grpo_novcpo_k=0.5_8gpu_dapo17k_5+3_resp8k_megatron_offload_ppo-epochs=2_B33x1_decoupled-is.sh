@@ -92,10 +92,16 @@ export VLLM_USE_FLASHINFER_SAMPLER=0
 # ================= Paths =================
 MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-8B"}
 TRAIN_FILE=${TRAIN_FILE:-"/home/jovyan/datasets/math_datasets/dapo/dapo-math-17k.parquet"}
-# Single validation set: aime-2024.parquet (data_source=math_dapo) ->
-# val-core/math_dapo/acc/mean@1. The fork's second file (math500.parquet,
-# data_source=math500_dapo) is dropped: its scorer is fork-only.
-TEST_FILE=${TEST_FILE:-"/home/jovyan/datasets/math_datasets/dapo/aime-2024.parquet"}
+# Two validation sets, reported separately by data_source:
+#   aime-2024.parquet (data_source=math_dapo)     -> val-core/math_dapo/acc/mean@1
+#   aime-2025.parquet (data_source=aime2025_dapo) -> val-core/aime2025_dapo/acc/mean@1
+# Both score through math_dapo: 2025 matches the registry's `data_source.startswith("aime")`
+# branch (reward_score/__init__.py), so no fork-only scorer is needed -- unlike the fork's
+# math500.parquet, whose math500_dapo scorer does not exist upstream and is still omitted.
+# 960 rows each, so one validation pass is 1920 prompts at up to 8192 tokens; with
+# serialize_validation=True that window freezes the pipeline (excluded from
+# cumulative_training_time, but real wall clock).
+TEST_FILE=${TEST_FILE:-"['/home/jovyan/datasets/math_datasets/dapo/aime-2024.parquet','/home/jovyan/datasets/math_datasets/dapo/aime-2025.parquet']"}
 
 project_name='vcpo'
 
