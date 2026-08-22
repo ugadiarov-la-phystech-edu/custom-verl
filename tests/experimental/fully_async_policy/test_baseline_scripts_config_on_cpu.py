@@ -172,6 +172,42 @@ def test_stop_the_world_accounting_enabled(composed, name):
     assert composed[name].actor_rollout_ref.rollout.calculate_log_probs is True
 
 
+# Architectures shipped inside transformers itself; anything else is custom code and needs
+# trust_remote_code on BOTH independent keys.
+NATIVE_MODEL_PREFIXES = ("Qwen/", "meta-llama/", "mistralai/", "deepseek-ai/")
+
+
+def _needs_remote_code(path: str) -> bool:
+    """A hub id outside the natively-supported set, or a local dir, may carry custom code.
+
+    Local directories are included deliberately: the openPangu arm points at a re-aliased checkpoint
+    whose *tokenizer* still resolves through ``tokenization_openpangu.py``, so it needs the flags even
+    though its config now says Llama.
+    """
+    return not path.startswith(NATIVE_MODEL_PREFIXES)
+
+
+@pytest.mark.parametrize("name", [s.name for s in SCRIPTS])
+def test_custom_code_models_set_both_trust_remote_code_keys(composed, name):
+    """``data.trust_remote_code`` and ``model.trust_remote_code`` are independent -- one is not
+    enough.
+
+    The first feeds only the dataset-side tokenizer (``fully_async_main.py:62``); the second feeds
+    ``HFModelConfig`` -- the agent-loop tokenizer, the actor/ref weight load, and the vLLM engine
+    (``vllm_async_server.py:259``). Nothing links them (no ``oc.select``), so setting one and not the
+    other crashes the other half of the system: a custom-code model with only the data key builds a
+    dataset and then dies loading weights, and with only the model key it dies in the dataloader.
+    """
+    cfg = composed[name]
+    path = cfg.actor_rollout_ref.model.path
+    if not _needs_remote_code(path):
+        pytest.skip(f"{path} is a natively-supported architecture")
+    assert cfg.actor_rollout_ref.model.trust_remote_code is True, (
+        f"{name}: custom-code model {path} needs actor_rollout_ref.model.trust_remote_code"
+    )
+    assert cfg.data.trust_remote_code is True, f"{name}: custom-code model {path} needs data.trust_remote_code"
+
+
 @pytest.mark.parametrize("name", [s.name for s in SCRIPTS])
 def test_batch_shape_invariants(composed, name):
     """The B-33x1 layout: 33 prompts x n=16 must divide evenly across the trainer GPUs."""

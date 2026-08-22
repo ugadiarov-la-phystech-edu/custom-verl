@@ -1,0 +1,448 @@
+#!/usr/bin/env bash
+# grpo_novcpo_k=1_8gpu_dapo17k_5+3_resp8k_fsdp2_openpangu7b_ppo-epochs=2_B33x1_bypass-reinforce_dynbsz.sh
+#
+# openPangu-Embedded-7B arm of the FSDP2 baseline. Data, layout, loss, schedule, staleness and
+# the 8192-token response budget are identical to the Qwen3-8B FSDP2 sibling; ONLY the model
+# differs, so the two are directly comparable.
+#
+# FSDP2 IS MANDATORY HERE, not a preference -- and the reason survives the Llama re-alias below.
+# The stock PanguEmbedded architecture is absent from verl/models/mcore/registry.py:120-136, so
+# megatron cannot load it at all. After re-aliasing to LlamaForCausalLM the registry DOES accept
+# it, but the model still cannot be represented: openPangu carries bias on q/k/v AND o_proj but
+# NOT on the MLP, and megatron-core governs o_proj and both MLP linears with a single flag
+# (attention.py:355 linear_proj and mlp.py:128,147 linear_fc1/2 all read add_bias_linear, while
+# only linear_qkv also honours add_qkv_bias). verl hardcodes add_bias_linear=False
+# (config_converter.py:178) and mbridge's LlamaBridge maps linear_proj weight-only with no bias
+# entry (mbridge/models/llama.py:25-26,42-45), so o_proj.bias would be silently dropped; forcing
+# add_bias_linear=True instead invents MLP biases the checkpoint does not have. That shape needs
+# custom converter code, which is not worth it for a 7B dense model on 3 trainer GPUs.
+#
+# RUN scripts/preflight_openpangu.py FIRST. Several ways this model can go wrong are silent --
+# they produce a running job with meaningless numbers rather than an error:
+#   * verl passes NO stop/stop_token_ids/eos_token_id to vLLM (agent_loop.py:496-502,
+#     vllm_async_server.py:503-505); termination depends entirely on the model's own eos. If
+#     that is wrong every rollout runs to 8192 tokens and scores -1.0.
+#   * vllm_rollout/utils.py:91-103 masks logits[..., len(tokenizer):] = -inf, so an eos id at
+#     or above len(tokenizer) can never be sampled.
+#   * The overlong-prompt filter swallows chat-template exceptions and returns
+#     max_prompt_length+1 (rl_dataset.py:238-263), i.e. a broken template empties the dataset.
+#   * apply_monkey_patch dispatches on model_type (monkey_patch.py:291-539). The re-alias makes
+#     this model_type=llama, which takes the generic tail and patches the shared
+#     transformers.integrations.flash_attention -- the correct target for anything routing
+#     attention through ALL_ATTENTION_FUNCTIONS, and the best-exercised path in the repo.
+#     Confirmed by preflight check 7.
+#
+# ANSWER EXTRACTION: math_dapo.compute_score is format-agnostic -- no thinking-delimiter
+# handling exists anywhere in verl. It takes solution_str[-300:] and the LAST
+# (?i)Answer\s*:\s*([^\n]+) match (math_dapo.py:166,180,260), and every reward manager decodes
+# with skip_special_tokens=True (reward_manager/naive.py:54-56), which strips [unused*] markers
+# before any parser could see them. That is fine for slow thinking BECAUSE the DAPO prompt
+# instructs the answer onto the last line, so it lands inside the 300-char window and a decoy
+# 'Answer:' inside the CoT loses. Verified offline by preflight check 6. The residual exposure
+# is a verbose epilogue AFTER the answer, which pushes it out of the window and scores -1.0
+# with pred='[INVALID]' -- watch the [INVALID] rate in the first validation.
+#
+# DYNAMIC BATCH SIZE (use_dynamic_bsz=True): instead of a fixed 1 sequence per micro-batch,
+# micro-batches are packed up to a token budget, so short responses no longer waste a whole
+# micro-batch. verl asserts actor.use_dynamic_bsz == rollout.log_prob_use_dynamic_bsz
+# (engine_workers.py:557) and then requires both *_max_token_len_per_gpu budgets, so all
+# three flags flip together and the budgets below become load-bearing.
+#   ppo_micro_batch_size_per_gpu / log_prob_micro_batch_size_per_gpu are IGNORED in this
+#   mode; they are still passed so the diff against the fixed-bsz arms stays readable.
+#
+# OOM WARNING — the token budget is the memory knob, and it is not proven for this shape.
+# Measured on this 8xH100 box for the 12k/4+4 layout: actor budget x3 did not fit at all;
+# x2 passed the first update then OOM'd on the second (Adam state materializes lazily at
+# the first optimizer.step(), so "it survived one step" proves nothing); x1.5 ran steady at
+# 66.4 GB peak. Those numbers came with `trainer.worker_env` delivering
+# PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to the trainer workers — that key does
+# NOT exist on this tree, so this arm has one less mitigation available. Starting point
+# below is x1 (10240 = one sequence's worth). x1.5 (15360) was tried on this box on
+# 2026-08-21 and OOM'd in the update's backward pass: 9.33 GiB free, 9.36 GiB requested --
+# short by ~30 MiB, with 8.03 GiB "reserved but unallocated", i.e. fragmentation that
+# expandable_segments would reclaim if trainer.worker_env existed on this tree.
+# The x1/x1.5 measurements above were taken on MEGATRON with HDO CPU offload; they do not
+# transfer directly to FSDP2, whose resident state is different (no optimizer offload here,
+# but sharded params/grads/Adam over 3 ranks). run/verl_k-1_4gpu_dapo17k_2+2_8k.sh:43 records
+# ~49.5 GB of sharded state per rank for this same model, 8k responses and this same 10240
+# budget at FSDP world size 2 — measured with this exact optimizer/dtype configuration, so it
+# is the right baseline; at world size 3 that is ~33 GB, so x1 should have real headroom.
+# Treat the first update step as the real test.
+#
+# Stock-verl-v0.8.0, derived from the fork arm
+#   custom_vcpo:recipe/fully_async_policy/shell/vcpo/dapo/opp-epochs_dapo-filter/
+#     grpo_novcpo_k=2_8gpu_dapo17k_5+3_resp8k_megatron_offload_ppo-epochs=2_B33x1.sh
+# Unlike the megatron arm, CWD does not matter: fully_async_ppo_trainer.yaml's hydra
+# searchpath is pkg://verl.trainer.config, not the megatron recipe's file://verl/trainer/config.
+#
+# THE ARM (unchanged from the fork):
+#   * async_training.require_batches=1: the pull is ONE 33-group mini-batch per trainer
+#     step (B-33x1) and with ppo_epochs=2 the trainer runs 2 AdamW updates per step —
+#     two passes over the same 33 groups. Model versions tick per 33-group step.
+#   * async_training.staleness_threshold=1 (between the k=0.5 and k=2 arms): the
+#     rollouter may generate up to (1+1) trainer batches ahead — int(33*2*1) = 66
+#     in-flight/queued groups, which is also the message-queue cap; the concurrency cap
+#     is min(5*16, 66) = 66 (fully_async_rollouter.py:531-543).
+#   * total_rollout_steps=66000 explicit, licensing up to ~2000 trainer steps of 33 groups.
+#   * test_freq=10 / save_freq=10 in param-version units (versions tick per 33-group
+#     step here) — validation/checkpointing every 330 groups.
+#   * trainer FSDP2 full shard over 3 GPUs (no TP/PP/CP, Ulysses SP=1), 33*16=528 seqs
+#     divide by DP=3. No offload, and — unlike the megatron arm's HDO — NO bf16 master
+#     weights: fsdp_config.model_dtype defaults to fp32 (engine/fsdp.yaml:33) and
+#     _build_model casts the module to it (fsdp/transformer_impl.py:301), so master weights
+#     and grads are fp32 here. The torchao _AdamW + bf16_stochastic_round pair is carried
+#     over from run/verl_k-1_*.sh for parity with those proven runs; the stochastic-rounding
+#     flag itself only engages on bf16 params and is inert at model_dtype=fp32. Setting
+#     model_dtype=bf16 would activate it and cut resident state, but departs from the
+#     configuration the memory numbers below were measured under.
+#
+# THE LOSS (the one substantive translation):
+#   The fork ran skip_recompute_old_log_prob=True, so no old-log-prob pass happened and
+#   the loss anchor was old_log_prob = log_prob.detach() (megatron_actor.py:519). The PPO
+#   ratio was therefore exp(logpi - logpi.detach()) == 1: clipping structurally inert
+#   (pg_clipfrac == 0), gradient = -trunc(pi_theta/pi_rollout, 2.0) * A * grad log pi,
+#   with the IS weights recomputed per micro-batch (so the 2nd ppo epoch re-weights
+#   against the updated policy). Upstream has no skip_recompute flag; the exact
+#   gradient-equivalent is bypass_mode + loss_type=reinforce, which computes
+#   -A * log pi * stopgrad(trunc(pi_theta/pi_rollout)) and likewise skips the
+#   old-log-prob forward pass.
+#   NOTE the two actor-side overrides are load-bearing: apply_bypass_mode() injects
+#   loss_mode/rollout_correction into the DRIVER's config only, but workers bound their
+#   ActorConfig at init_model and never re-read it. Without them the worker silently runs
+#   loss_mode=vanilla with no IS weights (i.e. plain PPO-clip) and loss_type/rollout_is
+#   are ignored. See docs/algo/rollout_corr.md.
+#
+# RESIDUAL DIFFERENCES vs the fork (cannot be closed by config — read the comparison
+# with these in mind):
+#   * Rollout concurrency cap: NOT a difference at this k. The cap is
+#     min(n_replicas*bsz_per_dp_rank, max_required_samples); at k=0.5 max_required=49
+#     binds on both sides — fork min(5*33, 49)=49, upstream min(5*16, 49)=49. (At the
+#     fork arm's k=2 they diverge, 99 vs 80; see the k=2 sibling script.)
+#   * Stop-the-world validation/save ARE enabled here (serialize_validation=True,
+#     pause_generation_during_save=True), backed by the virtual-clock port now in
+#     verl/experimental/fully_async_policy/. Both windows freeze generation and are
+#     excluded from fully_async/timing/cumulative_training_time, so accuracy-vs-
+#     training-time is on the same axis as the fork's runs. NOTE the upstream pause is
+#     drain-based (in-flight generations finish) where the fork's is cancel-based, so a
+#     pause lasts up to one extra generation; the window is excluded either way.
+#   * Both ppo epochs run inside ONE update_actor call (same 2 AdamW steps over the same
+#     528 sequences) instead of the fork's two driver-side calls; the LR scheduler
+#     advances differently (immaterial at lr_scheduler_type=constant).
+#   * Metrics: no training/rollout_actor_probs_pearson_corr (bypass skips the debug
+#     path); rollout-correction stats appear worker-side as actor/rollout_corr/*; entropy
+#     logs as actor/entropy_loss. This arm emits actor/ppo_kl and NO actor/pg_clipfrac —
+#     that asymmetry is the check that the reinforce path really ran.
+#   * MATH-500 validation dropped: data_source=math500_dapo has no scorer in stock verl
+#     (reward_score/__init__.py raises NotImplementedError). AIME-2024 only.
+#   * OPPORTUNISTIC PPO EPOCHS and DAPO FILTERING were off in the fork arm and have no
+#     upstream counterpart, so they are simply absent here. VCPO mechanisms stay off.
+
+set -xeuo pipefail
+
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export RAY_DISABLE_IMPORT_WARNING=1
+# The driver's stdout is block-buffered into the redirected log file, while stderr is not, so
+# Ray-forwarded console output (the `step:N - ... - val-core/...` metric lines, the startup
+# trace, the config dump) never reaches the launcher log. Unbuffer it.
+export PYTHONUNBUFFERED=1
+export VLLM_USE_V1=1
+export RAY_ADDRESS="local"
+export CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}
+export WANDB_MODE=disabled
+export VLLM_USE_FLASHINFER_SAMPLER=0
+
+# ================= Paths =================
+# A LOCAL, RE-ALIASED copy, not the hub id -- see scripts/realias_openpangu_to_llama.py.
+# The stock checkpoint is a trust_remote_code PanguEmbedded architecture, and that costs us
+# twice: modeling_openpangu_dense.py imports LossKwargs (removed in transformers >= 4.54; we
+# run 4.57.6), and vLLM 0.11.0 has no PanguEmbeddedForCausalLM in its registry. The generated
+# modeling file is a `modular` derivative of Llama whose math-carrying functions are
+# byte-for-byte copies of it, so the re-alias rewrites config.json to LlamaForCausalLM and
+# drops its auto_map. transformers then uses native Llama and vLLM its native Llama path --
+# the same weight-sync route (vllm_rollout/utils.py:287 -> model.load_weights) every other arm
+# already exercises. Weight names need no remapping. Verified by preflight checks 8 and 9.
+MODEL_PATH=${MODEL_PATH:-"/home/jovyan/ugadiarov/models/openPangu-Embedded-7B-llama"}
+# Still required after the re-alias, because the TOKENIZER stays custom: only the modeling
+# entries left config.json's auto_map, tokenizer_config.json keeps its own, so PanguTokenizer
+# is still loaded through remote code. BOTH keys are needed and they are INDEPENDENT
+# (no oc.select links them). data.trust_remote_code feeds the dataset-side tokenizer
+# (fully_async_main.py:62); actor_rollout_ref.model.trust_remote_code feeds HFModelConfig --
+# the agent-loop tokenizer, the actor/ref weight load, AND the vLLM engine
+# (vllm_async_server.py:259). Setting one without the other crashes the other half.
+trust_remote_code=True
+TRAIN_FILE=${TRAIN_FILE:-"/home/jovyan/datasets/math_datasets/dapo/dapo-math-17k.parquet"}
+# Two validation sets, reported separately by data_source:
+#   aime-2024.parquet (data_source=math_dapo)     -> val-core/math_dapo/acc/mean@1
+#   aime-2025.parquet (data_source=aime2025_dapo) -> val-core/aime2025_dapo/acc/mean@1
+# Both score through math_dapo: 2025 matches the registry's `data_source.startswith("aime")`
+# branch (reward_score/__init__.py), so no fork-only scorer is needed -- unlike the fork's
+# math500.parquet, whose math500_dapo scorer does not exist upstream and is still omitted.
+# 960 rows each, so one validation pass is 1920 prompts at up to 8192 tokens; with
+# serialize_validation=True that window freezes the pipeline (excluded from
+# cumulative_training_time, but real wall clock).
+TEST_FILE=${TEST_FILE:-"['/home/jovyan/datasets/math_datasets/dapo/aime-2024.parquet','/home/jovyan/datasets/math_datasets/dapo/aime-2025.parquet']"}
+
+project_name='vcpo'
+
+# ================= GPU Layout =================
+NNODES=${NNODES:-1}
+NGPUS_PER_NODE=${NGPUS_PER_NODE:-8}
+n_gpus_rollout=${n_gpus_rollout:-5}
+n_gpus_training=$((NGPUS_PER_NODE - n_gpus_rollout))
+
+# ================= Rollout =================
+rollout_mode="async"
+rollout_name="vllm"
+return_raw_chat="True"
+gen_tp=1
+n_resp_per_prompt=${n_resp_per_prompt:-16}
+# 0.8, not 0.9: the checkpoint engine allocates its weight-sync bucket on the rollout
+# GPUs beside vLLM and needs ~7.5 GB there. Measured on 8xH100 (2026-08-21): at 0.9
+# vLLM held 73.5 of 79.2 GiB, leaving 243 MiB, and the first sync OOM'd on a 2 GiB
+# bucket; at 0.8 it holds ~62 GB, leaving ~17 GB. Env-overridable for other hardware.
+gpu_memory_utilization=${gpu_memory_utilization:-0.8}
+enable_chunked_prefill=True
+calculate_log_probs=True
+
+# ================= Sequence Lengths =================
+max_prompt_length=2048
+max_response_length=8192
+max_num_batched_tokens=$((max_prompt_length + max_response_length))
+
+# ================= FSDP2 Sharding =================
+# Full shard over the trainer GPUs. create_device_mesh (workers/engine/fsdp/utils.py:40-58)
+# builds a 1-D (world_size,) mesh when fsdp_size is <0 or >= world_size, so this equals -1
+# but states the intent. No TP/PP/CP under FSDP2, and Ulysses SP stays at its default 1 --
+# which is what lets ppo_max_token_len_per_gpu transfer 1:1 from the megatron arm, since
+# workers/engine/utils.py:69-86 scales the budget by sp_size (= context_parallel_size on
+# megatron, = ulysses_sequence_parallel_size on FSDP), and both are 1 here.
+fsdp_size=${n_gpus_training}
+use_remove_padding=True
+precision_dtype="bfloat16"
+
+# ================= Batch Sizes =================
+train_prompt_bsz=0
+gen_prompt_bsz=1
+train_prompt_mini_bsz=33 # 33*16=528 seqs; must divide by trainer DP=3 (528/3=176)
+micro_bsz_per_gpu=1        # ignored while use_dynamic_bsz=True
+use_dynamic_bsz=True
+log_prob_micro_bsz_per_gpu=1  # ignored while use_dynamic_bsz=True
+# Token budgets per GPU (the real batch-size knob in dynamic mode). Sequence length here is
+# max_prompt_length + max_response_length = 10240.
+actor_ppo_max_token_len=${actor_ppo_max_token_len:-$((max_prompt_length + max_response_length))}   # x1 = 10240
+# The rollout/ref log-prob budgets are deliberately NOT set: rollout.yaml and ref.yaml both
+# default to ${oc.select:actor_rollout_ref.actor.ppo_max_token_len_per_gpu,16384}, so they
+# follow the actor budget and satisfy the non-None assert on their own. They would only
+# matter in decoupled mode (bypass_mode=False), where the pi_old pass actually runs; in this
+# arm that pass is skipped entirely, so any value here would be dead config.
+
+# ================= Algorithm =================
+adv_estimator=grpo
+loss_agg_mode="seq-mean-token-mean"
+clip_ratio=0.2
+clip_ratio_low=0.2
+clip_ratio_high=0.2
+clip_ratio_c=3.0
+use_kl_loss=False
+kl_loss_coef=0.0
+use_kl_in_reward=False
+kl_coef=0.0
+entropy_coeff=0
+calculate_entropy=True # log actor/entropy_loss even with entropy_coeff=0
+grad_clip=1.0
+
+# ================= Optimizer =================
+lr=1e-6
+lr_warmup_steps=0
+weight_decay=0.1
+
+# ================= IS / Rollout Correction =================
+# Token-level truncated IS applied to a REINFORCE objective — the gradient the fork's
+# skip_recompute path actually produced (see the header). Clipping never binds in this
+# mode; clip_ratio* below are inert and kept only for parity with the fork script.
+rollout_is="token"
+rollout_is_threshold="2.0"
+rollout_rs=null
+rollout_rs_threshold=null
+bypass_mode=True    # old_log_probs := rollout_log_probs; skips the old-log-prob pass
+loss_type=reinforce # replaces the fork's use_policy_gradient switch
+
+# ================= Async Training =================
+# k=1: the rollouter may run up to (1+1) trainer batches ahead — at B-33x1 that is
+# int(33*2)=66 in-flight/queued groups. partial_rollout still applies (it needs k>0).
+staleness_threshold=${staleness_threshold:-1.0}
+updates_per_param_sync=1
+num_minibatches_per_update=1 # require_batches=1: ONE 33-group mini-batch per trainer step (B-33x1)
+partial_rollout=True
+
+# ================= Stop-the-world accounting =================
+# Freeze the pipeline for validation and for checkpoint saves so both are pure time
+# translations: excluded from fully_async/timing/cumulative_training_time via the
+# per-sample stamps, leaving the trajectory identical to a no-validation-no-save run.
+serialize_validation=${serialize_validation:-True}
+pause_generation_during_save=${pause_generation_during_save:-True}
+
+# ================= PPO epochs =================
+# actor.ppo_epochs=2 -> 2 AdamW updates per trainer step: two passes over the single
+# 33-group mini-batch of the pull. shuffle/data_loader_seed replace the fork's
+# ppo_epochs_shuffle_seed (a no-op at require_batches=1: the pull IS the mini-batch).
+ppo_epochs=${ppo_epochs:-2}
+ppo_epochs_shuffle_seed=${ppo_epochs_shuffle_seed:-1234}
+
+# ================= Training/Rollout Steps =================
+# Explicit 66000 (NOT the base arms' 500-step formula, which at B-33x1 would shrink to
+# 500*1*1*33 = 16500): same generation budget as the B-33x4 arms, licensing up to ~2000
+# trainer steps of 33 groups.
+total_rollout_steps=${total_rollout_steps:-66000}
+epochs=10000000
+# test/save freq are in param-version units; versions tick per 33-group step here, so
+# 10 = every 330 groups. Use -1 to disable (0 raises ZeroDivisionError upstream).
+test_freq=${test_freq:-10}
+save_freq=${save_freq:-10}
+# Export-only checkpoints: weights in HF format, no optimizer/extra state, nothing pruned.
+# NOTE the token list is the INVERSE of the megatron arm's. On FSDP it is 'hf_model' that
+# produces the HF export -- fsdp_checkpoint_manager.py:341-391 gathers a full state dict and
+# calls save_pretrained into <step>/huggingface/ -- whereas on megatron/mbridge 'model'
+# drives the export and 'hf_model' is a no-op (megatron_checkpoint_manager.py:753, :820).
+# Adding 'model' here would only write per-rank sharded model_world_size_3_rank_*.pt files,
+# which resume_mode=disable never reads.
+#   ~16.4 GB per checkpoint (Qwen3-8B = 8,190,735,360 params x 2 B bf16) + ~16 MB
+#   tokenizer/config, which rank 0 writes regardless of the token list.
+#   At save_freq=10 and 2000 param versions that is ~200 checkpoints ~= 3.3 TB.
+#   Lower save_freq (env-overridable) if disk is tight.
+max_actor_ckpt_to_keep=null # keep every checkpoint (null disables both retention trims)
+ckpt_save_contents="['hf_model']"
+# Resume is off: these checkpoints carry no optimizer/RNG state, so an auto-resume
+# would silently restore weights only -- and the saves still write
+# latest_checkpointed_iteration.txt, which resume_mode=auto would pick up.
+resume_mode=${resume_mode:-disable}
+
+# ================= Logging =================
+exp_name=${exp_name:-"GRPO-noVCPO-v080 bypass-reinforce dynbsz k-${staleness_threshold} DAPO17K-AIME24 openPangu-7B ${n_gpus_rollout}-${n_gpus_training} fsdp2 B-${train_prompt_mini_bsz}x${num_minibatches_per_update} ppo-epochs-${ppo_epochs} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd"}
+exp_name_safe=${exp_name//\//_}
+log_dir="logs/${exp_name_safe}"
+CKPTS_DIR="${log_dir}"
+mkdir -p -- "${log_dir}"
+export TENSORBOARD_DIR="${log_dir}/tensorboard"
+
+trainer_logger="['console','tensorboard']"
+# Non-zero for this arm: the first validation is how we learn whether the model actually emits
+# the 'Answer:' last line the scorer needs. NOTE the dump decodes with skip_special_tokens=True
+# (ray_trainer.py:662), so [unused*] delimiters will NOT appear in it.
+log_val_generations=10
+val_before_train=${val_before_train:-True}
+
+# ================= LR schedule =================
+# FSDPOptimizerConfig has no lr_decay_style/lr_decay_steps -- those are megatron-only. The
+# FSDP knob is lr_scheduler_type, which accepts only constant|cosine (optimizer.py:111,123).
+lr_scheduler_type="constant"
+
+# ================= Run =================
+python -m verl.experimental.fully_async_policy.fully_async_main \
+    --config-name=fully_async_ppo_trainer.yaml \
+    data.train_files="${TRAIN_FILE}" \
+    data.val_files="${TEST_FILE}" \
+    data.prompt_key=prompt \
+    data.truncation='left' \
+    data.max_prompt_length=${max_prompt_length} \
+    data.max_response_length=${max_response_length} \
+    data.train_batch_size=${train_prompt_bsz} \
+    data.gen_batch_size=${gen_prompt_bsz} \
+    data.return_raw_chat=${return_raw_chat} \
+    data.filter_overlong_prompts=True \
+    data.filter_overlong_prompts_workers=8 \
+    actor_rollout_ref.rollout.n=${n_resp_per_prompt} \
+    algorithm.adv_estimator=${adv_estimator} \
+    algorithm.use_kl_in_reward=${use_kl_in_reward} \
+    algorithm.kl_ctrl.kl_coef=${kl_coef} \
+    algorithm.rollout_correction.rollout_is=${rollout_is} \
+    algorithm.rollout_correction.rollout_is_threshold=${rollout_is_threshold} \
+    algorithm.rollout_correction.rollout_rs=${rollout_rs} \
+    algorithm.rollout_correction.rollout_rs_threshold=${rollout_rs_threshold} \
+    algorithm.rollout_correction.bypass_mode=${bypass_mode} \
+    algorithm.rollout_correction.loss_type=${loss_type} \
+    actor_rollout_ref.actor.policy_loss.loss_mode=bypass_mode \
+    +actor_rollout_ref.actor.policy_loss.rollout_correction='${algorithm.rollout_correction}' \
+    actor_rollout_ref.actor.strategy=fsdp2 \
+    actor_rollout_ref.actor.fsdp_config.strategy=fsdp2 \
+    critic.strategy=fsdp2 \
+    actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \
+    actor_rollout_ref.actor.kl_loss_coef=${kl_loss_coef} \
+    actor_rollout_ref.actor.clip_ratio=${clip_ratio} \
+    actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
+    actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
+    actor_rollout_ref.actor.clip_ratio_c=${clip_ratio_c} \
+    actor_rollout_ref.model.path="${MODEL_PATH}" \
+    actor_rollout_ref.model.trust_remote_code=${trust_remote_code} \
+    data.trust_remote_code=${trust_remote_code} \
+    actor_rollout_ref.model.use_remove_padding=${use_remove_padding} \
+    actor_rollout_ref.hybrid_engine=False \
+    actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
+    actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=${micro_bsz_per_gpu} \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${actor_ppo_max_token_len} \
+    actor_rollout_ref.actor.ppo_epochs=${ppo_epochs} \
+    actor_rollout_ref.actor.shuffle=True \
+    actor_rollout_ref.actor.data_loader_seed=${ppo_epochs_shuffle_seed} \
+    actor_rollout_ref.actor.fsdp_config.fsdp_size=${fsdp_size} \
+    actor_rollout_ref.actor.fsdp_config.param_offload=False \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
+    actor_rollout_ref.actor.fsdp_config.offload_policy=False \
+    actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.actor.optim.lr=${lr} \
+    actor_rollout_ref.actor.optim.lr_warmup_steps=${lr_warmup_steps} \
+    actor_rollout_ref.actor.optim.lr_scheduler_type=${lr_scheduler_type} \
+    actor_rollout_ref.actor.optim.weight_decay=${weight_decay} \
+    actor_rollout_ref.actor.optim.clip_grad=${grad_clip} \
+    actor_rollout_ref.actor.optim.optimizer_impl=torchao.optim \
+    actor_rollout_ref.actor.optim.optimizer=_AdamW \
+    "actor_rollout_ref.actor.optim.override_optimizer_config={bf16_stochastic_round:true}" \
+    actor_rollout_ref.actor.entropy_coeff=${entropy_coeff} \
+    actor_rollout_ref.actor.calculate_entropy=${calculate_entropy} \
+    actor_rollout_ref.actor.loss_agg_mode=${loss_agg_mode} \
+    actor_rollout_ref.actor.use_rollout_log_probs=True \
+    actor_rollout_ref.ref.fsdp_config.param_offload=True \
+    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
+    actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=${log_prob_micro_bsz_per_gpu} \
+    actor_rollout_ref.rollout.name=${rollout_name} \
+    actor_rollout_ref.rollout.mode=${rollout_mode} \
+    actor_rollout_ref.rollout.gpu_memory_utilization=${gpu_memory_utilization} \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
+    actor_rollout_ref.rollout.dtype=${precision_dtype} \
+    actor_rollout_ref.rollout.enable_chunked_prefill=${enable_chunked_prefill} \
+    actor_rollout_ref.rollout.max_num_batched_tokens=${max_num_batched_tokens} \
+    actor_rollout_ref.rollout.temperature=1.0 \
+    actor_rollout_ref.rollout.top_p=1.0 \
+    actor_rollout_ref.rollout.top_k=-1 \
+    actor_rollout_ref.rollout.val_kwargs.temperature=0.8 \
+    actor_rollout_ref.rollout.val_kwargs.top_p=0.7 \
+    actor_rollout_ref.rollout.val_kwargs.top_k=-1 \
+    actor_rollout_ref.rollout.val_kwargs.do_sample=True \
+    actor_rollout_ref.rollout.val_kwargs.n=${val_n:-1} \
+    actor_rollout_ref.rollout.calculate_log_probs=${calculate_log_probs} \
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=${log_prob_micro_bsz_per_gpu} \
+    trainer.logger=${trainer_logger} \
+    trainer.project_name="${project_name}" \
+    trainer.experiment_name="${exp_name}" \
+    trainer.val_before_train=${val_before_train} \
+    trainer.save_freq=${save_freq} \
+    trainer.test_freq=${test_freq} \
+    trainer.total_epochs=${epochs} \
+    trainer.max_actor_ckpt_to_keep=${max_actor_ckpt_to_keep} \
+    trainer.resume_mode=${resume_mode} \
+    "actor_rollout_ref.actor.checkpoint.save_contents=${ckpt_save_contents}" \
+    trainer.rollout_data_dir="${log_dir}" \
+    trainer.log_val_generations=${log_val_generations} \
+    trainer.default_local_dir="${CKPTS_DIR}" \
+    trainer.nnodes="${NNODES}" \
+    trainer.n_gpus_per_node="${n_gpus_training}" \
+    rollout.nnodes="${NNODES}" \
+    rollout.n_gpus_per_node="${n_gpus_rollout}" \
+    rollout.total_rollout_steps="${total_rollout_steps}" \
+    async_training.staleness_threshold="${staleness_threshold}" \
+    async_training.trigger_parameter_sync_step="${updates_per_param_sync}" \
+    async_training.require_batches="${num_minibatches_per_update}" \
+    async_training.partial_rollout="${partial_rollout}" \
+    async_training.serialize_validation="${serialize_validation}" \
+    async_training.pause_generation_during_save="${pause_generation_during_save}" "$@"
