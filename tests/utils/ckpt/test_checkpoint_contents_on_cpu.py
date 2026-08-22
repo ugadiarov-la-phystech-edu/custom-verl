@@ -15,10 +15,14 @@
 """Checkpoint ``save_contents`` / ``load_contents`` semantics, and unlimited retention.
 
 Motivation: the ``run/baselines`` scripts save export-only checkpoints with
-``save_contents=['model','hf_model']`` and ``max_actor_ckpt_to_keep=null``. Both choices are
-load-bearing and easy to regress silently -- dropping ``'model'`` from the list yields *empty*
-checkpoints on the mbridge megatron path rather than an error (see
-``test_hf_model_alone_does_not_request_a_model_save``).
+``max_actor_ckpt_to_keep=null``. Which token list achieves that is **backend-dependent**, and the
+two are inverses: the megatron arms pass ``['model','hf_model']`` because ``'model'`` is what
+drives the mbridge HF export, while the fsdp2 arm passes ``['hf_model']`` because there that is
+the independent branch which writes the export. Both choices are load-bearing and easy to regress
+silently -- dropping ``'model'`` on the megatron path yields *empty* checkpoints rather than an
+error (see ``test_hf_model_alone_does_not_request_a_model_save``). The per-script mapping is
+enforced by ``EXPORT_ONLY_CONTENTS`` in
+``tests/experimental/fully_async_policy/test_baseline_scripts_config_on_cpu.py``.
 """
 
 import os
@@ -70,13 +74,15 @@ def test_baseline_contents_save_model_and_hf_model_only(monkeypatch):
 
 
 def test_hf_model_alone_does_not_request_a_model_save(monkeypatch):
-    """Regression guard for the run/baselines choice.
+    """Regression guard for the megatron run/baselines arms.
 
     On the mbridge megatron path ``use_hf_checkpoint`` is True, so the HF export runs inside
     ``if self.should_save_model:`` (megatron_checkpoint_manager.py) and the
     ``should_save_hf_model and not use_hf_checkpoint`` branch is unreachable. With ``['hf_model']``
     alone every save predicate below is False, i.e. the checkpoint would contain no weights at all.
-    That is why the scripts pass ``['model','hf_model']``.
+    That is why the megatron scripts pass ``['model','hf_model']``. On FSDP the same token list
+    would be wrong in the other direction -- see ``test_baseline_load_contents_carry_no_optimizer``
+    and the module docstring.
     """
     m = _manager(monkeypatch, save_contents=["hf_model"])
     assert m.should_save_model is False, "'hf_model' alone must not imply a model save"

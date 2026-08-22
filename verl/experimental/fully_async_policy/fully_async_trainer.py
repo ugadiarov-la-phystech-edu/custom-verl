@@ -313,6 +313,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             "first_sample_time": _iso(self.rollouter_first_sample_time),
             "checkpoint_save_started": _iso(save_start),
         }
+        # The workers create global_step_N/ on their own filesystems; this runs on the trainer
+        # driver, which shares one only when storage is shared. Create it rather than dying
+        # after an otherwise successful save.
+        os.makedirs(local_global_step_folder, exist_ok=True)
         with open(os.path.join(local_global_step_folder, "timing_state.json"), "w") as f:
             json.dump(timing_state, f, indent=2)
 
@@ -824,11 +828,14 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             # Snapshot the virtual clock before the pause: the persisted totals must
             # exclude the in-progress save, which is exactly what a resume rebuilds.
             save_start = time.time()
-            if self.pause_generation_during_save:
-                # Stop-the-world: freeze generation for the whole save window so it
-                # is a pure time translation of the pipeline.
-                await self.rollouter.begin_save_pause.remote()
             try:
+                if self.pause_generation_during_save:
+                    # Stop-the-world: freeze generation for the whole save window so it
+                    # is a pure time translation of the pipeline. Inside the try: the drain
+                    # sets _hard_paused before it can raise, and _maybe_auto_resume refuses
+                    # to lift a hard pause, so a failure out here would wedge the rollouter
+                    # permanently and the trainer would then block forever in _fit_generate.
+                    await self.rollouter.begin_save_pause.remote()
                 with marked_timer("save_checkpoint", timing_raw, color="green"):
                     local_global_step_folder = self._save_checkpoint()
                     self.last_ckpt_version = self.current_param_version

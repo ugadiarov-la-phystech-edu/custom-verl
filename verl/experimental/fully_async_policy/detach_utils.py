@@ -210,6 +210,15 @@ class MetricsAggregator:
             "avg": ["timing_s/agent_loop/tool_calls/mean"],
             "max": ["timing_s/agent_loop/tool_calls/max"],
             "last": [
+                # Cumulative clocks, not per-step samples. Without these entries they fall through
+                # to the name heuristic below, where "fully_async/timing/" contains the substring
+                # "min" (ti-MIN-g) and every one of them aggregates as *min* -- i.e. with
+                # trigger_parameter_sync_step > 1 the logged clock is the version's FIRST step,
+                # frozen a whole param version behind. Exact names win over the heuristic.
+                "fully_async/timing/wall_time_since_first_sample",
+                "fully_async/timing/cumulative_validation_time",
+                "fully_async/timing/cumulative_save_time",
+                "fully_async/timing/cumulative_training_time",
                 "fully_async/count/total_generated_samples",
                 "fully_async/count/stale_samples_processed",
                 "fully_async/count/stale_trajectory_processed",

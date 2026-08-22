@@ -992,3 +992,34 @@ def test_restore_ignores_the_absolute_timestamps(tmp_path):
     assert resumed.timing_save_offset == 2.0
     # and no attribute was invented from the new keys
     assert not hasattr(resumed, "first_sample_time")
+
+
+def test_cumulative_metrics_aggregate_as_last_not_mean():
+    """The virtual clock is cumulative, so it must survive multi-step param versions.
+
+    Every metric the trainer emits is buffered by ``MetricsAggregator`` and drained once per
+    parameter sync, so with ``trigger_parameter_sync_step > 1`` (the recipe default is 4) the
+    aggregation rule decides what actually gets logged. These four keys are especially easy to
+    get wrong: ``_get_aggregation_type``'s name heuristic does substring matching, and the
+    ``fully_async/timing/`` prefix contains ``"min"`` (ti-MIN-g), so absent an exact-name rule
+    they aggregate as *min* -- the version's first step, a whole param version stale and flat
+    across it. The ``fully_async/count/*`` counters are listed as ``"last"`` for the same
+    reason.
+    """
+    from verl.experimental.fully_async_policy.detach_utils import MetricsAggregator
+
+    agg = MetricsAggregator(total_gpus=1)
+    trainer = _make_trainer(first_sample_time=1000.0, cumulative_validation_time=7.0, cumulative_save_time=3.0)
+    trainer.virtual_free_time = 1040.0
+    step_data = {}
+    trainer._add_cumulative_time_metrics(step_data, now=1100.0)
+
+    assert step_data, "the anchor is set, so metrics must be emitted"
+    for key in step_data:
+        assert agg._get_aggregation_type(key) == "last", f"{key} falls through to the name heuristic"
+
+    # And end-to-end: two steps of one param version must report the second step's value.
+    for value in (10.0, 20.0):
+        agg.add_step_metrics(metrics={"fully_async/timing/cumulative_training_time": value}, sample_count=1)
+    out = agg.get_aggregated_metrics()
+    assert out["fully_async/timing/cumulative_training_time"] == 20.0, "must be last, not the 15.0 mean"

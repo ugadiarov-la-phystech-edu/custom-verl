@@ -35,7 +35,6 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPT_DIR = REPO_ROOT / "run" / "baselines"
 RECIPE_CONFIG_DIR = REPO_ROOT / "verl" / "experimental" / "fully_async_policy" / "config"
-RECIPE_CONFIG_NAME = "fully_async_ppo_megatron_trainer.yaml"
 
 SCRIPTS = sorted(SCRIPT_DIR.glob("*.sh")) if SCRIPT_DIR.is_dir() else []
 
@@ -70,14 +69,17 @@ def _capture_overrides(script: Path, tmp_path: Path) -> list[str]:
     assert argv[0] == "-m", f"{script.name}: expected `python -m <module>`, got {argv[:2]}"
     assert argv[1] == "verl.experimental.fully_async_policy.fully_async_main", argv[1]
     assert argv[2].startswith("--config-name="), argv[2]
-    return argv[3:]
+    # The recipe differs by backend -- megatron scripts select the megatron yaml, fsdp2 scripts the
+    # plain one -- so compose against whichever the script itself asked for, never a fixed name.
+    config_name = argv[2].split("=", 1)[1]
+    return config_name, argv[3:]
 
 
-def _compose(overrides: list[str]):
+def _compose(config_name: str, overrides: list[str]):
     from hydra import compose, initialize_config_dir
 
     with initialize_config_dir(config_dir=str(RECIPE_CONFIG_DIR), version_base=None):
-        return compose(config_name=RECIPE_CONFIG_NAME, overrides=overrides)
+        return compose(config_name=config_name, overrides=overrides)
 
 
 @pytest.fixture(scope="module")
@@ -86,7 +88,7 @@ def composed(tmp_path_factory):
     out = {}
     for script in SCRIPTS:
         tmp = tmp_path_factory.mktemp(script.stem[:24].replace("=", "_"))
-        out[script.name] = _compose(_capture_overrides(script, tmp))
+        out[script.name] = _compose(*_capture_overrides(script, tmp))
     return out
 
 
@@ -111,22 +113,54 @@ def test_stdout_is_unbuffered(script):
     assert "export PYTHONUNBUFFERED=1" in script.read_text(), f"{script.name} must export PYTHONUNBUFFERED=1"
 
 
+# Which save_contents yields a weights-only checkpoint depends on the training backend, and the
+# two are inverses of each other -- see test_export_only_checkpoint_policy.
+EXPORT_ONLY_CONTENTS = {"megatron": ["model", "hf_model"], "fsdp2": ["hf_model"]}
+
+
 @pytest.mark.parametrize("name", [s.name for s in SCRIPTS])
 def test_export_only_checkpoint_policy(composed, name):
-    """Weights-only checkpoints, kept forever, never resumed from."""
+    """Weights-only checkpoints, kept forever, never resumed from.
+
+    The token that produces the HF export flips with the backend:
+
+    * megatron/mbridge -- ``should_save_model`` drives ``bridge.save_hf_weights``
+      (``megatron_checkpoint_manager.py:753``) while the ``hf_model`` branch at ``:820`` is
+      gated on ``not use_hf_checkpoint`` and never runs. So ``model`` is mandatory and
+      ``hf_model`` alone would write no weights at all.
+    * fsdp2 -- ``should_save_hf_model`` is an independent branch
+      (``fsdp_checkpoint_manager.py:341-391``) that gathers its own full state dict and calls
+      ``save_pretrained``. ``model`` there writes per-rank sharded ``model_world_size_*.pt``
+      files instead, which ``resume_mode=disable`` never reads.
+    """
     cfg = composed[name]
     ckpt = cfg.actor_rollout_ref.actor.checkpoint
+    strategy = cfg.actor_rollout_ref.actor.strategy
 
     assert cfg.trainer.max_actor_ckpt_to_keep is None, "null disables both retention trims"
     assert cfg.trainer.resume_mode == "disable"
-    assert list(ckpt.save_contents) == ["model", "hf_model"]
-    # 'model' is what triggers the HF export on the mbridge megatron path; without it the
-    # checkpoint would contain no weights at all.
-    assert "model" in ckpt.save_contents
+    assert strategy in EXPORT_ONLY_CONTENTS, f"unhandled backend {strategy!r}"
+    assert list(ckpt.save_contents) == EXPORT_ONLY_CONTENTS[strategy]
     assert "optimizer" not in ckpt.save_contents
     assert "extra" not in ckpt.save_contents
     # load_contents follows save_contents by interpolation in actor.yaml.
     assert list(ckpt.load_contents) == list(ckpt.save_contents)
+
+
+@pytest.mark.parametrize("name", [s.name for s in SCRIPTS])
+def test_fsdp_strategy_is_set_on_both_keys(composed, name):
+    """``actor.strategy`` is the load-bearing one, and it silently overwrites the other.
+
+    ``FSDPActorConfig.__post_init__`` (``verl/workers/config/actor.py:310-317``) aliases
+    ``self.engine`` to ``self.fsdp_config`` and then copies ``self.strategy`` onto it, so a script
+    that sets only ``fsdp_config.strategy=fsdp2`` runs FSDP1 with no error. Several in-tree
+    example scripts are wrong in exactly this way; the baselines must set both.
+    """
+    cfg = composed[name]
+    strategy = cfg.actor_rollout_ref.actor.strategy
+    if not strategy.startswith("fsdp"):
+        pytest.skip(f"{strategy} backend has no fsdp_config")
+    assert cfg.actor_rollout_ref.actor.fsdp_config.strategy == strategy
 
 
 @pytest.mark.parametrize("name", [s.name for s in SCRIPTS])
