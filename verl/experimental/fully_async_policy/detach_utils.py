@@ -38,6 +38,10 @@ class RolloutSample:
     # Processing metadata
     rollout_status: dict[str, Any]
 
+    # Replay-buffer mode: model version of the group = min over its trajectories' min_global_steps (the
+    # version each trajectory's generation started under), stamped by the rollouter's insertion gate.
+    group_version: int = 0
+
 
 def prepare_single_generation_data(batch_dict, config) -> DataProto:
     """

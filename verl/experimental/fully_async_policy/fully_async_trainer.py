@@ -915,6 +915,17 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self.progress_bar.update(1)
 
     def _save_checkpoint(self):
+        if not self.config.async_training.get("pause_generation_during_save", False):
+            return self._save_checkpoint_inner()
+        # Stop-the-world save: generation is frozen for the whole save, so the save is a pure time
+        # translation of the pipeline instead of letting the queue build a surplus meanwhile.
+        ray.get(self.rollouter.begin_save_pause.remote())
+        try:
+            self._save_checkpoint_inner()
+        finally:
+            ray.get(self.rollouter.end_save_pause.remote())
+
+    def _save_checkpoint_inner(self):
         # Warning: Currently, to align the training process and metrics of colocate,
         # we use current_param_version instead of global step.
         # This can be logically aligned with the original self.global_steps of colocate

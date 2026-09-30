@@ -48,6 +48,46 @@ async_training:
   # Maximum number of concurrent generation requests per replica.
   concurrent_samples_per_replica: 16
 
+  # Staged in-flight cap for the warm-up (null = off): per-replica caps, e.g. [5, 12, 20]. Stage 0 holds
+  # until the trainer's first mini-batch has been delivered to the queue, stage i until
+  # first + i x ppo_mini_batch_size groups; then the cap is concurrent_samples_per_replica x replicas.
+  concurrency_ramp: null
+
+  # Stop-the-world validation: freeze all generation (no new samples, in-flight requests aborted and
+  # held for a partial-rollout resume) while the rollouter validates. Requires partial_rollout.
+  serialize_validation: False
+
+  # Stop-the-world checkpoint saves: freeze generation for the whole trainer checkpoint save, as above.
+  pause_generation_during_save: False
+
+  # Replay-buffer training mode (trainer-local buffer of prompt groups, see replay_buffer.py).
+  replay_buffer:
+
+    # Enable replay mode: the rollouter drops degenerate groups (all rewards equal) and freezes GRPO
+    # advantages at insertion; the trainer composes mini-batches from the buffer.
+    enable: False
+
+    # Staleness score half-life in model updates: score = 2^(-staleness / tau).
+    tau: 8.0
+
+    # Groups staler than this many model updates are evicted.
+    staleness_threshold: 32
+
+    # Pause watermark in mini-batches; values in (0, 1) instead size only the first mini-batch.
+    requires_mini_batches: 1.0
+
+    # Seed of the weighted replay draw.
+    sampling_seed: 1234
+
+    # Reuse-decay half-life in trainings: weight x 2^(-times_trained / reuse_halflife); null = off.
+    reuse_halflife: null
+
+    # Fresh-share gate: wait for ceil(min_fresh_ratio x mini-batch size) newly arrived groups; 0 = off.
+    min_fresh_ratio: 0.0
+
+    # Cap on the fresh-share wait in seconds (<= 0 = uncapped).
+    min_fresh_wait_timeout_s: 3600.0
+
 # Rollout config
 rollout:
 
