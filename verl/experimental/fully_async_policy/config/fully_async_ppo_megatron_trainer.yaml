@@ -48,6 +48,30 @@ async_training:
   # Maximum number of concurrent generation requests per replica.
   concurrent_samples_per_replica: 16
 
+  concurrency_ramp: null
+
+  serialize_validation: False
+
+  pause_generation_during_save: False
+
+  replay_buffer:
+
+    enable: False
+
+    tau: 8.0
+
+    staleness_threshold: 32
+
+    requires_mini_batches: 1.0
+
+    sampling_seed: 1234
+
+    reuse_halflife: null
+
+    min_fresh_ratio: 0.0
+
+    min_fresh_wait_timeout_s: 3600.0
+
 # Rollout config
 rollout:
 

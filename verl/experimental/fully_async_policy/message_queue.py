@@ -102,6 +102,13 @@ class MessageQueue:
             self.total_consumed += 1
             return data, len(self.queue)
 
+    async def get_available_samples(self) -> list[Any]:
+        async with self._lock:
+            drained = list(self.queue)
+            self.queue.clear()
+            self.total_consumed += len(drained)
+            return drained
+
     async def get_queue_size(self) -> int:
         """Get current queue length"""
         async with self._lock:
@@ -198,6 +205,10 @@ class MessageQueueClient:
     async def get_sample(self) -> Any | None:
         """Get single sample from queue, wait until one is available (async)"""
         future = self.queue_actor.get_sample.remote()
+        return await asyncio.wrap_future(future.future())
+
+    async def get_available_samples(self) -> list[Any]:
+        future = self.queue_actor.get_available_samples.remote()
         return await asyncio.wrap_future(future.future())
 
     async def get_queue_size(self) -> int:

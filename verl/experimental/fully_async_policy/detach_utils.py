@@ -38,6 +38,8 @@ class RolloutSample:
     # Processing metadata
     rollout_status: dict[str, Any]
 
+    group_version: int = 0
+
 
 def prepare_single_generation_data(batch_dict, config) -> DataProto:
     """
