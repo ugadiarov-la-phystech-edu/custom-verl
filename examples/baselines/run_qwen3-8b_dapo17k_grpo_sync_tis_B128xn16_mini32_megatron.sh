@@ -27,6 +27,18 @@
 # CADENCE. Validation and checkpoints every 3 rollout steps (= 12 optimizer updates; baseline 2):
 # test_freq=3, save_freq=3, env-overridable.
 #
+# H100 EMULATION IS ON BY DEFAULT (for runs on remote_h200's 140.4 GiB H200s; see the baseline's
+# "H100 emulation" note and verl/utils/gpu_memory_cap.py):
+#   * VERL_GPU_MEM_CAP_GB=76      caps the trainer (actor-role worker) allocator at 76 GiB: 79.65 GiB of
+#                                 an H100 minus the sleeping vLLM process and ~1.5 GiB outside the
+#                                 allocator. A starting value - re-derive it from nvidia-smi
+#                                 --query-compute-apps during update_actor.
+#   * gpu_memory_utilization=0.283 gives vLLM the H100's absolute budget, 0.5 x 79.65 / 140.4 GiB.
+# Both are tagged in exp_name (" h100-emu-76gb-gmu0.283"). The cap cannot bound the rollout phase
+# (resident trainer + vLLM): watch per-GPU memory with an nvidia-smi sampler; > ~78 GB would OOM an H100.
+# ON A REAL H100 OVERRIDE BOTH: VERL_GPU_MEM_CAP_GB= gpu_memory_utilization=0.5 bash <this script>
+# (0.283 of an 80 GiB card would halve vLLM's KV cache; an empty VERL_GPU_MEM_CAP_GB disables the cap).
+#
 # DYNAMIC BATCH SIZE is on here (DYNAMIC_BSZ=True, cap DYNAMIC_BSZ_MAX_TOKENS=10240 tokens per GPU per
 # micro-batch = one full-length sequence, so the memory peak stays at the measured worst case). It
 # packs short sequences into shared passes for old_log_prob / update_actor without changing the loss
@@ -83,6 +95,8 @@ export test_freq=${test_freq:-3}
 export save_freq=${save_freq:-3}
 export weight_decay=${weight_decay:-0.1}
 export DYNAMIC_BSZ=${DYNAMIC_BSZ:-True}
+export VERL_GPU_MEM_CAP_GB=${VERL_GPU_MEM_CAP_GB-76}
+export gpu_memory_utilization=${gpu_memory_utilization:-0.283}
 
 DEEPGEMM_CUDA_HOME=${DEEPGEMM_CUDA_HOME:-/home/jovyan/ugadiarov/cuda-12.9}
 if [[ -z "${CUDA_HOME:-}" && -x "${DEEPGEMM_CUDA_HOME}/bin/nvcc" ]]; then
