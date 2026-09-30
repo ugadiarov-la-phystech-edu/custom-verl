@@ -34,7 +34,12 @@ SCRIPTS = REPO / "examples" / "baselines"
 QWEN = "run_qwen3-8b_dapo17k_grpo_sync_B128xn16_mini32_megatron.sh"
 PANGU = "run_openpangu7b_dapo17k_grpo_sync_B128xn16_mini32_megatron.sh"
 ORZ = "run_orz7b_orz72k_grpo_sync_B128xn16_mini32_megatron.sh"
+QWEN_TIS = "run_qwen3-8b_dapo17k_grpo_sync_tis_B128xn16_mini32_megatron.sh"
 ALL = [QWEN, PANGU, ORZ]
+
+
+# Script knobs that must not leak in from the caller's shell.
+SCRIPT_ENV_KNOBS = {"VERL_GPU_MEM_CAP_GB", "SEED", "max_updates", "ROLLOUT_QUANT", "TIS", "TIS_THRESHOLD"}
 
 
 def _run(script, env=None, args=(), tmp=None):
@@ -45,9 +50,12 @@ def _run(script, env=None, args=(), tmp=None):
     # A wrapper, not a symlink: a symlinked venv interpreter outside the venv loses the venv.
     python3 = bindir / "python3"
     if not python3.exists():
-        python3.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
-        python3.chmod(0o755)
-    full_env = {k: v for k, v in os.environ.items() if k not in {"VERL_GPU_MEM_CAP_GB", "SEED", "max_updates"}}
+        # Atomic: pytest-xdist workers share this directory.
+        tmp_wrapper = bindir / f".python3.{os.getpid()}"
+        tmp_wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+        tmp_wrapper.chmod(0o755)
+        os.replace(tmp_wrapper, python3)
+    full_env = {k: v for k, v in os.environ.items() if k not in SCRIPT_ENV_KNOBS}
     full_env.update(
         {
             "PATH": f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}",
@@ -349,3 +357,111 @@ def test_no_legacy_or_noop_overrides(script):
         "recipe/fully_async_policy/reward",
     ):
         assert stale not in text, stale
+
+
+# --------------------------------------------------------------------------- Qwen3-8B precision / TIS variants
+
+TOGGLE_KEYS = {
+    "actor_rollout_ref.rollout.quantization",
+    "algorithm.rollout_correction.rollout_is",
+    "algorithm.rollout_correction.rollout_is_threshold",
+}
+
+
+def _diff(a, b):
+    fa, fb = _flatten(a), _flatten(b)
+    return {k for k in fa.keys() | fb.keys() if fa.get(k) != fb.get(k)}
+
+
+class TestQwenPrecisionAndTis:
+    def test_baseline_defaults_are_bf16_without_tis(self):
+        c = compose(QWEN)
+        assert c["actor_rollout_ref"]["rollout"]["quantization"] is None
+        assert c["algorithm"]["rollout_correction"]["rollout_is"] is None
+        name = c["trainer"]["experiment_name"]
+        assert "tis-" not in name and "rollout-fp8" not in name
+
+    def test_explicit_defaults_compose_identically_to_the_baseline(self):
+        assert _diff(compose(QWEN), compose(QWEN, ROLLOUT_QUANT="bf16", TIS="False")) == set()
+
+    def test_bf16_tis(self):
+        c = compose(QWEN_TIS)
+        rc = c["algorithm"]["rollout_correction"]
+        assert rc["rollout_is"] == "token"
+        assert rc["rollout_is_threshold"] == 2.0
+        assert rc["bypass_mode"] is False
+        assert rc["rollout_rs"] is None
+        assert c["actor_rollout_ref"]["rollout"]["quantization"] is None
+        assert c["actor_rollout_ref"]["rollout"]["calculate_log_probs"] is True
+        assert c["actor_rollout_ref"]["rollout"]["logprobs_mode"] == "processed_logprobs"
+        assert c["trainer"]["experiment_name"].endswith(" 0.01-wd tis-C2.0 seed-1")
+
+    def test_fp8_tis(self):
+        c = compose(QWEN_TIS, ROLLOUT_QUANT="fp8")
+        assert c["actor_rollout_ref"]["rollout"]["quantization"] == "fp8"
+        assert c["algorithm"]["rollout_correction"]["rollout_is"] == "token"
+        assert c["trainer"]["experiment_name"].endswith(" tis-C2.0 rollout-fp8 seed-1")
+
+    def test_bf16_tis_differs_from_baseline_only_by_tis(self):
+        expected = {"algorithm.rollout_correction.rollout_is"} | NAME_DERIVED_KEYS
+        assert _diff(compose(QWEN), compose(QWEN_TIS)) == expected
+
+    def test_fp8_tis_differs_from_bf16_tis_only_by_quantization(self):
+        diff = _diff(compose(QWEN_TIS), compose(QWEN_TIS, ROLLOUT_QUANT="fp8"))
+        assert diff == {"actor_rollout_ref.rollout.quantization"} | NAME_DERIVED_KEYS
+
+    def test_tis_script_is_the_baseline_with_tis_on(self):
+        assert _diff(compose(QWEN_TIS), compose(QWEN, TIS="True")) == set()
+
+    def test_tis_script_honours_an_explicit_tis_off(self):
+        # the wrapper only defaults TIS; an explicit env value wins
+        assert _diff(compose(QWEN_TIS, TIS="False"), compose(QWEN)) == set()
+
+    def test_threshold_flows_to_config_and_name(self):
+        c = compose(QWEN_TIS, TIS_THRESHOLD="4")
+        assert c["algorithm"]["rollout_correction"]["rollout_is_threshold"] == 4.0
+        assert " tis-C4 seed-1" in c["trainer"]["experiment_name"]
+
+    def test_wrapper_forwards_env_knobs_and_cli_overrides(self):
+        c = compose(QWEN_TIS, args=("trainer.total_training_steps=3",), SEED="7", ROLLOUT_QUANT="fp8")
+        assert c["trainer"]["total_training_steps"] == 3
+        assert c["actor_rollout_ref"]["rollout"]["seed"] == 7
+        assert c["trainer"]["experiment_name"].endswith("rollout-fp8 seed-7")
+
+    def test_emulation_tag_still_last(self):
+        c = compose(QWEN_TIS, ROLLOUT_QUANT="fp8", VERL_GPU_MEM_CAP_GB="108", gpu_memory_utilization="0.283")
+        assert c["trainer"]["experiment_name"].endswith("tis-C2.0 rollout-fp8 seed-1 h100-emu-108gb-gmu0.283")
+
+    def test_toggles_do_not_leak_into_other_arms(self):
+        for script in (PANGU, ORZ):
+            c = compose(script)
+            assert c["actor_rollout_ref"]["rollout"]["quantization"] is None
+            assert c["algorithm"]["rollout_correction"]["rollout_is"] is None
+
+    def test_fp8_without_tis_is_allowed_with_a_warning(self, tmp_path):
+        rc, out, err = _run(QWEN, env={"ROLLOUT_QUANT": "fp8"}, tmp=tmp_path)
+        assert rc == 0, err[-2000:]
+        assert "WARNING: ROLLOUT_QUANT=fp8 without TIS" in err
+        assert yaml.safe_load(out)["actor_rollout_ref"]["rollout"]["quantization"] == "fp8"
+
+    def test_no_warning_with_tis(self, tmp_path):
+        rc, _, err = _run(QWEN_TIS, env={"ROLLOUT_QUANT": "fp8"}, tmp=tmp_path)
+        assert rc == 0 and "WARNING: ROLLOUT_QUANT" not in err
+
+
+@pytest.mark.parametrize("script", [QWEN, QWEN_TIS])
+@pytest.mark.parametrize(
+    "env, message",
+    [
+        ({"ROLLOUT_QUANT": "int8"}, "ROLLOUT_QUANT must be"),
+        ({"ROLLOUT_QUANT": "FP8"}, "ROLLOUT_QUANT must be"),
+        ({"TIS": "yes"}, "TIS must be"),
+        ({"TIS_THRESHOLD": "abc"}, "TIS_THRESHOLD must be"),
+        ({"TIS_THRESHOLD": "0"}, "TIS_THRESHOLD must be"),
+        ({"TIS_THRESHOLD": "-1"}, "TIS_THRESHOLD must be"),
+    ],
+)
+def test_invalid_toggles_fail_fast(script, env, message, tmp_path):
+    rc, _, err = _run(script, env=env, tmp=tmp_path)
+    assert rc == 2, err[-2000:]
+    assert message in err

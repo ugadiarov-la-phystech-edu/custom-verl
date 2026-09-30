@@ -249,6 +249,36 @@ val_top_p=${val_top_p:-0.7}
 # bypass_mode stays false (old_log_probs recomputed by the trainer).
 calculate_log_probs=True
 
+# ================= Rollout precision / TIS toggles =================
+# Defaults reproduce the baseline (bf16 rollout, no correction). Both toggles are tagged in exp_name.
+#   ROLLOUT_QUANT=bf16|fp8  vLLM rollout precision. fp8 = verl's native online block-FP8
+#       (actor_rollout_ref.rollout.quantization=fp8): the trainer stays bf16 and every weight sync
+#       re-quantizes Linear weights to 128x128-block FP8 inside vLLM; embeddings, lm_head and norms stay
+#       bf16. The same gpu_memory_utilization now leaves ~8 GB more for KV cache (weights halve).
+#   TIS=False|True          truncated importance sampling (Yao et al., "Your Efficient RL Framework
+#       Secretly Brings You Off-Policy RL Training"): every token's PPO loss is scaled by
+#       min(pi_trainer_old / pi_vllm, TIS_THRESHOLD), computed from the cached rollout log-probs
+#       (algorithm.rollout_correction.rollout_is=token, decoupled mode, bypass_mode=false).
+#   TIS_THRESHOLD           the cap C (default 2.0, as in verl's FP8 guide and FlashRL's TIS-2).
+# FP8 rollout without TIS collapsed in FlashRL's experiments; it is allowed here only for ablations.
+ROLLOUT_QUANT=${ROLLOUT_QUANT:-bf16}
+TIS=${TIS:-False}
+TIS_THRESHOLD=${TIS_THRESHOLD:-2.0}
+case "${ROLLOUT_QUANT}" in
+    bf16) rollout_quantization=null; quant_tag="" ;;
+    fp8) rollout_quantization=fp8; quant_tag=" rollout-fp8" ;;
+    *) echo "ROLLOUT_QUANT must be bf16 or fp8, got '${ROLLOUT_QUANT}'" >&2; exit 2 ;;
+esac
+[[ "${TIS_THRESHOLD}" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk "BEGIN{exit !(${TIS_THRESHOLD} > 0)}" || { echo "TIS_THRESHOLD must be a positive number, got '${TIS_THRESHOLD}'" >&2; exit 2; }
+case "${TIS}" in
+    True|true|1) rollout_is=token; tis_tag=" tis-C${TIS_THRESHOLD}" ;;
+    False|false|0) rollout_is=null; tis_tag="" ;;
+    *) echo "TIS must be True or False, got '${TIS}'" >&2; exit 2 ;;
+esac
+if [[ "${rollout_quantization}" == "fp8" && "${rollout_is}" == "null" ]]; then
+    echo "WARNING: ROLLOUT_QUANT=fp8 without TIS; quantized rollouts without TIS collapsed in FlashRL's runs" >&2
+fi
+
 # ================= Trainer =================
 test_freq=${test_freq:-2}    # rollout steps (= 8 optimizer updates)
 save_freq=${save_freq:-2}    # rollout steps
@@ -283,7 +313,7 @@ NNODES=${NNODES:-1}
 n_gpus_per_node=${n_gpus_per_node:-8}
 
 # ================= Logging =================
-exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} mini-${train_prompt_mini_bsz} ppo-epochs-${ppo_epochs} DAPO17K-AIME24-25 Qwen3-8B tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd seed-${SEED}${emu_tag}"}
+exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} mini-${train_prompt_mini_bsz} ppo-epochs-${ppo_epochs} DAPO17K-AIME24-25 Qwen3-8B tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${tis_tag}${quant_tag} seed-${SEED}${emu_tag}"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -359,6 +389,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.top_p=${top_p} \
     actor_rollout_ref.rollout.top_k=${top_k} \
     actor_rollout_ref.rollout.calculate_log_probs=${calculate_log_probs} \
+    actor_rollout_ref.rollout.quantization=${rollout_quantization} \
+    algorithm.rollout_correction.rollout_is=${rollout_is} \
+    algorithm.rollout_correction.rollout_is_threshold=${TIS_THRESHOLD} \
     actor_rollout_ref.rollout.val_kwargs.temperature=${val_temperature} \
     actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p} \
     actor_rollout_ref.rollout.val_kwargs.top_k=-1 \
