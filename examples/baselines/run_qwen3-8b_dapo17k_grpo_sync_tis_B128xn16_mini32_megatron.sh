@@ -51,6 +51,21 @@
 # gpu_memory_utilization=0.5 (~21 GiB KV per GPU), and halving the weights adds ~8 GB of KV.
 # Measure before assuming a speedup (verl's published FP8 numbers are from H100).
 #
+# DEEPGEMM (FP8 rollout kernels). vLLM runs block-FP8 linears through DeepGEMM, which JIT-compiles its
+# kernels and therefore needs a CUDA toolkit (CUDA_HOME); without one its import fails and vLLM falls
+# back to slower kernels. On remote_h100 (no system toolkit) a userspace CUDA 12.9 toolkit lives at
+# DEEPGEMM_CUDA_HOME=/home/jovyan/ugadiarov/cuda-12.9. When CUDA_HOME is unset and that toolkit exists,
+# this script exports:
+#   CUDA_HOME=$DEEPGEMM_CUDA_HOME
+#   DG_JIT_CACHE_DIR=/home/jovyan/ugadiarov/cache/deep_gemm   compiled kernels on persistent NFS (vLLM's
+#       default ~/.cache/vllm/deep_gemm is /home/user, which is lost when the job is recreated)
+#   VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER=0   vLLM would otherwise JIT FlashInfer's small-batch (M < 32)
+#       block-FP8 GEMM too, which needs cuBLAS/cuRAND headers the userspace toolkit lacks and crashes
+#       engine start-up; with 0, DeepGEMM serves every batch size.
+# Each is left alone if already set, and nothing is exported where the toolkit is absent. Verified on
+# remote_h100 (2026-09-30): DeepGEMM kernels compile with it and run correctly on the 12.6 driver for
+# all Qwen3-1.7B/8B linear shapes. bf16 rollout does not use DeepGEMM.
+#
 # Any env knob or trailing Hydra override of the base script still applies, e.g.
 #   TIS_THRESHOLD=2 max_updates=200 ROLLOUT_QUANT=fp8 bash <this script>
 
@@ -63,4 +78,11 @@ export clip_ratio_c=${clip_ratio_c:-10.0}
 export lr_warmup_steps=${lr_warmup_steps:-10}
 export weight_decay=${weight_decay:-0.1}
 export DYNAMIC_BSZ=${DYNAMIC_BSZ:-True}
+
+DEEPGEMM_CUDA_HOME=${DEEPGEMM_CUDA_HOME:-/home/jovyan/ugadiarov/cuda-12.9}
+if [[ -z "${CUDA_HOME:-}" && -x "${DEEPGEMM_CUDA_HOME}/bin/nvcc" ]]; then
+    export CUDA_HOME="${DEEPGEMM_CUDA_HOME}"
+    export DG_JIT_CACHE_DIR=${DG_JIT_CACHE_DIR:-/home/jovyan/ugadiarov/cache/deep_gemm}
+    export VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER=${VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER:-0}
+fi
 exec bash "$(dirname "${BASH_SOURCE[0]}")/run_qwen3-8b_dapo17k_grpo_sync_B128xn16_mini32_megatron.sh" "$@"
