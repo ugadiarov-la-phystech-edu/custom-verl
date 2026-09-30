@@ -54,6 +54,7 @@ SCRIPT_ENV_KNOBS = {
     "DYNAMIC_BSZ",
     "DYNAMIC_BSZ_MAX_TOKENS",
     "DYNAMIC_BSZ_LOG_PROB_MAX_TOKENS",
+    "DEEPGEMM_CUDA_HOME",
 }
 
 
@@ -636,3 +637,107 @@ def test_invalid_dynamic_bsz_settings_fail_fast(script, env, message, tmp_path):
     rc, _, err = _run(script, env=env, tmp=tmp_path)
     assert rc == 2, err[-2000:]
     assert message in err
+
+
+@pytest.mark.parametrize("script", [QWEN, QWEN_TIS])
+def test_warmup_longer_than_a_short_run_fails_fast(script, tmp_path):
+    # 40 updates = 10 rollout steps; the TIS script warms up for 10 -> Megatron would assert at init
+    env = {"max_updates": "40", "lr_warmup_steps": "10"}
+    rc, _, err = _run(script, env=env, tmp=tmp_path)
+    assert rc == 2, err[-2000:]
+    assert "lr_warmup_steps=10 must be < the 10 rollout steps" in err
+
+
+def test_warmup_shorter_than_the_run_is_fine():
+    c = compose(QWEN_TIS, max_updates="44")  # 11 rollout steps > 10 warmup steps
+    assert c["trainer"]["total_training_steps"] == 11
+    assert c["actor_rollout_ref"]["actor"]["optim"]["lr_warmup_steps"] == 10
+
+
+# --------------------------------------------------------------------------- DeepGEMM env (TIS script)
+
+DEEPGEMM_VARS = ("CUDA_HOME", "DG_JIT_CACHE_DIR", "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER")
+
+
+def _env_seen_by_python(script, tmp_path, env=None):
+    """Run a script with a stand-in python3 that prints the DeepGEMM-related env it was given."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    fake = bindir / "python3"
+    lines = "".join(f'echo "{v}=${{{v}-<unset>}}"\n' for v in DEEPGEMM_VARS)
+    fake.write_text("#!/bin/sh\n" + lines)
+    fake.chmod(0o755)
+    base = {k: v for k, v in os.environ.items() if k not in SCRIPT_ENV_KNOBS and k not in DEEPGEMM_VARS}
+    base.pop("DEEPGEMM_CUDA_HOME", None)
+    base["PATH"] = f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}"
+    base.update(env or {})
+    proc = subprocess.run(
+        ["bash", str(SCRIPTS / script)], cwd=tmp_path, env=base, capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    return dict(line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line)
+
+
+def _fake_toolkit(tmp_path):
+    toolkit = tmp_path / "cuda-12.9"
+    (toolkit / "bin").mkdir(parents=True)
+    nvcc = toolkit / "bin" / "nvcc"
+    nvcc.write_text("#!/bin/sh\n")
+    nvcc.chmod(0o755)
+    return toolkit
+
+
+class TestDeepGemmEnv:
+    def test_exports_all_three_when_the_toolkit_exists(self, tmp_path):
+        toolkit = _fake_toolkit(tmp_path)
+        seen = _env_seen_by_python(QWEN_TIS, tmp_path, {"DEEPGEMM_CUDA_HOME": str(toolkit)})
+        assert seen == {
+            "CUDA_HOME": str(toolkit),
+            "DG_JIT_CACHE_DIR": "/home/jovyan/ugadiarov/cache/deep_gemm",
+            "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER": "0",
+        }
+
+    def test_exports_nothing_where_the_toolkit_is_absent(self, tmp_path):
+        seen = _env_seen_by_python(QWEN_TIS, tmp_path, {"DEEPGEMM_CUDA_HOME": str(tmp_path / "missing")})
+        assert set(seen.values()) == {"<unset>"}
+
+    def test_a_toolkit_dir_without_nvcc_is_ignored(self, tmp_path):
+        (tmp_path / "cuda-no-nvcc" / "bin").mkdir(parents=True)
+        seen = _env_seen_by_python(QWEN_TIS, tmp_path, {"DEEPGEMM_CUDA_HOME": str(tmp_path / "cuda-no-nvcc")})
+        assert set(seen.values()) == {"<unset>"}
+
+    def test_an_existing_cuda_home_is_left_alone(self, tmp_path):
+        # a full system toolkit: keep it, and keep vLLM's FlashInfer small-batch path enabled
+        toolkit = _fake_toolkit(tmp_path)
+        seen = _env_seen_by_python(
+            QWEN_TIS, tmp_path, {"DEEPGEMM_CUDA_HOME": str(toolkit), "CUDA_HOME": "/usr/local/cuda-12.9"}
+        )
+        assert seen == {
+            "CUDA_HOME": "/usr/local/cuda-12.9",
+            "DG_JIT_CACHE_DIR": "<unset>",
+            "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER": "<unset>",
+        }
+
+    def test_explicit_cache_dir_and_flashinfer_flag_win(self, tmp_path):
+        toolkit = _fake_toolkit(tmp_path)
+        seen = _env_seen_by_python(
+            QWEN_TIS,
+            tmp_path,
+            {
+                "DEEPGEMM_CUDA_HOME": str(toolkit),
+                "DG_JIT_CACHE_DIR": "/scratch/dg",
+                "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER": "1",
+            },
+        )
+        assert seen["DG_JIT_CACHE_DIR"] == "/scratch/dg"
+        assert seen["VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER"] == "1"
+        assert seen["CUDA_HOME"] == str(toolkit)
+
+    def test_baseline_script_exports_nothing(self, tmp_path):
+        toolkit = _fake_toolkit(tmp_path)
+        seen = _env_seen_by_python(QWEN, tmp_path, {"DEEPGEMM_CUDA_HOME": str(toolkit)})
+        assert set(seen.values()) == {"<unset>"}
+
+    def test_config_is_unaffected(self, tmp_path):
+        toolkit = _fake_toolkit(tmp_path)
+        assert _diff(compose(QWEN_TIS), compose(QWEN_TIS, DEEPGEMM_CUDA_HOME=str(toolkit))) == set()

@@ -18,4 +18,11 @@ export clip_ratio_c=${clip_ratio_c:-10.0}
 export lr_warmup_steps=${lr_warmup_steps:-10}
 export weight_decay=${weight_decay:-0.1}
 export DYNAMIC_BSZ=${DYNAMIC_BSZ:-True}
+
+DEEPGEMM_CUDA_HOME=${DEEPGEMM_CUDA_HOME:-/home/jovyan/ugadiarov/cuda-12.9}
+if [[ -z "${CUDA_HOME:-}" && -x "${DEEPGEMM_CUDA_HOME}/bin/nvcc" ]]; then
+    export CUDA_HOME="${DEEPGEMM_CUDA_HOME}"
+    export DG_JIT_CACHE_DIR=${DG_JIT_CACHE_DIR:-/home/jovyan/ugadiarov/cache/deep_gemm}
+    export VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER=${VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER:-0}
+fi
 exec bash "$(dirname "${BASH_SOURCE[0]}")/run_qwen3-8b_dapo17k_grpo_sync_B128xn16_mini32_megatron.sh" "$@"

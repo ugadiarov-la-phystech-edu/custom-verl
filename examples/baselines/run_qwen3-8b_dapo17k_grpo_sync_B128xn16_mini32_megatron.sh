@@ -128,6 +128,7 @@ if [[ "${max_updates}" == "null" ]]; then
 else
     [[ "${max_updates}" =~ ^[1-9][0-9]*$ ]] || { echo "max_updates must be a positive integer or null, got '${max_updates}'" >&2; exit 2; }
     total_training_steps=$(( (max_updates + updates_per_step - 1) / updates_per_step ))
+    (( lr_warmup_steps < total_training_steps )) || { echo "lr_warmup_steps=${lr_warmup_steps} must be < the ${total_training_steps} rollout steps that max_updates=${max_updates} allows; lower lr_warmup_steps (e.g. lr_warmup_steps=0 for smoke runs) or raise max_updates" >&2; exit 2; }
 fi
 val_before_train=${val_before_train:-True}
 save_contents=${save_contents:-"['hf_model']"}
