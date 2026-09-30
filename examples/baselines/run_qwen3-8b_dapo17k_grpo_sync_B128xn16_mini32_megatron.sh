@@ -71,6 +71,24 @@ val_temperature=${val_temperature:-0.8}
 val_top_p=${val_top_p:-0.7}
 calculate_log_probs=True
 
+ROLLOUT_QUANT=${ROLLOUT_QUANT:-bf16}
+TIS=${TIS:-False}
+TIS_THRESHOLD=${TIS_THRESHOLD:-2.0}
+case "${ROLLOUT_QUANT}" in
+    bf16) rollout_quantization=null; quant_tag="" ;;
+    fp8) rollout_quantization=fp8; quant_tag=" rollout-fp8" ;;
+    *) echo "ROLLOUT_QUANT must be bf16 or fp8, got '${ROLLOUT_QUANT}'" >&2; exit 2 ;;
+esac
+[[ "${TIS_THRESHOLD}" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk "BEGIN{exit !(${TIS_THRESHOLD} > 0)}" || { echo "TIS_THRESHOLD must be a positive number, got '${TIS_THRESHOLD}'" >&2; exit 2; }
+case "${TIS}" in
+    True|true|1) rollout_is=token; tis_tag=" tis-C${TIS_THRESHOLD}" ;;
+    False|false|0) rollout_is=null; tis_tag="" ;;
+    *) echo "TIS must be True or False, got '${TIS}'" >&2; exit 2 ;;
+esac
+if [[ "${rollout_quantization}" == "fp8" && "${rollout_is}" == "null" ]]; then
+    echo "WARNING: ROLLOUT_QUANT=fp8 without TIS; quantized rollouts without TIS collapsed in FlashRL's runs" >&2
+fi
+
 test_freq=${test_freq:-2}
 save_freq=${save_freq:-2}
 total_epochs=${total_epochs:-3}
@@ -91,7 +109,7 @@ resume_mode=${resume_mode:-disable}
 NNODES=${NNODES:-1}
 n_gpus_per_node=${n_gpus_per_node:-8}
 
-exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} mini-${train_prompt_mini_bsz} ppo-epochs-${ppo_epochs} DAPO17K-AIME24-25 Qwen3-8B tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd seed-${SEED}${emu_tag}"}
+exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} mini-${train_prompt_mini_bsz} ppo-epochs-${ppo_epochs} DAPO17K-AIME24-25 Qwen3-8B tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${tis_tag}${quant_tag} seed-${SEED}${emu_tag}"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -167,6 +185,9 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.top_p=${top_p} \
     actor_rollout_ref.rollout.top_k=${top_k} \
     actor_rollout_ref.rollout.calculate_log_probs=${calculate_log_probs} \
+    actor_rollout_ref.rollout.quantization=${rollout_quantization} \
+    algorithm.rollout_correction.rollout_is=${rollout_is} \
+    algorithm.rollout_correction.rollout_is_threshold=${TIS_THRESHOLD} \
     actor_rollout_ref.rollout.val_kwargs.temperature=${val_temperature} \
     actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p} \
     actor_rollout_ref.rollout.val_kwargs.top_k=-1 \
