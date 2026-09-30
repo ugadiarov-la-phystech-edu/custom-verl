@@ -32,6 +32,7 @@ from PIL import Image
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
 
+from verl.utils.dataset.prompt_utils import maybe_prepend_bos
 from verl.utils.import_utils import load_extern_object
 from verl.utils.tokenizer import build_multimodal_processor_inputs, normalize_token_ids
 
@@ -119,6 +120,7 @@ class RLHFDataset(Dataset):
         self.filter_overlong_prompts = config.get("filter_overlong_prompts", True)
         self.apply_chat_template_kwargs = config.get("apply_chat_template_kwargs", {})
         self.mm_processor_kwargs = config.get("mm_processor_kwargs", {})
+        self.add_bos_token_to_prompt = bool(config.get("add_bos_token_to_prompt", False))
 
         # Mirror AgentLoopWorker's tool loading so length filtering sees the
         # same schemas the rollout will.
@@ -256,6 +258,12 @@ class RLHFDataset(Dataset):
                         apply_kwargs.pop("return_dict", None)
                         apply_kwargs.pop("return_tensors", None)
 
+                        if self.add_bos_token_to_prompt:
+                            raw_prompt = tokenizer.apply_chat_template(
+                                doc[prompt_key], add_generation_prompt=True, tokenize=False, **apply_kwargs
+                            )
+                            prompt_ids = tokenizer.encode(raw_prompt, add_special_tokens=False)
+                            return len(maybe_prepend_bos(tokenizer, raw_prompt, prompt_ids, enabled=True))
                         tokenized_prompt = tokenizer.apply_chat_template(
                             doc[prompt_key], add_generation_prompt=True, tokenize=True, **apply_kwargs
                         )

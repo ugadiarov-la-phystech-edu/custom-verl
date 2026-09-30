@@ -50,6 +50,7 @@ from verl.protocol import DataProto
 from verl.tools.tool_registry import load_all_tools
 from verl.trainer.distillation import is_distillation_enabled
 from verl.utils.config import omega_conf_to_dataclass
+from verl.utils.dataset.prompt_utils import maybe_prepend_bos
 from verl.utils.dataset.rl_dataset import RLHFDataset, get_dataset_class
 from verl.utils.model import compute_position_id_with_mask
 from verl.utils.profiler import simple_timer
@@ -235,6 +236,7 @@ class AgentLoopBase(ABC):
         self.data_config = data_config.config
         self.apply_chat_template_kwargs = self.data_config.get("apply_chat_template_kwargs", {})
         self.mm_processor_kwargs = self.data_config.get("mm_processor_kwargs", {})
+        self.add_bos_token_to_prompt = bool(self.data_config.get("add_bos_token_to_prompt", False))
         self.continuous_token_builder = None
         self.enable_continuous_token = False
         continuous_token_config = self.data_config.continuous_token
@@ -424,6 +426,20 @@ class AgentLoopBase(ABC):
                 else self._get_mm_processor_kwargs(audios),
             )
             prompt_ids = normalize_token_ids(model_inputs.pop("input_ids"))
+        elif self.add_bos_token_to_prompt and not remove_system_prompt:
+            raw_prompt = await self.loop.run_in_executor(
+                None,
+                lambda: apply_chat_template(
+                    self.tokenizer,
+                    messages,
+                    tools=tools,
+                    add_generation_prompt=True,
+                    tokenize=False,
+                    **self.apply_chat_template_kwargs,
+                ),
+            )
+            encoded = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
+            prompt_ids = maybe_prepend_bos(self.tokenizer, raw_prompt, encoded, enabled=True)
         else:
             tokenized_prompt = await self.loop.run_in_executor(
                 None,
