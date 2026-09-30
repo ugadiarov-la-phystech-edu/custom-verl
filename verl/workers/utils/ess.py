@@ -21,7 +21,18 @@ import torch.distributed as dist
 
 from verl.utils.device import get_device_name, is_device_available
 
-__all__ = ["ess_from_log_weights", "compute_global_ess_from_log_weights", "compute_min_ess_lr_scale"]
+__all__ = [
+    "seq_log_is_sums",
+    "ess_from_log_weights",
+    "compute_global_ess_from_log_weights",
+    "compute_min_ess_lr_scale",
+]
+
+
+def seq_log_is_sums(log_prob: torch.Tensor, rollout_log_prob: torch.Tensor, response_mask: torch.Tensor) -> list[float]:
+    mask = response_mask.bool()
+    diff = (log_prob.detach().double() - rollout_log_prob.detach().double()).masked_fill(~mask, 0.0)
+    return diff.sum(dim=-1)[mask.any(dim=-1)].tolist()
 
 
 def _clamped_exponents(seq_log_is: Sequence[float], rollout_is_threshold: float | None):

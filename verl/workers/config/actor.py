@@ -34,6 +34,7 @@ from .model import HFModelConfig
 from .optimizer import OptimizerConfig
 
 __all__ = [
+    "ESSScalingConfig",
     "PolicyLossConfig",
     "RouterReplayConfig",
     "ActorConfig",
@@ -44,6 +45,19 @@ __all__ = [
     "TorchTitanActorConfig",
     "MindSpeedActorConfig",
 ]
+
+
+@dataclass
+class ESSScalingConfig(BaseConfig):
+
+    enable: bool = False
+    min_ess: float = 1.1
+    lr_scale: float = 0.5
+    use_clipped: bool = False
+
+    def __post_init__(self):
+        assert self.min_ess >= 1, f"ess_scaling.min_ess must be >= 1 (ESS floors at 1), got {self.min_ess}"
+        assert 0 < self.lr_scale <= 1, f"ess_scaling.lr_scale must be in (0, 1], got {self.lr_scale}"
 
 
 @dataclass
@@ -170,6 +184,7 @@ class ActorConfig(BaseConfig):
     tau_pos: float = 1.0
     tau_neg: float = 1.05
     calculate_entropy: bool = False
+    ess_scaling: ESSScalingConfig = field(default_factory=ESSScalingConfig)
     calculate_sum_pi_squared: bool = False
     use_kl_loss: bool = False
     # Whether to enable PrefixGrouper-based shared-prefix forward

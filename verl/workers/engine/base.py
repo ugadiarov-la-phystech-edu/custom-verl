@@ -110,7 +110,9 @@ class BaseEngine:
         """
         raise NotImplementedError
 
-    def train_batch(self, data: TensorDict, loss_function: Callable) -> Any:
+    def train_batch(
+        self, data: TensorDict, loss_function: Callable, pre_optimizer_step_hook: Optional[Callable] = None
+    ) -> Any:
         """
         Perform a training step on a batch of data.
 
@@ -125,11 +127,21 @@ class BaseEngine:
 
         self.optimizer_zero_grad()
         outputs = self.forward_backward_batch(data, loss_function, forward_only=False)
-        grad_norm = self.optimizer_step()
+        if pre_optimizer_step_hook is not None:
+            with pre_optimizer_step_hook(self, data, outputs):
+                grad_norm = self.optimizer_step()
+        else:
+            grad_norm = self.optimizer_step()
         if self.is_mp_src_rank_with_outputs():
             assert "grad_norm" not in outputs["metrics"]
             outputs["metrics"]["grad_norm"] = grad_norm
         return outputs
+
+    def get_optimizer_param_groups(self) -> list[dict]:
+        return self.optimizer.param_groups
+
+    def get_ess_reduction_group(self):
+        return self.get_data_parallel_group()
 
     def infer_batch(self, data: TensorDict, loss_function: Optional[Callable] = None) -> Any:
         """
