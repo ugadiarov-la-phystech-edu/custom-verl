@@ -260,6 +260,12 @@ def _bare_trainer(mini=4, first=None, rmb=1.0, fresh=0.0, timeout=3600.0, queue=
     t._replay_fresh_wait_s = 0.0
     t._replay_fresh_floor_waived = 0
     t.message_queue_client = queue or _Queue()
+    t.virtual_free_time = None
+    t._step_virtual_start = None
+    t._step_actual_start = None
+    t._step_wait_valid_time = 0.0
+    t._step_save_time = 0.0
+    t.cumulative_save_time = 0.0
     t.config = OmegaConf.create(
         {
             "trainer": {"balance_batch": False},

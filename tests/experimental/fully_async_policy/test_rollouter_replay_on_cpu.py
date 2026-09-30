@@ -139,6 +139,10 @@ def _bare_rollouter(events=None, replay=True, norm=True, ramp=(), serialize=Fals
     r.serialize_validation = serialize
     r.pause_generation_during_save = save_pause
     r._hard_pause_reasons = set()
+    r.first_sample_time = None
+    r.cumulative_validation_time = 0.0
+    r.cumulative_checkpoint_pause = 0.0
+    r._save_pause_start = None
     for name in (
         "groups_completed_total",
         "all_correct_groups_total",

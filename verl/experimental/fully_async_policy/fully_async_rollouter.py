@@ -465,6 +465,13 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.serialize_validation = bool(config.async_training.get("serialize_validation", False))
         self.pause_generation_during_save = bool(config.async_training.get("pause_generation_during_save", False))
         self._hard_pause_reasons: set[str] = set()
+        # Virtual-timeline bookkeeping (the trainer's fully_async/timing/*): the wall-clock anchor is the
+        # first draw from the training dataloader; validation time and save-pause time count only after it
+        # (val_before_train is excluded).
+        self.first_sample_time = None
+        self.cumulative_validation_time = 0.0
+        self.cumulative_checkpoint_pause = 0.0
+        self._save_pause_start = None
         if self.serialize_validation or self.pause_generation_during_save:
             # the freeze aborts in-flight requests; only partial rollout resumes them instead of dropping
             assert config.async_training.partial_rollout, (
@@ -721,6 +728,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             with marked_timer("rollouter/validate_time", timing_raw, color="green"):
                 # _validate drives the agent loop synchronously and blocks this actor's event loop
                 val_metrics: dict = self._validate()
+            if self.first_sample_time is not None:
+                # generation is held (event loop blocked, or serialized) for the whole validation
+                self.cumulative_validation_time += timing_raw["rollouter/validate_time"]
         finally:
             if self.serialize_validation:
                 await self._end_hard_pause("validation")
@@ -728,11 +738,24 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
     async def begin_save_pause(self):
         """Freeze generation for a whole trainer checkpoint save (async_training.pause_generation_during_save)."""
+        self._save_pause_start = time.time()
         await self._begin_hard_pause("save")
 
     async def end_save_pause(self):
-        """Resume generation after a trainer checkpoint save."""
+        """Resume generation after a trainer checkpoint save; the frozen window shifts later samples'
+        virtual arrival times (post-anchor only)."""
         await self._end_hard_pause("save")
+        if self._save_pause_start is not None and self.first_sample_time is not None:
+            self.cumulative_checkpoint_pause += time.time() - self._save_pause_start
+        self._save_pause_start = None
+
+    def get_timing_state(self) -> dict:
+        """The rollouter's side of the virtual timeline, for the trainer's fully_async/timing/* metrics."""
+        return {
+            "first_sample_time": self.first_sample_time,
+            "cumulative_validation_time": self.cumulative_validation_time,
+            "cumulative_checkpoint_pause": self.cumulative_checkpoint_pause,
+        }
 
     def is_hard_paused(self) -> bool:
         """Whether a stop-the-world pause currently holds generation."""
@@ -1001,6 +1024,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         continuous_iterator = self._create_continuous_iterator()
 
         for epoch, batch_dict in continuous_iterator:
+            if self.first_sample_time is None:
+                self.first_sample_time = time.time()
             # Similar to _prepare_generate_batch: Separate data
             full_batch = prepare_single_generation_data(batch_dict, self.config)
 
@@ -1150,6 +1175,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             self.processed_sample_count += 1
             return
         rollout_sample.rollout_status = await self.get_statistics()
+        rollout_sample.enqueue_time = time.time()
+        rollout_sample.validation_pause_before = self.cumulative_validation_time
+        rollout_sample.checkpoint_pause_before = self.cumulative_checkpoint_pause
 
         success = await self.message_queue_client.put_sample(
             sample=ray.cloudpickle.dumps(rollout_sample),
