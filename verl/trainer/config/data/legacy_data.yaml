@@ -118,6 +118,11 @@ return_multi_modal_inputs: True
 # Additional kwargs when calling tokenizer.apply_chat_template
 apply_chat_template_kwargs: {}
 
+# Prepend the tokenizer's BOS token to text prompts, as a plain tokenizer(text) call would, for models
+# whose chat template does not emit BOS itself (e.g. openPangu). No-op for tokenizers without
+# add_bos_token (Qwen) and for templates that already start with BOS (Llama-3).
+add_bos_token_to_prompt: false
+
 # Continuous Token keeps the runtime token stream across multi-turn rollout instead of reconstructing previous assistant turns from text.
 # Disabled by default for compatibility.
 continuous_token:

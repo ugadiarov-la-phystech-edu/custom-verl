@@ -542,6 +542,7 @@ data:
     name: null
   return_multi_modal_inputs: true
   apply_chat_template_kwargs: {}
+  add_bos_token_to_prompt: false
   continuous_token:
     enable: false
     model_family: auto
