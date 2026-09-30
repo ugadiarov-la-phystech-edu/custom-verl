@@ -456,6 +456,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.serialize_validation = bool(config.async_training.get("serialize_validation", False))
         self.pause_generation_during_save = bool(config.async_training.get("pause_generation_during_save", False))
         self._hard_pause_reasons: set[str] = set()
+        self.first_sample_time = None
+        self.cumulative_validation_time = 0.0
+        self.cumulative_checkpoint_pause = 0.0
+        self._save_pause_start = None
         if self.serialize_validation or self.pause_generation_during_save:
             assert config.async_training.partial_rollout, (
                 "async_training.serialize_validation / pause_generation_during_save require "
@@ -707,16 +711,29 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             timing_raw = {}
             with marked_timer("rollouter/validate_time", timing_raw, color="green"):
                 val_metrics: dict = self._validate()
+            if self.first_sample_time is not None:
+                self.cumulative_validation_time += timing_raw["rollouter/validate_time"]
         finally:
             if self.serialize_validation:
                 await self._end_hard_pause("validation")
         return timing_raw | val_metrics
 
     async def begin_save_pause(self):
+        self._save_pause_start = time.time()
         await self._begin_hard_pause("save")
 
     async def end_save_pause(self):
         await self._end_hard_pause("save")
+        if self._save_pause_start is not None and self.first_sample_time is not None:
+            self.cumulative_checkpoint_pause += time.time() - self._save_pause_start
+        self._save_pause_start = None
+
+    def get_timing_state(self) -> dict:
+        return {
+            "first_sample_time": self.first_sample_time,
+            "cumulative_validation_time": self.cumulative_validation_time,
+            "cumulative_checkpoint_pause": self.cumulative_checkpoint_pause,
+        }
 
     def is_hard_paused(self) -> bool:
         return bool(self._hard_pause_reasons)
@@ -974,6 +991,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         continuous_iterator = self._create_continuous_iterator()
 
         for epoch, batch_dict in continuous_iterator:
+            if self.first_sample_time is None:
+                self.first_sample_time = time.time()
             # Similar to _prepare_generate_batch: Separate data
             full_batch = prepare_single_generation_data(batch_dict, self.config)
 
@@ -1122,6 +1141,9 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             self.processed_sample_count += 1
             return
         rollout_sample.rollout_status = await self.get_statistics()
+        rollout_sample.enqueue_time = time.time()
+        rollout_sample.validation_pause_before = self.cumulative_validation_time
+        rollout_sample.checkpoint_pause_before = self.cumulative_checkpoint_pause
 
         success = await self.message_queue_client.put_sample(
             sample=ray.cloudpickle.dumps(rollout_sample),

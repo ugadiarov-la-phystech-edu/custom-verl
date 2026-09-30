@@ -15,7 +15,7 @@ import asyncio
 import time
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 import torch
@@ -39,6 +39,10 @@ class RolloutSample:
     rollout_status: dict[str, Any]
 
     group_version: int = 0
+
+    enqueue_time: Optional[float] = None
+    validation_pause_before: float = 0.0
+    checkpoint_pause_before: float = 0.0
 
 
 def prepare_single_generation_data(batch_dict, config) -> DataProto:
