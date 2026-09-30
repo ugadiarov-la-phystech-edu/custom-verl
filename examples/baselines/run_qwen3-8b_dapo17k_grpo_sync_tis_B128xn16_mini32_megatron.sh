@@ -17,4 +17,5 @@ export clip_ratio_high=${clip_ratio_high:-0.28}
 export clip_ratio_c=${clip_ratio_c:-10.0}
 export lr_warmup_steps=${lr_warmup_steps:-10}
 export weight_decay=${weight_decay:-0.1}
+export DYNAMIC_BSZ=${DYNAMIC_BSZ:-True}
 exec bash "$(dirname "${BASH_SOURCE[0]}")/run_qwen3-8b_dapo17k_grpo_sync_B128xn16_mini32_megatron.sh" "$@"

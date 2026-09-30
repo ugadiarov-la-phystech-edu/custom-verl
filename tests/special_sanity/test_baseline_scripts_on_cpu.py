@@ -51,6 +51,9 @@ SCRIPT_ENV_KNOBS = {
     "clip_ratio_c",
     "lr_warmup_steps",
     "weight_decay",
+    "DYNAMIC_BSZ",
+    "DYNAMIC_BSZ_MAX_TOKENS",
+    "DYNAMIC_BSZ_LOG_PROB_MAX_TOKENS",
 }
 
 
@@ -76,14 +79,19 @@ def _run(script, env=None, args=(), tmp=None):
         }
     )
     full_env.update(env or {})
-    proc = subprocess.run(
-        ["bash", str(SCRIPTS / script), *args, "--cfg", "job", "--resolve"],
-        cwd=workdir,
-        env=full_env,
-        capture_output=True,
-        text=True,
-        timeout=600,
-    )
+    for _ in range(2):
+        proc = subprocess.run(
+            ["bash", str(SCRIPTS / script), *args, "--cfg", "job", "--resolve"],
+            cwd=workdir,
+            env=full_env,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        # Retry once only if the Python interpreter itself crashed (bash reports 128 + SIGSEGV):
+        # observed once under 8 pytest-xdist workers, never reproduced. Real errors are not retried.
+        if proc.returncode != 128 + 11:
+            break
     return proc.returncode, proc.stdout, proc.stderr
 
 
@@ -373,6 +381,18 @@ def test_no_legacy_or_noop_overrides(script):
 
 # --------------------------------------------------------------------------- Qwen3-8B precision / TIS variants
 
+# Keys dynamic batching changes: the actor/rollout flags and caps, plus the ref/critic keys that
+# follow the actor through oc.select (inert: no ref model and no critic under GRPO without KL).
+DYNBSZ_KEYS = {
+    "actor_rollout_ref.actor.use_dynamic_bsz",
+    "actor_rollout_ref.actor.ppo_max_token_len_per_gpu",
+    "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz",
+    "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu",
+    "actor_rollout_ref.ref.log_prob_use_dynamic_bsz",
+    "actor_rollout_ref.ref.log_prob_max_token_len_per_gpu",
+    "critic.use_dynamic_bsz",
+}
+
 TOGGLE_KEYS = {
     "actor_rollout_ref.rollout.quantization",
     "algorithm.rollout_correction.rollout_is",
@@ -406,7 +426,9 @@ class TestQwenPrecisionAndTis:
         assert c["actor_rollout_ref"]["rollout"]["quantization"] is None
         assert c["actor_rollout_ref"]["rollout"]["calculate_log_probs"] is True
         assert c["actor_rollout_ref"]["rollout"]["logprobs_mode"] == "processed_logprobs"
-        assert c["trainer"]["experiment_name"].endswith(" 0.1-wd clip-0.2-0.28-c10.0 warmup-10 tis-C8 seed-1")
+        assert c["trainer"]["experiment_name"].endswith(
+            " 0.1-wd clip-0.2-0.28-c10.0 warmup-10 dynbsz-10240 tis-C8 seed-1"
+        )
 
     def test_fp8_tis(self):
         c = compose(QWEN_TIS, ROLLOUT_QUANT="fp8")
@@ -425,15 +447,19 @@ class TestQwenPrecisionAndTis:
         assert actor["optim"]["lr_decay_style"] == "constant"
         assert actor["optim"]["lr"] == 1e-6
 
-    def test_bf16_tis_differs_from_baseline_only_by_the_flashrl_knobs(self):
-        expected = {
-            "algorithm.rollout_correction.rollout_is",
-            "algorithm.rollout_correction.rollout_is_threshold",
-            "actor_rollout_ref.actor.clip_ratio_high",
-            "actor_rollout_ref.actor.clip_ratio_c",
-            "actor_rollout_ref.actor.optim.lr_warmup_steps",
-            "actor_rollout_ref.actor.optim.weight_decay",
-        } | NAME_DERIVED_KEYS
+    def test_bf16_tis_differs_from_baseline_only_by_the_flashrl_knobs_and_dynbsz(self):
+        expected = (
+            DYNBSZ_KEYS
+            | {
+                "algorithm.rollout_correction.rollout_is",
+                "algorithm.rollout_correction.rollout_is_threshold",
+                "actor_rollout_ref.actor.clip_ratio_high",
+                "actor_rollout_ref.actor.clip_ratio_c",
+                "actor_rollout_ref.actor.optim.lr_warmup_steps",
+                "actor_rollout_ref.actor.optim.weight_decay",
+            }
+            | NAME_DERIVED_KEYS
+        )
         assert _diff(compose(QWEN), compose(QWEN_TIS)) == expected
 
     def test_tis_script_with_baseline_knobs_is_a_tis_only_ablation(self):
@@ -444,6 +470,7 @@ class TestQwenPrecisionAndTis:
             clip_ratio_c="3.0",
             lr_warmup_steps="0",
             weight_decay="0.01",
+            DYNAMIC_BSZ="False",
         )
         assert _diff(compose(QWEN), ablation) == {"algorithm.rollout_correction.rollout_is"} | NAME_DERIVED_KEYS
         assert ablation["trainer"]["experiment_name"].endswith(" 0.01-wd tis-C2.0 seed-1")
@@ -476,6 +503,7 @@ class TestQwenPrecisionAndTis:
             clip_ratio_c="10.0",
             lr_warmup_steps="10",
             weight_decay="0.1",
+            DYNAMIC_BSZ="True",
         )
         assert _diff(compose(QWEN_TIS), compose(QWEN, **flashrl)) == set()
 
@@ -530,6 +558,81 @@ class TestQwenPrecisionAndTis:
     ],
 )
 def test_invalid_toggles_fail_fast(script, env, message, tmp_path):
+    rc, _, err = _run(script, env=env, tmp=tmp_path)
+    assert rc == 2, err[-2000:]
+    assert message in err
+
+
+# --------------------------------------------------------------------------- dynamic batch size
+
+
+class TestDynamicBatchSize:
+    def test_baseline_default_is_off_and_unchanged(self):
+        c = compose(QWEN)
+        assert c["actor_rollout_ref"]["actor"]["use_dynamic_bsz"] is False
+        assert c["actor_rollout_ref"]["rollout"]["log_prob_use_dynamic_bsz"] is False
+        assert "dynbsz" not in c["trainer"]["experiment_name"]
+        assert _diff(c, compose(QWEN, DYNAMIC_BSZ="False")) == set()
+
+    def test_on_sets_flags_and_caps_consistently(self):
+        c = compose(QWEN, DYNAMIC_BSZ="True")
+        actor, rollout = c["actor_rollout_ref"]["actor"], c["actor_rollout_ref"]["rollout"]
+        # engine_workers.py asserts these two flags are equal and both caps set
+        assert actor["use_dynamic_bsz"] is rollout["log_prob_use_dynamic_bsz"] is True
+        assert actor["ppo_max_token_len_per_gpu"] == 10240
+        assert rollout["log_prob_max_token_len_per_gpu"] == 10240
+        assert _diff(compose(QWEN), c) == DYNBSZ_KEYS | NAME_DERIVED_KEYS
+        assert c["trainer"]["experiment_name"].endswith(" 0.01-wd dynbsz-10240 seed-1")
+
+    def test_default_cap_is_one_full_sequence(self):
+        c = compose(QWEN, DYNAMIC_BSZ="True")
+        assert c["actor_rollout_ref"]["actor"]["ppo_max_token_len_per_gpu"] == (
+            c["data"]["max_prompt_length"] + c["data"]["max_response_length"]
+        )
+
+    def test_caps_are_configurable(self):
+        c = compose(QWEN, DYNAMIC_BSZ="True", DYNAMIC_BSZ_MAX_TOKENS="16384", DYNAMIC_BSZ_LOG_PROB_MAX_TOKENS="20480")
+        assert c["actor_rollout_ref"]["actor"]["ppo_max_token_len_per_gpu"] == 16384
+        assert c["actor_rollout_ref"]["rollout"]["log_prob_max_token_len_per_gpu"] == 20480
+        assert " dynbsz-16384 " in c["trainer"]["experiment_name"]
+
+    def test_log_prob_cap_follows_training_cap(self):
+        c = compose(QWEN, DYNAMIC_BSZ="True", DYNAMIC_BSZ_MAX_TOKENS="12288")
+        assert c["actor_rollout_ref"]["rollout"]["log_prob_max_token_len_per_gpu"] == 12288
+
+    def test_tis_script_enables_it(self):
+        c = compose(QWEN_TIS)
+        assert c["actor_rollout_ref"]["actor"]["use_dynamic_bsz"] is True
+        assert c["actor_rollout_ref"]["rollout"]["log_prob_use_dynamic_bsz"] is True
+        assert compose(QWEN_TIS, DYNAMIC_BSZ="False")["actor_rollout_ref"]["actor"]["use_dynamic_bsz"] is False
+
+    def test_passes_verl_config_validation(self):
+        from omegaconf import OmegaConf
+
+        from verl.trainer.ppo.utils import need_critic, need_reference_policy
+        from verl.utils.config import validate_config
+
+        for c in (compose(QWEN_TIS), compose(QWEN_TIS, ROLLOUT_QUANT="fp8")):
+            cfg = OmegaConf.create(c)
+            validate_config(config=cfg, use_reference_policy=need_reference_policy(cfg), use_critic=need_critic(cfg))
+
+    def test_toggle_does_not_leak_into_other_arms(self):
+        for script in (PANGU, ORZ):
+            assert compose(script)["actor_rollout_ref"]["actor"]["use_dynamic_bsz"] is False
+
+
+@pytest.mark.parametrize("script", [QWEN, QWEN_TIS])
+@pytest.mark.parametrize(
+    "env, message",
+    [
+        ({"DYNAMIC_BSZ": "maybe"}, "DYNAMIC_BSZ must be"),
+        ({"DYNAMIC_BSZ": "True", "DYNAMIC_BSZ_MAX_TOKENS": "8192"}, "must be >= max_prompt_length"),
+        ({"DYNAMIC_BSZ": "True", "DYNAMIC_BSZ_LOG_PROB_MAX_TOKENS": "4096"}, "must be >= max_prompt_length"),
+        ({"DYNAMIC_BSZ": "True", "DYNAMIC_BSZ_MAX_TOKENS": "10k"}, "positive integers"),
+        ({"DYNAMIC_BSZ": "True", "DYNAMIC_BSZ_MAX_TOKENS": "0"}, "positive integers"),
+    ],
+)
+def test_invalid_dynamic_bsz_settings_fail_fast(script, env, message, tmp_path):
     rc, _, err = _run(script, env=env, tmp=tmp_path)
     assert rc == 2, err[-2000:]
     assert message in err
