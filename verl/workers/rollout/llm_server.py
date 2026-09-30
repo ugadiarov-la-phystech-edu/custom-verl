@@ -79,6 +79,7 @@ class GlobalRequestLoadBalancer:
         self._inflight_requests: dict[str, int] = {sid: 0 for sid in servers}
         self._request_id_to_server: LRUCache = LRUCache(maxsize=max_cache_size)
         self._full_determinism = full_determinism
+        self._held = False
 
     def acquire_server(self, request_id: str) -> tuple[str, ray.actor.ActorHandle]:
         """Acquire a server for the given request (sticky + least-loaded).
@@ -192,6 +193,13 @@ class GlobalRequestLoadBalancer:
     def get_total_inflight(self) -> int:
         """Return the sum of in-flight requests across all currently registered servers."""
         return sum(self._inflight_requests.values())
+
+    def set_hold(self, held: bool) -> None:
+        self._held = bool(held)
+        logger.info(f"[GlobalLoadBalancer] hold {'set' if self._held else 'cleared'}")
+
+    def is_held(self) -> bool:
+        return self._held
 
 
 class LLMServerClient:
@@ -330,6 +338,12 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 else:
                     raise
 
+    async def _wait_while_held(self) -> None:
+        if self._load_balancer is None:
+            return
+        while await self._load_balancer.is_held.remote():
+            await asyncio.sleep(1)
+
     def _configured_response_length(self) -> Optional[int]:
         """Per-response token budget from the rollout config, or ``None`` when unavailable.
 
@@ -454,6 +468,7 @@ class FullyAsyncLLMServerClient(LLMServerClient):
                 break
 
             await asyncio.sleep(1)
+            await self._wait_while_held()
 
         final_output.extra_fields["global_steps"] = global_steps
         final_output.extra_fields["min_global_steps"] = min_global_steps
