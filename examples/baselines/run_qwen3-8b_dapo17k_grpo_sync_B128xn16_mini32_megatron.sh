@@ -287,6 +287,44 @@ if [[ "${rollout_quantization}" == "fp8" && "${rollout_is}" == "null" ]]; then
     echo "WARNING: ROLLOUT_QUANT=fp8 without TIS; quantized rollouts without TIS collapsed in FlashRL's runs" >&2
 fi
 
+# ================= Dynamic batch size (toggle) =================
+# DYNAMIC_BSZ=False (default) keeps one sequence per forward/backward pass (micro-batch 1), whose memory
+# envelope the MEMORY block measured. DYNAMIC_BSZ=True packs each rank's share of a mini-batch into
+# micro-batches of up to DYNAMIC_BSZ_MAX_TOKENS tokens (sequence-length balanced across DP ranks, same
+# micro-batch count on every rank; verl/utils/seqlen_balancing.py). It does NOT change the maths: the
+# policy loss is normalized by the token count of the whole mini-batch, not per micro-batch, so
+# token-mean, the TIS weights and the 4-updates-per-step structure are identical up to float summation
+# order. Short responses share a pass -> fewer, fuller passes in old_log_prob and update_actor; the
+# generation phase (which dominates this arm) is unaffected.
+#   DYNAMIC_BSZ_MAX_TOKENS          per-GPU token cap for training micro-batches. Must be >= one full
+#       sequence (max_prompt_length + max_response_length = 10240, the default), which keeps the peak at
+#       the measured worst case (one 10240-token sequence): memory scales with TOKENS per micro-batch,
+#       dominated by the full-vocabulary fp32 logits (151,936 x 4 B ~= 0.6 MB/token, ~6 GB at 10240,
+#       plus a copy for entropy). Raising it needs a fresh OOM smoke; the headroom is 3-5 GB.
+#   DYNAMIC_BSZ_LOG_PROB_MAX_TOKENS token cap for the forward-only old_log_prob pass (default: same).
+# Tagged in exp_name.
+DYNAMIC_BSZ=${DYNAMIC_BSZ:-False}
+DYNAMIC_BSZ_MAX_TOKENS=${DYNAMIC_BSZ_MAX_TOKENS:-$((max_prompt_length + max_response_length))}
+DYNAMIC_BSZ_LOG_PROB_MAX_TOKENS=${DYNAMIC_BSZ_LOG_PROB_MAX_TOKENS:-${DYNAMIC_BSZ_MAX_TOKENS}}
+dynbsz_args=()
+dynbsz_tag=""
+case "${DYNAMIC_BSZ}" in
+    True|true|1)
+        use_dynamic_bsz=True
+        for cap in "${DYNAMIC_BSZ_MAX_TOKENS}" "${DYNAMIC_BSZ_LOG_PROB_MAX_TOKENS}"; do
+            [[ "${cap}" =~ ^[1-9][0-9]*$ ]] || { echo "DYNAMIC_BSZ token caps must be positive integers, got '${cap}'" >&2; exit 2; }
+            (( cap >= max_prompt_length + max_response_length )) || { echo "DYNAMIC_BSZ token caps must be >= max_prompt_length + max_response_length = $((max_prompt_length + max_response_length)), got ${cap}" >&2; exit 2; }
+        done
+        dynbsz_args=(
+            actor_rollout_ref.actor.ppo_max_token_len_per_gpu="${DYNAMIC_BSZ_MAX_TOKENS}"
+            actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="${DYNAMIC_BSZ_LOG_PROB_MAX_TOKENS}"
+        )
+        dynbsz_tag=" dynbsz-${DYNAMIC_BSZ_MAX_TOKENS}"
+        ;;
+    False|false|0) use_dynamic_bsz=False ;;
+    *) echo "DYNAMIC_BSZ must be True or False, got '${DYNAMIC_BSZ}'" >&2; exit 2 ;;
+esac
+
 # ================= Trainer =================
 test_freq=${test_freq:-2}    # rollout steps (= 8 optimizer updates)
 save_freq=${save_freq:-2}    # rollout steps
@@ -321,7 +359,7 @@ NNODES=${NNODES:-1}
 n_gpus_per_node=${n_gpus_per_node:-8}
 
 # ================= Logging =================
-exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} mini-${train_prompt_mini_bsz} ppo-epochs-${ppo_epochs} DAPO17K-AIME24-25 Qwen3-8B tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${clip_tag}${warmup_tag}${tis_tag}${quant_tag} seed-${SEED}${emu_tag}"}
+exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} mini-${train_prompt_mini_bsz} ppo-epochs-${ppo_epochs} DAPO17K-AIME24-25 Qwen3-8B tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${clip_tag}${warmup_tag}${dynbsz_tag}${tis_tag}${quant_tag} seed-${SEED}${emu_tag}"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -353,7 +391,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.clip_ratio_low=${clip_ratio_low} \
     actor_rollout_ref.actor.clip_ratio_high=${clip_ratio_high} \
     actor_rollout_ref.actor.clip_ratio_c=${clip_ratio_c} \
-    actor_rollout_ref.actor.use_dynamic_bsz=False \
+    actor_rollout_ref.actor.use_dynamic_bsz=${use_dynamic_bsz} \
     actor_rollout_ref.actor.ppo_mini_batch_size=${train_prompt_mini_bsz} \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.actor.ppo_epochs=${ppo_epochs} \
@@ -405,7 +443,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.top_k=-1 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.n=1 \
-    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=False \
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=${use_dynamic_bsz} \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     critic.megatron.seed=${SEED} \
     trainer.logger="['console','tensorboard']" \
@@ -423,4 +461,4 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes="${NNODES}" \
     trainer.n_gpus_per_node="${n_gpus_per_node}" \
     trainer.total_training_steps=${total_training_steps} \
-    trainer.total_epochs=${total_epochs} "$@"
+    trainer.total_epochs=${total_epochs} "${dynbsz_args[@]}" "$@"
