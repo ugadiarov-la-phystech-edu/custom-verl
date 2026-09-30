@@ -193,10 +193,16 @@ kl_coef=0.0
 use_kl_loss=False
 kl_loss_coef=0.0
 # verl actor.yaml defaults: symmetric PPO band 0.2/0.2, dual-clip c=3.0.
-clip_ratio=0.2
-clip_ratio_low=0.2
-clip_ratio_high=0.2
-clip_ratio_c=3.0
+# Overridable (the TIS variant sets FlashRL's clip-higher 0.2/0.28 and dual-clip c=10); any value
+# other than the default 0.2/0.2/3.0 is tagged in exp_name.
+clip_ratio_low=${clip_ratio_low:-0.2}
+clip_ratio_high=${clip_ratio_high:-0.2}
+clip_ratio_c=${clip_ratio_c:-3.0}
+clip_ratio=${clip_ratio_low}
+clip_tag=""
+if [[ "${clip_ratio_low}/${clip_ratio_high}/${clip_ratio_c}" != "0.2/0.2/3.0" ]]; then
+    clip_tag=" clip-${clip_ratio_low}-${clip_ratio_high}-c${clip_ratio_c}"
+fi
 # verl default (and DAPO's token-level loss): every token weighs equally.
 loss_agg_mode="token-mean"
 entropy_coeff=${entropy_coeff:-0}
@@ -204,7 +210,9 @@ calculate_entropy=True
 
 # ================= Optimizer =================
 lr=${lr:-1e-6}
-lr_warmup_steps=${lr_warmup_steps:-0}
+lr_warmup_steps=${lr_warmup_steps:-0}   # counted in ROLLOUT steps (the scheduler steps once per step)
+warmup_tag=""
+if [[ "${lr_warmup_steps}" != "0" ]]; then warmup_tag=" warmup-${lr_warmup_steps}"; fi
 weight_decay=${weight_decay:-0.01}
 grad_clip=1.0
 
@@ -313,7 +321,7 @@ NNODES=${NNODES:-1}
 n_gpus_per_node=${n_gpus_per_node:-8}
 
 # ================= Logging =================
-exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} mini-${train_prompt_mini_bsz} ppo-epochs-${ppo_epochs} DAPO17K-AIME24-25 Qwen3-8B tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${tis_tag}${quant_tag} seed-${SEED}${emu_tag}"}
+exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} mini-${train_prompt_mini_bsz} ppo-epochs-${ppo_epochs} DAPO17K-AIME24-25 Qwen3-8B tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${clip_tag}${warmup_tag}${tis_tag}${quant_tag} seed-${SEED}${emu_tag}"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
