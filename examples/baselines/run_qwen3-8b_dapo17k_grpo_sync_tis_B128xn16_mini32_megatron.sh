@@ -13,16 +13,19 @@
 #   bash examples/baselines/run_qwen3-8b_dapo17k_grpo_sync_tis_B128xn16_mini32_megatron.sh                     # bf16 + TIS
 #   ROLLOUT_QUANT=fp8 bash examples/baselines/run_qwen3-8b_dapo17k_grpo_sync_tis_B128xn16_mini32_megatron.sh   # fp8 + TIS
 #
-# FLASHRL PARAMETERS. Five knobs follow FlashRL's DAPO-Qwen2.5-32B recipe (yaof20/verl, branch
-# flash-rl, recipe/flash_rl/dapo_qwen32b_{bf16,int8}.sh), overriding the baseline:
+# FLASHRL PARAMETERS. Four knobs follow FlashRL's DAPO-Qwen2.5-32B recipe (yaof20/verl, branch
+# flash-rl, recipe/flash_rl/dapo_qwen32b_{bf16,int8}.sh), overriding the baseline, plus a shorter warmup:
 #   * TIS cap C            TIS_THRESHOLD=8        (baseline arm: TIS off; verl's FP8 guide uses 2)
 #   * clip ratio low/high  0.2 / 0.28 (DAPO clip-higher; baseline 0.2 / 0.2)
 #   * dual-clip c          10.0                   (baseline 3.0)
-#   * LR warmup            10 steps, linear, then constant (baseline 0). Both FlashRL's FSDP worker and
-#                          v0.9.0's engine step the scheduler once per ROLLOUT step, so this is the same
-#                          10 steps (= 40 optimizer updates here) as in FlashRL.
+#   * LR warmup            3 steps, linear, then constant (baseline 0; FlashRL: 10). Both FlashRL's FSDP
+#                          worker and v0.9.0's engine step the scheduler once per ROLLOUT step, so this is
+#                          3 rollout steps (= 12 optimizer updates here).
 #   * weight decay         0.1                    (baseline 0.01)
 # All five are env-overridable and tagged in exp_name.
+#
+# CADENCE. Validation and checkpoints every 3 rollout steps (= 12 optimizer updates; baseline 2):
+# test_freq=3, save_freq=3, env-overridable.
 #
 # DYNAMIC BATCH SIZE is on here (DYNAMIC_BSZ=True, cap DYNAMIC_BSZ_MAX_TOKENS=10240 tokens per GPU per
 # micro-batch = one full-length sequence, so the memory peak stays at the measured worst case). It
@@ -75,7 +78,9 @@ export TIS_THRESHOLD=${TIS_THRESHOLD:-8}
 export clip_ratio_low=${clip_ratio_low:-0.2}
 export clip_ratio_high=${clip_ratio_high:-0.28}
 export clip_ratio_c=${clip_ratio_c:-10.0}
-export lr_warmup_steps=${lr_warmup_steps:-10}
+export lr_warmup_steps=${lr_warmup_steps:-3}
+export test_freq=${test_freq:-3}
+export save_freq=${save_freq:-3}
 export weight_decay=${weight_decay:-0.1}
 export DYNAMIC_BSZ=${DYNAMIC_BSZ:-True}
 

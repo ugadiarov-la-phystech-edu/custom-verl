@@ -50,6 +50,8 @@ SCRIPT_ENV_KNOBS = {
     "clip_ratio_high",
     "clip_ratio_c",
     "lr_warmup_steps",
+    "test_freq",
+    "save_freq",
     "weight_decay",
     "DYNAMIC_BSZ",
     "DYNAMIC_BSZ_MAX_TOKENS",
@@ -428,7 +430,7 @@ class TestQwenPrecisionAndTis:
         assert c["actor_rollout_ref"]["rollout"]["calculate_log_probs"] is True
         assert c["actor_rollout_ref"]["rollout"]["logprobs_mode"] == "processed_logprobs"
         assert c["trainer"]["experiment_name"].endswith(
-            " 0.1-wd clip-0.2-0.28-c10.0 warmup-10 dynbsz-10240 tis-C8 seed-1"
+            " 0.1-wd clip-0.2-0.28-c10.0 warmup-3 dynbsz-10240 tis-C8 seed-1"
         )
 
     def test_fp8_tis(self):
@@ -443,7 +445,7 @@ class TestQwenPrecisionAndTis:
         assert c["algorithm"]["rollout_correction"]["rollout_is_threshold"] == 8.0
         assert (actor["clip_ratio"], actor["clip_ratio_low"], actor["clip_ratio_high"]) == (0.2, 0.2, 0.28)
         assert actor["clip_ratio_c"] == 10.0
-        assert actor["optim"]["lr_warmup_steps"] == 10
+        assert actor["optim"]["lr_warmup_steps"] == 3  # FlashRL: 10
         assert actor["optim"]["weight_decay"] == 0.1
         assert actor["optim"]["lr_decay_style"] == "constant"
         assert actor["optim"]["lr"] == 1e-6
@@ -458,6 +460,8 @@ class TestQwenPrecisionAndTis:
                 "actor_rollout_ref.actor.clip_ratio_c",
                 "actor_rollout_ref.actor.optim.lr_warmup_steps",
                 "actor_rollout_ref.actor.optim.weight_decay",
+                "trainer.test_freq",
+                "trainer.save_freq",
             }
             | NAME_DERIVED_KEYS
         )
@@ -472,6 +476,8 @@ class TestQwenPrecisionAndTis:
             lr_warmup_steps="0",
             weight_decay="0.01",
             DYNAMIC_BSZ="False",
+            test_freq="2",
+            save_freq="2",
         )
         assert _diff(compose(QWEN), ablation) == {"algorithm.rollout_correction.rollout_is"} | NAME_DERIVED_KEYS
         assert ablation["trainer"]["experiment_name"].endswith(" 0.01-wd tis-C2.0 seed-1")
@@ -502,11 +508,19 @@ class TestQwenPrecisionAndTis:
             TIS_THRESHOLD="8",
             clip_ratio_high="0.28",
             clip_ratio_c="10.0",
-            lr_warmup_steps="10",
+            lr_warmup_steps="3",
             weight_decay="0.1",
             DYNAMIC_BSZ="True",
+            test_freq="3",
+            save_freq="3",
         )
         assert _diff(compose(QWEN_TIS), compose(QWEN, **flashrl)) == set()
+
+    def test_tis_script_cadence(self):
+        c = compose(QWEN_TIS)
+        assert (c["trainer"]["test_freq"], c["trainer"]["save_freq"]) == (3, 3)
+        c = compose(QWEN_TIS, test_freq="5", save_freq="4")
+        assert (c["trainer"]["test_freq"], c["trainer"]["save_freq"]) == (5, 4)
 
     def test_tis_script_honours_explicit_env_values(self):
         # the wrapper only sets defaults; explicit env values win
@@ -641,7 +655,7 @@ def test_invalid_dynamic_bsz_settings_fail_fast(script, env, message, tmp_path):
 
 @pytest.mark.parametrize("script", [QWEN, QWEN_TIS])
 def test_warmup_longer_than_a_short_run_fails_fast(script, tmp_path):
-    # 40 updates = 10 rollout steps; the TIS script warms up for 10 -> Megatron would assert at init
+    # 40 updates = 10 rollout steps; a 10-step warmup -> Megatron would assert at init
     env = {"max_updates": "40", "lr_warmup_steps": "10"}
     rc, _, err = _run(script, env=env, tmp=tmp_path)
     assert rc == 2, err[-2000:]
@@ -649,9 +663,15 @@ def test_warmup_longer_than_a_short_run_fails_fast(script, tmp_path):
 
 
 def test_warmup_shorter_than_the_run_is_fine():
-    c = compose(QWEN_TIS, max_updates="44")  # 11 rollout steps > 10 warmup steps
-    assert c["trainer"]["total_training_steps"] == 11
-    assert c["actor_rollout_ref"]["actor"]["optim"]["lr_warmup_steps"] == 10
+    c = compose(QWEN_TIS, max_updates="16")  # 4 rollout steps > 3 warmup steps
+    assert c["trainer"]["total_training_steps"] == 4
+    assert c["actor_rollout_ref"]["actor"]["optim"]["lr_warmup_steps"] == 3
+
+
+def test_tis_default_warmup_needs_more_than_three_rollout_steps(tmp_path):
+    rc, _, err = _run(QWEN_TIS, env={"max_updates": "12"}, tmp=tmp_path)  # 3 rollout steps = 3 warmup steps
+    assert rc == 2, err[-2000:]
+    assert "lr_warmup_steps=3 must be < the 3 rollout steps" in err
 
 
 # --------------------------------------------------------------------------- DeepGEMM env (TIS script)
