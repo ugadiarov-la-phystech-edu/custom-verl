@@ -210,6 +210,11 @@ def init_megatron_optim_config(
     override_config = optim_config.get("override_optimizer_config", {})
     if override_config:
         for k, v in override_config.items():
+            # OptimizerConfig's dtype fields (main_params_dtype, main_grads_dtype, exp_avg*_dtype) must be
+            # torch.dtype; Hydra delivers strings, which OptimizerConfig keeps as-is ("bfloat16" !=
+            # torch.bfloat16), silently breaking its dtype checks and the master-weight dtype.
+            if k.endswith("_dtype") and isinstance(v, str):
+                v = PrecisionType.to_dtype(v)
             optim_args[k] = v
 
     print_rank_0(f"optimizer config after override: {optim_args}")
