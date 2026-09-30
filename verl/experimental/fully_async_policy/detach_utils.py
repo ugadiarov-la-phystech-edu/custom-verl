@@ -75,6 +75,8 @@ def prepare_single_generation_data(batch_dict, config) -> DataProto:
 
 def addition_process(output: DataProto):
     """collect metirics"""
+    if "metrics" not in output.meta_info and "processing_times" in output.non_tensor_batch:
+        return output
     metrics = output.meta_info.pop("metrics")  # List[Dict[str, str]]
     processing_times_list = [item["generate_sequences"] for item in metrics]
     tool_calls_times_list = [item["tool_calls"] for item in metrics]
