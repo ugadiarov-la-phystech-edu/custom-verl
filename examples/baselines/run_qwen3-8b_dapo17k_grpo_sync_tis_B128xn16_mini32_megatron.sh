@@ -20,6 +20,8 @@ export test_freq=${test_freq:-3}
 export save_freq=${save_freq:-3}
 export weight_decay=${weight_decay:-0.1}
 export DYNAMIC_BSZ=${DYNAMIC_BSZ:-True}
+export VERL_GPU_MEM_CAP_GB=${VERL_GPU_MEM_CAP_GB-76}
+export gpu_memory_utilization=${gpu_memory_utilization:-0.283}
 
 DEEPGEMM_CUDA_HOME=${DEEPGEMM_CUDA_HOME:-/home/jovyan/ugadiarov/cuda-12.9}
 if [[ -z "${CUDA_HOME:-}" && -x "${DEEPGEMM_CUDA_HOME}/bin/nvcc" ]]; then

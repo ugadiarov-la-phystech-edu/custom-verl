@@ -52,6 +52,7 @@ SCRIPT_ENV_KNOBS = {
     "lr_warmup_steps",
     "test_freq",
     "save_freq",
+    "gpu_memory_utilization",
     "weight_decay",
     "DYNAMIC_BSZ",
     "DYNAMIC_BSZ_MAX_TOKENS",
@@ -430,14 +431,14 @@ class TestQwenPrecisionAndTis:
         assert c["actor_rollout_ref"]["rollout"]["calculate_log_probs"] is True
         assert c["actor_rollout_ref"]["rollout"]["logprobs_mode"] == "processed_logprobs"
         assert c["trainer"]["experiment_name"].endswith(
-            " 0.1-wd clip-0.2-0.28-c10.0 warmup-3 dynbsz-10240 tis-C8 seed-1"
+            " 0.1-wd clip-0.2-0.28-c10.0 warmup-3 dynbsz-10240 tis-C8 seed-1 h100-emu-76gb-gmu0.283"
         )
 
     def test_fp8_tis(self):
         c = compose(QWEN_TIS, ROLLOUT_QUANT="fp8")
         assert c["actor_rollout_ref"]["rollout"]["quantization"] == "fp8"
         assert c["algorithm"]["rollout_correction"]["rollout_is"] == "token"
-        assert c["trainer"]["experiment_name"].endswith(" tis-C8 rollout-fp8 seed-1")
+        assert c["trainer"]["experiment_name"].endswith(" tis-C8 rollout-fp8 seed-1 h100-emu-76gb-gmu0.283")
 
     def test_tis_script_uses_flashrl_parameters(self):
         c = compose(QWEN_TIS)
@@ -462,6 +463,7 @@ class TestQwenPrecisionAndTis:
                 "actor_rollout_ref.actor.optim.weight_decay",
                 "trainer.test_freq",
                 "trainer.save_freq",
+                "actor_rollout_ref.rollout.gpu_memory_utilization",
             }
             | NAME_DERIVED_KEYS
         )
@@ -478,6 +480,8 @@ class TestQwenPrecisionAndTis:
             DYNAMIC_BSZ="False",
             test_freq="2",
             save_freq="2",
+            VERL_GPU_MEM_CAP_GB="",
+            gpu_memory_utilization="0.5",
         )
         assert _diff(compose(QWEN), ablation) == {"algorithm.rollout_correction.rollout_is"} | NAME_DERIVED_KEYS
         assert ablation["trainer"]["experiment_name"].endswith(" 0.01-wd tis-C2.0 seed-1")
@@ -513,6 +517,8 @@ class TestQwenPrecisionAndTis:
             DYNAMIC_BSZ="True",
             test_freq="3",
             save_freq="3",
+            VERL_GPU_MEM_CAP_GB="76",
+            gpu_memory_utilization="0.283",
         )
         assert _diff(compose(QWEN_TIS), compose(QWEN, **flashrl)) == set()
 
@@ -537,7 +543,23 @@ class TestQwenPrecisionAndTis:
         c = compose(QWEN_TIS, args=("trainer.total_training_steps=3",), SEED="7", ROLLOUT_QUANT="fp8")
         assert c["trainer"]["total_training_steps"] == 3
         assert c["actor_rollout_ref"]["rollout"]["seed"] == 7
-        assert c["trainer"]["experiment_name"].endswith("rollout-fp8 seed-7")
+        assert c["trainer"]["experiment_name"].endswith("rollout-fp8 seed-7 h100-emu-76gb-gmu0.283")
+
+    def test_tis_script_emulates_an_h100_by_default(self):
+        c = compose(QWEN_TIS)
+        assert c["actor_rollout_ref"]["rollout"]["gpu_memory_utilization"] == 0.283
+        assert c["trainer"]["experiment_name"].endswith(" seed-1 h100-emu-76gb-gmu0.283")
+
+    def test_tis_cap_reaches_the_trainer_env(self, tmp_path):
+        assert _env_seen_by_python(QWEN_TIS, tmp_path, {}, ["VERL_GPU_MEM_CAP_GB"])["VERL_GPU_MEM_CAP_GB"] == "76"
+
+    def test_tis_script_on_a_real_h100(self, tmp_path):
+        # an empty VERL_GPU_MEM_CAP_GB switches the cap off; 0.5 restores the H100 vLLM budget
+        c = compose(QWEN_TIS, VERL_GPU_MEM_CAP_GB="", gpu_memory_utilization="0.5")
+        assert c["actor_rollout_ref"]["rollout"]["gpu_memory_utilization"] == 0.5
+        assert "h100-emu" not in c["trainer"]["experiment_name"]
+        seen = _env_seen_by_python(QWEN_TIS, tmp_path, {"VERL_GPU_MEM_CAP_GB": ""}, ["VERL_GPU_MEM_CAP_GB"])
+        assert seen["VERL_GPU_MEM_CAP_GB"] == ""
 
     def test_emulation_tag_still_last(self):
         c = compose(QWEN_TIS, ROLLOUT_QUANT="fp8", VERL_GPU_MEM_CAP_GB="108", gpu_memory_utilization="0.283")
@@ -679,12 +701,12 @@ def test_tis_default_warmup_needs_more_than_three_rollout_steps(tmp_path):
 DEEPGEMM_VARS = ("CUDA_HOME", "DG_JIT_CACHE_DIR", "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER")
 
 
-def _env_seen_by_python(script, tmp_path, env=None):
-    """Run a script with a stand-in python3 that prints the DeepGEMM-related env it was given."""
+def _env_seen_by_python(script, tmp_path, env=None, names=None):
+    """Run a script with a stand-in python3 that prints the given env vars (default: the DeepGEMM ones)."""
     bindir = tmp_path / "bin"
     bindir.mkdir(exist_ok=True)
     fake = bindir / "python3"
-    lines = "".join(f'echo "{v}=${{{v}-<unset>}}"\n' for v in DEEPGEMM_VARS)
+    lines = "".join(f'echo "{v}=${{{v}-<unset>}}"\n' for v in (names or DEEPGEMM_VARS))
     fake.write_text("#!/bin/sh\n" + lines)
     fake.chmod(0o755)
     base = {k: v for k, v in os.environ.items() if k not in SCRIPT_ENV_KNOBS and k not in DEEPGEMM_VARS}
