@@ -15,7 +15,9 @@ export TIS_THRESHOLD=${TIS_THRESHOLD:-8}
 export clip_ratio_low=${clip_ratio_low:-0.2}
 export clip_ratio_high=${clip_ratio_high:-0.28}
 export clip_ratio_c=${clip_ratio_c:-10.0}
-export lr_warmup_steps=${lr_warmup_steps:-10}
+export lr_warmup_steps=${lr_warmup_steps:-3}
+export test_freq=${test_freq:-3}
+export save_freq=${save_freq:-3}
 export weight_decay=${weight_decay:-0.1}
 export DYNAMIC_BSZ=${DYNAMIC_BSZ:-True}
 
