@@ -109,7 +109,8 @@ echo "uv: $(command -v uv) ($(uv --version))"
 export UV_LINK_MODE=${UV_LINK_MODE:-copy}
 
 if command -v nvidia-smi > /dev/null; then
-    nvidia-smi --query-gpu=name,driver_version,compute_cap --format=csv,noheader | head -1
+    # -i 0, not `| head -1`: with many GPUs nvidia-smi gets SIGPIPE and pipefail + set -e end the script silently
+    nvidia-smi -i 0 --query-gpu=name,driver_version,compute_cap --format=csv,noheader
     # "9.0" -> "90"; several distinct GPU types -> "80;90"
     DETECTED_ARCHS=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | tr -d . | sort -u | paste -sd ';')
 else
