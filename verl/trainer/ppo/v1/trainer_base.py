@@ -52,6 +52,7 @@ from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.metric_utils import (
     RolloutMoELoadBalanceMetricsAccumulator,
+    compute_cumulative_timing_metrics,
     compute_data_metrics,
     compute_moe_lb_metrics,
     compute_throughout_metrics,
@@ -422,6 +423,9 @@ class PPOTrainer(ABC):
                 self._shutdown_dump_executor()
                 return
 
+        # Running totals behind the fully_async/timing/* metrics (see compute_cumulative_timing_metrics).
+        self._cumulative_timing: dict[str, float] = {}
+
         current_epoch = self.global_steps // self.steps_per_epoch
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
 
@@ -477,6 +481,7 @@ class PPOTrainer(ABC):
 
             # 5. record metrics
             self._compute_metrics(batch, metrics, self.timing_raw, global_steps=self.global_steps, epoch=current_epoch)
+            metrics.update(compute_cumulative_timing_metrics(self._cumulative_timing, self.timing_raw))
 
             # 6. dump rollout generations if enabled
             rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)

@@ -652,6 +652,48 @@ def compute_timing_metrics(batch: DataProto, timing_raw: dict[str, float]) -> di
     }
 
 
+CUMULATIVE_TIMING_PREFIX = "fully_async/timing"
+
+
+def compute_cumulative_timing_metrics(cumulative: dict[str, float], timing_raw: dict[str, float]) -> dict[str, float]:
+    """Accumulate run-level timers across training steps and return them as metrics.
+
+    The v1 ``fit`` loop times ``save_checkpoint`` *inside* the ``step`` timer and ``testing``
+    (validation) *outside* it. Training time is therefore ``step - save_checkpoint``, so that it
+    excludes both validation and checkpoint saves, and the identity
+    ``training == wall - validation - save`` holds at every step. The initial
+    ``val_before_train`` pass runs before the loop and is not counted.
+
+    The metric keys match the fully-async trainer's, so sync and async runs can be plotted
+    against the same axis.
+
+    Args:
+        cumulative: Mutable running totals, updated in place. Pass the same dict on every step
+            (an empty dict on the first one).
+        timing_raw: This step's timers in seconds; missing timers count as 0.
+
+    Returns:
+        The four ``fully_async/timing/*`` running totals after this step.
+    """
+    step = float(timing_raw.get("step", 0.0))
+    testing = float(timing_raw.get("testing", 0.0))
+    save = float(timing_raw.get("save_checkpoint", 0.0))
+    # Timer jitter must never make training time go backwards.
+    training = max(step - save, 0.0)
+
+    cumulative["wall"] = cumulative.get("wall", 0.0) + step + testing
+    cumulative["validation"] = cumulative.get("validation", 0.0) + testing
+    cumulative["save"] = cumulative.get("save", 0.0) + save
+    cumulative["training"] = cumulative.get("training", 0.0) + training
+
+    return {
+        f"{CUMULATIVE_TIMING_PREFIX}/wall_time_since_first_sample": cumulative["wall"],
+        f"{CUMULATIVE_TIMING_PREFIX}/cumulative_validation_time": cumulative["validation"],
+        f"{CUMULATIVE_TIMING_PREFIX}/cumulative_save_time": cumulative["save"],
+        f"{CUMULATIVE_TIMING_PREFIX}/cumulative_training_time": cumulative["training"],
+    }
+
+
 def compute_throughout_metrics(batch: DataProto, timing_raw: dict[str, float], n_gpus: int) -> dict[str, Any]:
     """
     Computes throughput metrics for PPO training.
