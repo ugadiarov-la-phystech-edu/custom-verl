@@ -36,16 +36,22 @@ use_kl_in_reward=False
 kl_coef=0.0
 use_kl_loss=False
 kl_loss_coef=0.0
-clip_ratio=0.2
-clip_ratio_low=0.2
-clip_ratio_high=0.2
-clip_ratio_c=3.0
+clip_ratio_low=${clip_ratio_low:-0.2}
+clip_ratio_high=${clip_ratio_high:-0.2}
+clip_ratio_c=${clip_ratio_c:-3.0}
+clip_ratio=${clip_ratio_low}
+clip_tag=""
+if [[ "${clip_ratio_low}/${clip_ratio_high}/${clip_ratio_c}" != "0.2/0.2/3.0" ]]; then
+    clip_tag=" clip-${clip_ratio_low}-${clip_ratio_high}-c${clip_ratio_c}"
+fi
 loss_agg_mode="token-mean"
 entropy_coeff=${entropy_coeff:-0}
 calculate_entropy=True
 
 lr=${lr:-1e-6}
 lr_warmup_steps=${lr_warmup_steps:-0}
+warmup_tag=""
+if [[ "${lr_warmup_steps}" != "0" ]]; then warmup_tag=" warmup-${lr_warmup_steps}"; fi
 weight_decay=${weight_decay:-0.01}
 grad_clip=1.0
 
@@ -109,7 +115,7 @@ resume_mode=${resume_mode:-disable}
 NNODES=${NNODES:-1}
 n_gpus_per_node=${n_gpus_per_node:-8}
 
-exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} mini-${train_prompt_mini_bsz} ppo-epochs-${ppo_epochs} DAPO17K-AIME24-25 Qwen3-8B tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${tis_tag}${quant_tag} seed-${SEED}${emu_tag}"}
+exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} mini-${train_prompt_mini_bsz} ppo-epochs-${ppo_epochs} DAPO17K-AIME24-25 Qwen3-8B tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${clip_tag}${warmup_tag}${tis_tag}${quant_tag} seed-${SEED}${emu_tag}"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
