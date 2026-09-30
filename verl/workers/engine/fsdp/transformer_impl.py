@@ -651,6 +651,15 @@ class FSDPEngine(BaseEngine):
         else:
             return torch.distributed.group.WORLD
 
+    def get_ess_reduction_group(self):
+        # With Ulysses sequence parallelism a sequence's tokens are spread over the SP group.
+        if self.ulysses_sequence_parallel_size > 1:
+            raise NotImplementedError(
+                "actor.ess_scaling (ESS LR brake) requires ulysses_sequence_parallel_size == 1 on the FSDP "
+                f"engine, got {self.ulysses_sequence_parallel_size}"
+            )
+        return self.get_data_parallel_group()
+
     def get_model_parallel_group(self):
         raise NotImplementedError
 

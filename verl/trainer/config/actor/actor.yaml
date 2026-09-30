@@ -95,6 +95,26 @@ entropy_coeff: 0
 # When true, the actor forward will request entropy from the model
 calculate_entropy: false
 
+# Min-ESS learning-rate brake: before each optimizer step, measure the global sequence-level Kish ESS
+# of the mini-batch's importance weights pi_theta/pi_rollout; a mini-batch whose ESS is <= min_ess
+# effective samples steps at lr * lr_scale, otherwise at the full lr. Needs rollout_log_probs.
+ess_scaling:
+
+  # Target dataclass for this configuration
+  _target_: verl.workers.config.ESSScalingConfig
+
+  # Whether to enable the brake
+  enable: false
+
+  # Threshold in effective samples (inclusive); ESS floors at 1, so min_ess >= 1
+  min_ess: 1.1
+
+  # Constant lr multiplier applied on braked steps
+  lr_scale: 0.5
+
+  # Brake on the ESS of weights clipped at rollout_is_threshold instead of the unclipped ESS
+  use_clipped: false
+
 # This computes Σπ² needed for the Logit-Gradient Norm proxy W(τ) = Σ_t[1 - 2π_t + Σπ²]
 # c.f. https://yingru.notion.site/The-Optimal-Token-Baseline-399211a558b782cfa936014c0d42dfb8
 calculate_sum_pi_squared: false

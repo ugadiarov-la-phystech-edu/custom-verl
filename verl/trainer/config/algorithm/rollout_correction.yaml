@@ -26,3 +26,7 @@ loss_type: ppo_clip
 
 # Batch normalize IS weights: false = raw weights, true = normalize to mean=1.0
 rollout_is_batch_normalize: false
+
+# Log training/rollout_actor_probs_pearson_corr from the actor loss (Pearson of exp(policy) vs
+# exp(rollout) log-probs over response tokens); needs policy_loss.rollout_correction on the worker
+log_probs_pearson_corr: false

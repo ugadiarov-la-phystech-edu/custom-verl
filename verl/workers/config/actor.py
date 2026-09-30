@@ -34,6 +34,7 @@ from .model import HFModelConfig
 from .optimizer import OptimizerConfig
 
 __all__ = [
+    "ESSScalingConfig",
     "PolicyLossConfig",
     "RouterReplayConfig",
     "ActorConfig",
@@ -44,6 +45,35 @@ __all__ = [
     "TorchTitanActorConfig",
     "MindSpeedActorConfig",
 ]
+
+
+@dataclass
+class ESSScalingConfig(BaseConfig):
+    """Min-ESS learning-rate brake (VCPO-style), applied per optimizer step.
+
+    Before each optimizer step the global sequence-level Kish ESS of the mini-batch's importance
+    weights pi_theta/pi_rollout (see verl/workers/utils/ess.py) is measured; a mini-batch whose ESS is
+    <= ``min_ess`` effective samples (inclusive) steps at ``lr * lr_scale``, otherwise at the full
+    nominal lr. Requires ``rollout_log_probs`` in the batch (rollout.calculate_log_probs=True).
+
+    Args:
+        enable (bool): Whether to apply the brake.
+        min_ess (float): Threshold in effective samples. The max-shifted ESS is floored at exactly 1 for any
+            non-empty batch, so min_ess >= 1 makes degenerate (single-dominant-sequence) mini-batches always
+            brake, at lr * lr_scale and never lower.
+        lr_scale (float): Constant multiplier applied on braked steps (no sqrt/linear shaping).
+        use_clipped (bool): Brake on the ESS of weights clipped at the rollout-correction
+            ``rollout_is_threshold`` instead of the unclipped ESS.
+    """
+
+    enable: bool = False
+    min_ess: float = 1.1
+    lr_scale: float = 0.5
+    use_clipped: bool = False
+
+    def __post_init__(self):
+        assert self.min_ess >= 1, f"ess_scaling.min_ess must be >= 1 (ESS floors at 1), got {self.min_ess}"
+        assert 0 < self.lr_scale <= 1, f"ess_scaling.lr_scale must be in (0, 1], got {self.lr_scale}"
 
 
 @dataclass
@@ -170,6 +200,7 @@ class ActorConfig(BaseConfig):
     tau_pos: float = 1.0
     tau_neg: float = 1.05
     calculate_entropy: bool = False
+    ess_scaling: ESSScalingConfig = field(default_factory=ESSScalingConfig)
     calculate_sum_pi_squared: bool = False
     use_kl_loss: bool = False
     # Whether to enable PrefixGrouper-based shared-prefix forward

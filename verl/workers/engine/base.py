@@ -110,13 +110,18 @@ class BaseEngine:
         """
         raise NotImplementedError
 
-    def train_batch(self, data: TensorDict, loss_function: Callable) -> Any:
+    def train_batch(
+        self, data: TensorDict, loss_function: Callable, pre_optimizer_step_hook: Optional[Callable] = None
+    ) -> Any:
         """
         Perform a training step on a batch of data.
 
         Args:
             data: The input data for training, typically containing tensors and metadata.
             loss_function: A function that computes the loss and metrics given a batch and predictions.
+            pre_optimizer_step_hook: Optional ``hook(engine, data, outputs) -> context manager`` called after
+                the backward pass; the returned context wraps ``optimizer_step()`` (e.g. to scale the
+                learning rate of this one step, see verl/workers/utils/ess_brake.py).
 
         Returns:
             dict[str, torch.Tensor]: A dictionary containing the aggregated training metrics for the batch.
@@ -125,11 +130,28 @@ class BaseEngine:
 
         self.optimizer_zero_grad()
         outputs = self.forward_backward_batch(data, loss_function, forward_only=False)
-        grad_norm = self.optimizer_step()
+        if pre_optimizer_step_hook is not None:
+            with pre_optimizer_step_hook(self, data, outputs):
+                grad_norm = self.optimizer_step()
+        else:
+            grad_norm = self.optimizer_step()
         if self.is_mp_src_rank_with_outputs():
             assert "grad_norm" not in outputs["metrics"]
             outputs["metrics"]["grad_norm"] = grad_norm
         return outputs
+
+    def get_optimizer_param_groups(self) -> list[dict]:
+        """The optimizer's parameter groups, for per-step LR changes by optimizer-step hooks."""
+        return self.optimizer.param_groups
+
+    def get_ess_reduction_group(self):
+        """Process group over which a mini-batch's per-sequence ESS statistics are reduced.
+
+        Every rank of the group must hold whole sequences; engines that split a sequence's tokens
+        across ranks (context/sequence parallelism) or its loss across pipeline stages override this
+        and refuse.
+        """
+        return self.get_data_parallel_group()
 
     def infer_batch(self, data: TensorDict, loss_function: Optional[Callable] = None) -> Any:
         """

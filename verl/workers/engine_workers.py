@@ -155,6 +155,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
             self.flops_counter = None
 
         self.loss_fn = None
+        self.optimizer_step_hook = None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def to(self, device, model=True, optimizer=True, grad=True):
@@ -169,6 +170,11 @@ class TrainingWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_loss_fn(self, loss_fn):
         self.loss_fn = loss_fn
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def set_optimizer_step_hook(self, hook):
+        """Install a pre-optimizer-step hook (see BaseEngine.train_batch), e.g. the ESS LR brake."""
+        self.optimizer_step_hook = hook
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def reset(self):
@@ -360,7 +366,9 @@ class TrainingWorker(Worker, DistProfilerExtension):
             self.engine.train_mode(disable_auto_offload=disable_auto_offload),
             Timer(name="train_batch", logger=None) as timer,
         ):
-            output = self.engine.train_batch(data, loss_function=self.loss_fn)
+            output = self.engine.train_batch(
+                data, loss_function=self.loss_fn, pre_optimizer_step_hook=self.optimizer_step_hook
+            )
             # containing loss, model_output and metrics
             # for training, we only care about loss and metrics
         delta_time = timer.last
@@ -644,6 +652,13 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.actor = self.actor_worker_cls(config=actor_training_config)
             self.actor.reset()
             self.actor.set_loss_fn(self.loss_fn)
+            if actor_config.ess_scaling.enable:
+                assert not self.distillation_enabled, "actor.ess_scaling is not supported with distillation"
+                from verl.workers.utils.ess_brake import make_ess_optimizer_step_hook
+
+                # resolves the reduction group now, so an unsupported parallel layout fails at init
+                self.actor.engine.get_ess_reduction_group()
+                self.actor.set_optimizer_step_hook(make_ess_optimizer_step_hook(actor_config))
             self.set_dispatch_collect(mesh_name="actor", **self.actor.get_dispatch_collect())
 
         # 3. build rollout engine

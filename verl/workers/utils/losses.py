@@ -19,10 +19,16 @@ from tensordict import TensorDict
 from verl.trainer.ppo.core_algos import agg_loss, compute_value_loss, get_policy_loss_fn, kl_penalty
 from verl.utils import tensordict_utils as tu
 from verl.utils.dataset.dataset_utils import DatasetPadMode
+from verl.utils.debug.metrics import rollout_actor_probs_pearson_corr
 from verl.utils.metric import AggregationType, Metric
 from verl.utils.torch_functional import masked_mean, masked_sum
 from verl.workers.config import ActorConfig, CriticConfig
+from verl.workers.utils.ess import seq_log_is_sums
 from verl.workers.utils.padding import no_padding_2_padding
+
+# Per-micro-batch list of per-sequence log-IS sums emitted by ppo_loss for the ESS brake. The brake's
+# pre-optimizer-step hook (verl/workers/utils/ess_brake.py) pops it before metrics are gathered.
+ESS_SEQ_LOG_IS_KEY = "_ess/seq_log_is"
 
 
 def sft_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None):
@@ -82,15 +88,36 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
     metrics = {}
 
+    # The ESS brake and the Pearson diagnostic both compare the policy being updated with the
+    # behavior (rollout) policy, so they need the rollout log-probs.
+    ess_scaling = config.get("ess_scaling", None)
+    ess_enabled = ess_scaling is not None and ess_scaling.enable
+    rollout_corr = config.policy_loss.get("rollout_correction", None)
+    pearson_enabled = rollout_corr is not None and bool(rollout_corr.get("log_probs_pearson_corr", False))
+    need_rollout_log_probs = ess_enabled or pearson_enabled
+
     # select fields and convert to padded tensor
     fields = ["response_mask", "old_log_probs", "advantages"]
     if "rollout_is_weights" in data:
         fields.append("rollout_is_weights")
     if "ref_log_prob" in data:
         fields.append("ref_log_prob")
+    if need_rollout_log_probs:
+        if "rollout_log_probs" not in data:
+            raise ValueError(
+                "actor.ess_scaling.enable / rollout_correction.log_probs_pearson_corr need rollout_log_probs in "
+                "the batch (set actor_rollout_ref.rollout.calculate_log_probs=True)"
+            )
+        fields.append("rollout_log_probs")
     data = data.select(*fields).to_padded_tensor()
 
     response_mask = data["response_mask"].to(bool)
+    if ess_enabled:
+        metrics[ESS_SEQ_LOG_IS_KEY] = seq_log_is_sums(log_prob, data["rollout_log_probs"], response_mask)
+    if pearson_enabled:
+        metrics["training/rollout_actor_probs_pearson_corr"] = rollout_actor_probs_pearson_corr(
+            log_prob.detach(), data["rollout_log_probs"], response_mask
+        )
     # compute policy loss
     old_log_prob = data["old_log_probs"]
     advantages = data["advantages"]

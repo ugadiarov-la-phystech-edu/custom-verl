@@ -182,6 +182,9 @@ class RolloutCorrectionConfig(BaseConfig):
     rollout_rs_threshold: Optional[str | float] = None
     bypass_mode: bool = False
     loss_type: str = "ppo_clip"
+    # Log training/rollout_actor_probs_pearson_corr (Pearson of exp(policy) vs exp(rollout) log-probs over
+    # response tokens) from the actor loss, i.e. against the log-probs of the policy being updated.
+    log_probs_pearson_corr: bool = False
 
     @classmethod
     def decoupled_token_is(cls, threshold: float = 2.0) -> "RolloutCorrectionConfig":
