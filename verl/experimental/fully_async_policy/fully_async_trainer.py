@@ -14,12 +14,15 @@
 
 import asyncio
 import logging
+import math
 import os
 import time
 from datetime import datetime
 from typing import Any
 
+import numpy as np
 import ray
+import torch
 from omegaconf import OmegaConf, open_dict
 from tqdm import tqdm
 
@@ -31,6 +34,8 @@ from verl.experimental.fully_async_policy.detach_utils import (
 )
 from verl.experimental.fully_async_policy.dynamic_schedule import DynamicScheduleContext
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
+from verl.experimental.fully_async_policy.replay_buffer import ReplayBuffer
+from verl.experimental.fully_async_policy.replay_sizing import first_minibatch_groups, trainer_dp_size
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.ppo import core_algos
@@ -39,9 +44,46 @@ from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.debug import marked_timer
+from verl.utils.metric import reduce_metrics
 from verl.utils.tracking import Tracking
 
 logger = logging.getLogger(__name__)
+
+# async_training keys of the custom_vcpo recipe that this port does not implement. Scripts may keep
+# them only in their disabled form; an enabled value raises instead of being silently ignored.
+_UNSUPPORTED_ASYNC_KEYS = {
+    "dynamic_filtering.enable": False,
+    "opportunistic_epochs.enable": False,
+    "ppo_epochs": None,
+    "save_queue_state": False,
+    "replay_buffer.save_state": False,
+    "resumable_ckpts_to_keep": None,
+    "bsz_per_dp_rank": None,
+}
+
+
+def check_unsupported_async_keys(async_training) -> None:
+    """Raise when an unsupported custom_vcpo async_training key is set to anything but its off value."""
+    bad = []
+    for key, off in _UNSUPPORTED_ASYNC_KEYS.items():
+        value = OmegaConf.select(async_training, key, default=off)
+        if value != off and not (off is None and value in (0, "null")):
+            bad.append(f"async_training.{key}={value!r}")
+    if bad:
+        raise ValueError(
+            f"Unsupported async_training settings: {', '.join(bad)} (not ported from custom_vcpo; "
+            "use concurrent_samples_per_replica for bsz_per_dp_rank)"
+        )
+
+
+def parse_max_train_steps(value) -> int | None:
+    """trainer.total_training_steps as a cap on optimizer updates: None/null = no cap."""
+    if value is None:
+        return None
+    steps = int(value)
+    if steps < 1:
+        raise ValueError(f"trainer.total_training_steps must be >= 1 or null, got {value!r}")
+    return steps
 
 
 class TrainingStopException(Exception):
@@ -157,6 +199,15 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         # required_samples use ppo_mini_batch_size*require_batches as the minimum number of samples.
         self.require_batches = config.async_training.require_batches
         self.required_samples = config.actor_rollout_ref.actor.ppo_mini_batch_size * self.require_batches
+        check_unsupported_async_keys(config.async_training)
+        # Cap on optimizer updates (verl's trainer.total_training_steps; null = the rollouter's prompt budget
+        # alone ends the run). Reaching it forces a final checkpoint and ends the run.
+        self.max_train_steps = parse_max_train_steps(config.trainer.get("total_training_steps", None))
+        self.stopped_by_step_cap = False
+        replay_cfg = config.async_training.get("replay_buffer", None)
+        self.replay_enable = bool(replay_cfg.get("enable", False)) if replay_cfg else False
+        if self.replay_enable:
+            self._init_replay(config, replay_cfg)
         self._step_wait_times: list[float] = []  # per-collection wait times within the current step (seconds)
         # Per-collection count of samples that actually had to be waited on (not
         # already sitting in the queue at collection start). Parallel to
@@ -212,6 +263,75 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             expected_samples=0,
             buffer_samples=0,
             only_hybrid=self.only_hybrid,
+        )
+
+    def _init_replay(self, config, replay_cfg):
+        """Replay-buffer mode: the trainer keeps drained groups in a version-aware buffer and composes every
+        optimizer mini-batch from it (fresh groups first, then a staleness/reuse-weighted draw), syncing
+        weights after every update. See replay_buffer.py."""
+        assert self.trigger_parameter_sync_step == 1, (
+            "replay_buffer mode syncs weights after every update: set async_training.trigger_parameter_sync_step=1"
+        )
+        assert self.require_batches == 1, (
+            "replay_buffer mode composes one mini-batch per update: set async_training.require_batches=1"
+        )
+        assert int(config.actor_rollout_ref.actor.ppo_epochs) == 1, "replay_buffer mode needs actor.ppo_epochs=1"
+        assert str(config.algorithm.adv_estimator) == "grpo", (
+            f"replay_buffer mode freezes GRPO group advantages at insertion; got {config.algorithm.adv_estimator}"
+        )
+        assert not config.algorithm.use_kl_in_reward, "replay_buffer mode does not support use_kl_in_reward"
+        assert not self.use_critic, "replay_buffer mode does not support a critic"
+        assert not config.async_training.get("use_dynamic_resource_scheduling", False), (
+            "replay_buffer mode does not support use_dynamic_resource_scheduling"
+        )
+        # The update trains against the cached behavior log-probs (bypass mode). losses.py reads only
+        # actor.policy_loss, so the worker-side keys must be set explicitly, not just algorithm.*.
+        rollout_corr = config.algorithm.get("rollout_correction", None)
+        assert rollout_corr is not None and rollout_corr.get("bypass_mode", False), (
+            "replay_buffer mode trains against rollout log-probs: set algorithm.rollout_correction.bypass_mode=True"
+        )
+        policy_loss = config.actor_rollout_ref.actor.policy_loss
+        assert policy_loss.get("loss_mode", None) == "bypass_mode", (
+            "replay_buffer mode: set actor_rollout_ref.actor.policy_loss.loss_mode=bypass_mode "
+            "(algorithm.rollout_correction.bypass_mode alone never reaches the workers)"
+        )
+        worker_corr = policy_loss.get("rollout_correction", None)
+        assert worker_corr is not None and worker_corr.get("loss_type", None) == "reinforce", (
+            "replay_buffer mode: pass +actor_rollout_ref.actor.policy_loss.rollout_correction="
+            "'${algorithm.rollout_correction}' with algorithm.rollout_correction.loss_type=reinforce"
+        )
+
+        self.replay_requires_mini_batches = float(replay_cfg.get("requires_mini_batches", 1.0))
+        assert self.replay_requires_mini_batches > 0, "replay_buffer.requires_mini_batches must be > 0"
+        n = int(config.actor_rollout_ref.rollout.n)
+        # requires_mini_batches in (0, 1) sizes only the FIRST mini-batch (rounded up so its sequences split
+        # evenly over the trainer DP ranks); later mini-batches are full-size with the watermark at one
+        # mini-batch. Values >= 1 are the pause watermark in mini-batches.
+        self.replay_first_mini_size = first_minibatch_groups(
+            self.replay_requires_mini_batches, self.required_samples, n, trainer_dp_size(config)
+        )
+        self.replay_min_fresh_ratio = float(replay_cfg.get("min_fresh_ratio", 0.0))
+        assert 0.0 <= self.replay_min_fresh_ratio <= 1.0, (
+            f"replay_buffer.min_fresh_ratio must be in [0, 1], got {self.replay_min_fresh_ratio}"
+        )
+        self.replay_min_fresh_wait_timeout_s = float(replay_cfg.get("min_fresh_wait_timeout_s", 3600.0))
+        self.replay_fresh_poll_interval_s = 0.5
+        reuse_halflife = replay_cfg.get("reuse_halflife", None)
+        self.replay_buffer = ReplayBuffer(
+            tau=float(replay_cfg.get("tau", 8.0)),
+            staleness_threshold=int(replay_cfg.get("staleness_threshold", 32)),
+            seed=int(replay_cfg.get("sampling_seed", 1234)),
+            reuse_halflife=float(reuse_halflife) if reuse_halflife is not None else None,
+        )
+        self.replay_updates_done = 0
+        self.rollout_done = False
+        self._replay_fresh_wait_s = 0.0
+        self._replay_fresh_floor_waived = 0
+        print(
+            f"[FullyAsyncTrainer][Replay] tau={self.replay_buffer.tau} k={self.replay_buffer.staleness_threshold} "
+            f"reuse_halflife={self.replay_buffer.reuse_halflife} mini-batch={self.required_samples} groups, "
+            f"first={self.replay_first_mini_size or self.required_samples}, "
+            f"min_fresh_ratio={self.replay_min_fresh_ratio}"
         )
 
     async def _setup_checkpoint_manager(self):
@@ -354,6 +474,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             await self._setup_dynamic_resource_controller()
 
     def set_total_train_steps(self, total_training_steps):
+        if self.max_train_steps is not None:
+            total_training_steps = min(total_training_steps, self.max_train_steps)
         self.total_train_steps = total_training_steps
 
         try:
@@ -518,9 +640,12 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
         # Use queue mode, no need for traditional dataloader iterator
         # Initialize to get the first batch of data
-        while True:
+        while not self._train_step_cap_reached():
             try:
-                await self.fit_step()
+                if self.replay_enable:
+                    await self._fit_replay_step()
+                else:
+                    await self.fit_step()
             except TrainingStopException:
                 print("[FullyAsyncTrainer] Training stopped by queue termination signal")
                 break
@@ -532,6 +657,226 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 self._fit_log_aggregated_training_metrics(rollout_reset_timing_raw)
             await self._fit_validate()
         self._fit_save_checkpoint(force=True)
+
+    def _train_step_cap_reached(self) -> bool:
+        """True once trainer.total_training_steps optimizer updates have been done (global_steps starts at 1
+        and counts updates, so it reads N + 1 after N)."""
+        if self.max_train_steps is None or self.global_steps <= self.max_train_steps:
+            return False
+        if not self.stopped_by_step_cap:
+            print(f"[FullyAsyncTrainer] reached trainer.total_training_steps={self.max_train_steps}; stopping")
+            self.stopped_by_step_cap = True
+        return True
+
+    # ==================== replay-buffer training mode ====================
+
+    async def _drain_queue_into_buffer(self) -> int:
+        """Move everything currently in the message queue into the replay buffer without blocking. Returns
+        the number of groups added; the termination sentinel sets rollout_done."""
+        added = 0
+        for raw in await self.message_queue_client.get_available_samples():
+            if raw is None:
+                self.rollout_done = True
+                continue
+            self.replay_buffer.add(ray.cloudpickle.loads(raw), self.current_param_version)
+            added += 1
+        return added
+
+    async def _wait_one_sample_into_buffer(self) -> bool:
+        """Block for one sample and add it to the buffer; False when the rollouter has finished instead."""
+        result = await self.message_queue_client.get_sample()
+        sample = result[0] if result is not None else None
+        if sample is None:
+            self.rollout_done = True
+            return False
+        self.replay_buffer.add(ray.cloudpickle.loads(sample), self.current_param_version)
+        return True
+
+    def _replay_minibatch_size(self) -> int:
+        """Groups in the next composition: the smaller first mini-batch (requires_mini_batches < 1) once,
+        then ppo_mini_batch_size."""
+        if self.replay_first_mini_size is not None and self.replay_updates_done == 0:
+            return int(self.replay_first_mini_size)
+        return int(self.required_samples)
+
+    def _replay_min_fresh_groups(self, mini_size: int) -> int:
+        """The fresh-share floor in groups: ceil(min_fresh_ratio x mini_size); 0 when the gate is off."""
+        if self.replay_min_fresh_ratio <= 0.0:
+            return 0
+        return min(mini_size, int(math.ceil(self.replay_min_fresh_ratio * mini_size - 1e-9)))
+
+    async def _wait_for_fresh_floor(self, mini_size: int) -> tuple[float, int]:
+        """Wait (polling the queue) until enough groups arrived since the previous composition, the rollouter
+        is done, or the wall-clock cap is hit. Returns (seconds waited, 1 if the floor was waived).
+
+        The wait is capped because the rollouter stops generating once its staleness quota is used up, and
+        dropped degenerate groups count against it without ever reaching the buffer: after a reward collapse
+        an uncapped wait could leave both sides waiting on each other."""
+        floor = self._replay_min_fresh_groups(mini_size)
+        if floor <= 0 or self.replay_buffer.pending_fresh_count() >= floor:
+            return 0.0, 0
+        start = time.time()
+        announced = False
+        while self.replay_buffer.pending_fresh_count() < floor:
+            waited = time.time() - start
+            if self.rollout_done:
+                print(f"[FullyAsyncTrainer][Replay] rollout finished: fresh floor {floor} waived")
+                return waited, 1
+            timeout = self.replay_min_fresh_wait_timeout_s
+            if timeout > 0.0 and waited >= timeout:
+                print(
+                    f"[FullyAsyncTrainer][Replay] WARNING: fresh floor {floor} not met after {waited:.0f}s "
+                    f"({self.replay_buffer.pending_fresh_count()} fresh groups); composing anyway"
+                )
+                return waited, 1
+            if await self._drain_queue_into_buffer() == 0:
+                await asyncio.sleep(self.replay_fresh_poll_interval_s)
+                if not announced and waited >= 60.0:
+                    announced = True
+                    print(
+                        f"[FullyAsyncTrainer][Replay] waiting for fresh groups: "
+                        f"{self.replay_buffer.pending_fresh_count()}/{floor} after {waited:.0f}s"
+                    )
+        return time.time() - start, 0
+
+    async def _acquire_replay_minibatch(self):
+        """Compose the next mini-batch of groups, or (None, None) once the rollouter has finished and the
+        buffer cannot fill another one.
+
+        Waits until the buffer holds the watermark (requires_mini_batches x mini_size groups, or one
+        mini-batch when requires_mini_batches < 1), then for the fresh-share floor, then composes."""
+        mini_size = self._replay_minibatch_size()
+        if self.replay_requires_mini_batches < 1:
+            watermark = mini_size
+        else:
+            watermark = self.replay_requires_mini_batches * mini_size
+        await self._drain_queue_into_buffer()
+        while self.replay_buffer.size() < watermark:
+            if self.rollout_done:
+                print(
+                    f"[FullyAsyncTrainer][Replay] rollout finished with buffer {self.replay_buffer.size()} "
+                    f"< watermark {watermark}; stopping"
+                )
+                return None, None
+            await self._wait_one_sample_into_buffer()
+        self._replay_fresh_wait_s, self._replay_fresh_floor_waived = await self._wait_for_fresh_floor(mini_size)
+        return self.replay_buffer.compose_minibatch(mini_size, self.current_param_version)
+
+    def _replay_post_update_maintenance(self, entries, new_version: int) -> None:
+        """After an update, at the version it produced: count the trainings BEFORE evicting (a just-trained
+        group crossing the threshold is not generated-but-never-trained waste), evict, rescore."""
+        self.replay_buffer.mark_trained(entries)
+        self.replay_buffer.evict(new_version)
+        self.replay_buffer.recompute_scores(new_version)
+
+    def _build_replay_batch(self, entries) -> DataProto:
+        """Training batch from buffered groups with the insertion-time statistics frozen by the rollouter:
+        advantages broadcast from advantage_scalar, sparse token-level rewards from reward_scalar, and the
+        cached rollout log-probs as the behavior policy (bypass mode) -- nothing is recomputed."""
+        balance = self._balance_batch if self.config.trainer.balance_batch else None
+        batch = assemble_batch_from_rollout_samples([e.sample for e in entries], self.tokenizer, self.config, balance)
+        response_mask = batch.batch["response_mask"]
+        adv = torch.from_numpy(np.asarray(batch.non_tensor_batch["advantage_scalar"], dtype=np.float32))
+        advantages = adv.unsqueeze(-1) * response_mask.float()
+        batch.batch["advantages"] = advantages
+        batch.batch["returns"] = advantages
+        rewards = torch.from_numpy(np.asarray(batch.non_tensor_batch["reward_scalar"], dtype=np.float32))
+        scores = torch.zeros_like(response_mask, dtype=torch.float32)
+        lengths = response_mask.sum(dim=-1).long()
+        valid = lengths > 0
+        scores[torch.arange(response_mask.shape[0])[valid], lengths[valid] - 1] = rewards[valid]
+        batch.batch["token_level_scores"] = scores
+        batch.batch["token_level_rewards"] = scores
+        batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+        return batch
+
+    def _add_replay_metrics(self, metrics: dict, info: dict, new_version: int) -> None:
+        """replay/* metrics after this update's maintenance, at the version it produced."""
+        buf = self.replay_buffer
+        staleness = info["staleness"]
+        n_new = int(info["n_new"])
+        size = n_new + int(info["n_replayed"])
+        buffer_staleness = buf.staleness_list(new_version)
+        times_trained = list(info.get("times_trained", []))
+        buffer_times_trained = buf.times_trained_list()
+        metrics.update(
+            {
+                "replay/buffer_size": buf.size(),
+                "replay/buffer_untrained": buf.untrained_count(),
+                "replay/buffer_max_staleness": float(buf.max_staleness(new_version) or 0),
+                "replay/minibatch_size": size,
+                "replay/minibatch_new": n_new,
+                "replay/minibatch_replayed": size - n_new,
+                "replay/minibatch_new_ratio": n_new / size,
+                "replay/minibatch_staleness_mean": float(np.mean(staleness)),
+                "replay/minibatch_staleness_max": float(np.max(staleness)),
+                "replay/minibatch_staleness_p50": float(np.percentile(staleness, 50)),
+                "replay/evicted_cum": buf.evicted_total,
+                "replay/evicted_unseen_cum": buf.evicted_unseen_total,
+                "replay/evicted_trained_once_cum": buf.evicted_trained_once_total,
+                "replay/total_added": buf.total_added,
+                "replay/updates_done": self.replay_updates_done,
+                "replay/fresh_floor": float(self._replay_min_fresh_groups(size)),
+                "replay/fresh_wait_s": float(self._replay_fresh_wait_s),
+                "replay/fresh_floor_waived": float(self._replay_fresh_floor_waived),
+            }
+        )
+        if buffer_staleness:
+            metrics["replay/buffer_staleness_mean"] = float(np.mean(buffer_staleness))
+            metrics["replay/buffer_staleness_p50"] = float(np.percentile(buffer_staleness, 50))
+        fresh = list(info.get("fresh_staleness", staleness[:n_new]))
+        replayed = list(staleness[n_new:])
+        if fresh:
+            metrics["replay/minibatch_fresh_staleness_mean"] = float(np.mean(fresh))
+            metrics["replay/minibatch_fresh_staleness_max"] = float(np.max(fresh))
+        if replayed:
+            metrics["replay/minibatch_replayed_staleness_mean"] = float(np.mean(replayed))
+        if times_trained:
+            metrics["replay/minibatch_times_trained_mean"] = float(np.mean(times_trained))
+            metrics["replay/minibatch_times_trained_max"] = float(np.max(times_trained))
+        if buffer_times_trained:
+            metrics["replay/buffer_times_trained_mean"] = float(np.mean(buffer_times_trained))
+
+    async def _fit_replay_step(self):
+        """One replay-mode update: compose a mini-batch from the buffer, update the actor on it against the
+        cached rollout log-probs, maintain the buffer at the new version, sync weights, validate, save."""
+        self.metrics = {"training/global_step": self.global_steps, "training/epoch": self.epoch}
+        self.timing_raw = {}
+        self.reward_extra_infos_dict = {}
+
+        steps = self.config.global_profiler.steps
+        should_profile = steps is not None and (self.current_param_version + 1) in steps
+        self._fit_start_profile(should_profiler=should_profile)
+
+        with marked_timer("step", self.timing_raw):
+            with marked_timer("gen", self.timing_raw, color="red"):
+                entries, info = await self._acquire_replay_minibatch()
+                if entries is None:
+                    raise TrainingStopException("Training terminated: rollout finished and replay buffer drained")
+                batch = self._build_replay_batch(entries)
+                self._collect_metrics_from_samples(batch, self.metrics)
+            _allocated_start = time.time()
+            batch = self._fit_compute_log_prob(batch)  # bypass mode: old_log_probs = rollout_log_probs
+            with marked_timer("update_actor", self.timing_raw, color="red"):
+                # the batch is exactly one optimizer mini-batch, also when it is the smaller first one
+                actor_output = self._update_actor(batch, mini_batch_size=len(batch))
+            self.metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
+            self._fit_update_local_step()
+            self.replay_updates_done += 1
+            self._replay_post_update_maintenance(entries, self.current_param_version)
+            self._add_replay_metrics(self.metrics, info, self.current_param_version)
+            rollout_reset_timing_raw = await self._fit_update_weights()
+            self._fit_dump_data(batch)
+            self._record_train_resource_utilization(allocated_time=time.time() - _allocated_start)
+
+        await self._fit_validate()
+        self._fit_save_checkpoint()
+        self._fit_stop_profile(should_profiler=should_profile)
+        self._fit_collect_metrics(batch)
+        # add this update's metrics before logging the cycle, so they land at the version it produced
+        self._fit_postprocess_step()
+        if rollout_reset_timing_raw is not None:
+            self._fit_log_aggregated_training_metrics(rollout_reset_timing_raw)
 
     async def fit_step(self, batch_dict: dict = None):
         """

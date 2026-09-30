@@ -1299,7 +1299,13 @@ class RayPPOTrainer:
         old_log_prob = DataProto.from_tensordict(old_log_prob)
         return old_log_prob, old_log_prob_mfu
 
-    def _update_actor(self, batch: DataProto) -> DataProto:
+    def _update_actor(self, batch: DataProto, mini_batch_size: Optional[int] = None) -> DataProto:
+        """Update the actor on ``batch``.
+
+        ``mini_batch_size`` (sequences) overrides ppo_mini_batch_size x rollout.n as both the optimizer
+        mini-batch and the global batch size the loss is normalized by (callers whose batches are not a
+        multiple of the configured mini-batch, e.g. the replay-buffer trainer's smaller first update).
+        """
         rollout_config = self.config.actor_rollout_ref.rollout
         batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
         # TODO: Make "temperature" single source of truth from generation.
@@ -1324,8 +1330,11 @@ class RayPPOTrainer:
                 and not distillation_loss_cfg.use_task_rewards
                 and not distillation_loss_cfg.use_policy_gradient
             )
-        ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
-        ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        if mini_batch_size is not None:
+            ppo_mini_batch_size = int(mini_batch_size)
+        else:
+            ppo_mini_batch_size = self.config.actor_rollout_ref.actor.ppo_mini_batch_size
+            ppo_mini_batch_size = ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
         ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs
         seed = self.config.actor_rollout_ref.actor.data_loader_seed
         shuffle = self.config.actor_rollout_ref.actor.shuffle

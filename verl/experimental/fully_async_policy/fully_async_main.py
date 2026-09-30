@@ -208,6 +208,13 @@ class FullyAsyncTaskRunner:
                         raise e
 
                 futures = remaining_futures
+                if trainer_future in done_futures and futures:
+                    # The trainer is done (normally after the rollouter's end signal; earlier when it hit
+                    # trainer.total_training_steps): nothing consumes further samples, stop generating.
+                    print("[ASYNC MAIN] Trainer finished; cancelling the rollouter")
+                    for remaining_future in futures:
+                        ray.cancel(remaining_future)
+                    futures = []
 
         except Exception as e:
             print(f"[ASYNC MAIN] Training failed: {e}")
