@@ -39,7 +39,19 @@ ALL = [QWEN, PANGU, ORZ]
 
 
 # Script knobs that must not leak in from the caller's shell.
-SCRIPT_ENV_KNOBS = {"VERL_GPU_MEM_CAP_GB", "SEED", "max_updates", "ROLLOUT_QUANT", "TIS", "TIS_THRESHOLD"}
+SCRIPT_ENV_KNOBS = {
+    "VERL_GPU_MEM_CAP_GB",
+    "SEED",
+    "max_updates",
+    "ROLLOUT_QUANT",
+    "TIS",
+    "TIS_THRESHOLD",
+    "clip_ratio_low",
+    "clip_ratio_high",
+    "clip_ratio_c",
+    "lr_warmup_steps",
+    "weight_decay",
+}
 
 
 def _run(script, env=None, args=(), tmp=None):
@@ -388,39 +400,95 @@ class TestQwenPrecisionAndTis:
         c = compose(QWEN_TIS)
         rc = c["algorithm"]["rollout_correction"]
         assert rc["rollout_is"] == "token"
-        assert rc["rollout_is_threshold"] == 2.0
+        assert rc["rollout_is_threshold"] == 8.0
         assert rc["bypass_mode"] is False
         assert rc["rollout_rs"] is None
         assert c["actor_rollout_ref"]["rollout"]["quantization"] is None
         assert c["actor_rollout_ref"]["rollout"]["calculate_log_probs"] is True
         assert c["actor_rollout_ref"]["rollout"]["logprobs_mode"] == "processed_logprobs"
-        assert c["trainer"]["experiment_name"].endswith(" 0.01-wd tis-C2.0 seed-1")
+        assert c["trainer"]["experiment_name"].endswith(" 0.1-wd clip-0.2-0.28-c10.0 warmup-10 tis-C8 seed-1")
 
     def test_fp8_tis(self):
         c = compose(QWEN_TIS, ROLLOUT_QUANT="fp8")
         assert c["actor_rollout_ref"]["rollout"]["quantization"] == "fp8"
         assert c["algorithm"]["rollout_correction"]["rollout_is"] == "token"
-        assert c["trainer"]["experiment_name"].endswith(" tis-C2.0 rollout-fp8 seed-1")
+        assert c["trainer"]["experiment_name"].endswith(" tis-C8 rollout-fp8 seed-1")
 
-    def test_bf16_tis_differs_from_baseline_only_by_tis(self):
-        expected = {"algorithm.rollout_correction.rollout_is"} | NAME_DERIVED_KEYS
+    def test_tis_script_uses_flashrl_parameters(self):
+        c = compose(QWEN_TIS)
+        actor = c["actor_rollout_ref"]["actor"]
+        assert c["algorithm"]["rollout_correction"]["rollout_is_threshold"] == 8.0
+        assert (actor["clip_ratio"], actor["clip_ratio_low"], actor["clip_ratio_high"]) == (0.2, 0.2, 0.28)
+        assert actor["clip_ratio_c"] == 10.0
+        assert actor["optim"]["lr_warmup_steps"] == 10
+        assert actor["optim"]["weight_decay"] == 0.1
+        assert actor["optim"]["lr_decay_style"] == "constant"
+        assert actor["optim"]["lr"] == 1e-6
+
+    def test_bf16_tis_differs_from_baseline_only_by_the_flashrl_knobs(self):
+        expected = {
+            "algorithm.rollout_correction.rollout_is",
+            "algorithm.rollout_correction.rollout_is_threshold",
+            "actor_rollout_ref.actor.clip_ratio_high",
+            "actor_rollout_ref.actor.clip_ratio_c",
+            "actor_rollout_ref.actor.optim.lr_warmup_steps",
+            "actor_rollout_ref.actor.optim.weight_decay",
+        } | NAME_DERIVED_KEYS
         assert _diff(compose(QWEN), compose(QWEN_TIS)) == expected
+
+    def test_tis_script_with_baseline_knobs_is_a_tis_only_ablation(self):
+        ablation = compose(
+            QWEN_TIS,
+            TIS_THRESHOLD="2.0",
+            clip_ratio_high="0.2",
+            clip_ratio_c="3.0",
+            lr_warmup_steps="0",
+            weight_decay="0.01",
+        )
+        assert _diff(compose(QWEN), ablation) == {"algorithm.rollout_correction.rollout_is"} | NAME_DERIVED_KEYS
+        assert ablation["trainer"]["experiment_name"].endswith(" 0.01-wd tis-C2.0 seed-1")
+
+    def test_baseline_name_unchanged_by_new_knobs(self):
+        name = compose(QWEN)["trainer"]["experiment_name"]
+        assert "clip-" not in name and "warmup-" not in name
+        assert name.endswith(" 0.01-wd seed-1")
+
+    @pytest.mark.parametrize(
+        "env, tag",
+        [
+            ({"clip_ratio_high": "0.28"}, " clip-0.2-0.28-c3.0"),
+            ({"clip_ratio_c": "10.0"}, " clip-0.2-0.2-c10.0"),
+            ({"lr_warmup_steps": "5"}, " warmup-5"),
+        ],
+    )
+    def test_nondefault_knobs_are_tagged_on_the_baseline(self, env, tag):
+        assert tag in compose(QWEN, **env)["trainer"]["experiment_name"]
 
     def test_fp8_tis_differs_from_bf16_tis_only_by_quantization(self):
         diff = _diff(compose(QWEN_TIS), compose(QWEN_TIS, ROLLOUT_QUANT="fp8"))
         assert diff == {"actor_rollout_ref.rollout.quantization"} | NAME_DERIVED_KEYS
 
-    def test_tis_script_is_the_baseline_with_tis_on(self):
-        assert _diff(compose(QWEN_TIS), compose(QWEN, TIS="True")) == set()
+    def test_tis_script_is_the_baseline_with_tis_and_flashrl_knobs(self):
+        flashrl = dict(
+            TIS="True",
+            TIS_THRESHOLD="8",
+            clip_ratio_high="0.28",
+            clip_ratio_c="10.0",
+            lr_warmup_steps="10",
+            weight_decay="0.1",
+        )
+        assert _diff(compose(QWEN_TIS), compose(QWEN, **flashrl)) == set()
 
-    def test_tis_script_honours_an_explicit_tis_off(self):
-        # the wrapper only defaults TIS; an explicit env value wins
-        assert _diff(compose(QWEN_TIS, TIS="False"), compose(QWEN)) == set()
+    def test_tis_script_honours_explicit_env_values(self):
+        # the wrapper only sets defaults; explicit env values win
+        c = compose(QWEN_TIS, TIS="False", weight_decay="0.05")
+        assert c["algorithm"]["rollout_correction"]["rollout_is"] is None
+        assert c["actor_rollout_ref"]["actor"]["optim"]["weight_decay"] == 0.05
 
     def test_threshold_flows_to_config_and_name(self):
-        c = compose(QWEN_TIS, TIS_THRESHOLD="4")
-        assert c["algorithm"]["rollout_correction"]["rollout_is_threshold"] == 4.0
-        assert " tis-C4 seed-1" in c["trainer"]["experiment_name"]
+        c = compose(QWEN_TIS, TIS_THRESHOLD="2")
+        assert c["algorithm"]["rollout_correction"]["rollout_is_threshold"] == 2.0
+        assert " tis-C2 seed-1" in c["trainer"]["experiment_name"]
 
     def test_wrapper_forwards_env_knobs_and_cli_overrides(self):
         c = compose(QWEN_TIS, args=("trainer.total_training_steps=3",), SEED="7", ROLLOUT_QUANT="fp8")
@@ -430,7 +498,7 @@ class TestQwenPrecisionAndTis:
 
     def test_emulation_tag_still_last(self):
         c = compose(QWEN_TIS, ROLLOUT_QUANT="fp8", VERL_GPU_MEM_CAP_GB="108", gpu_memory_utilization="0.283")
-        assert c["trainer"]["experiment_name"].endswith("tis-C2.0 rollout-fp8 seed-1 h100-emu-108gb-gmu0.283")
+        assert c["trainer"]["experiment_name"].endswith("tis-C8 rollout-fp8 seed-1 h100-emu-108gb-gmu0.283")
 
     def test_toggles_do_not_leak_into_other_arms(self):
         for script in (PANGU, ORZ):
