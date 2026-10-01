@@ -186,6 +186,12 @@ pause_generation_during_save=${pause_generation_during_save:-True}
 # ================= Training/Rollout Steps =================
 # 66000-prompt generation budget (fed prompts, not kept groups).
 total_rollout_steps=${total_rollout_steps:-66000}
+# LR schedule horizon (the source's lr_decay_steps=total_rollout_steps). It MUST be passed explicitly: the fully-async
+# trainer builds its Megatron LR scheduler before it learns the run length (optim.total_training_steps is still -1
+# then), and Megatron asserts lr_decay_steps > 0 and lr_warmup_steps < lr_decay_steps. Constant LR, so the value
+# matters only through that assertion.
+lr_decay_steps=${lr_decay_steps:-${total_rollout_steps}}
+[[ "${lr_decay_steps}" =~ ^[1-9][0-9]*$ ]] || { echo "lr_decay_steps must be a positive integer, got '${lr_decay_steps}'" >&2; exit 2; }
 # Cap on OPTIMIZER UPDATES (= parameter versions: one sync per update) via trainer.total_training_steps;
 # null = the prompt budget decides. At the cap the trainer validates, writes a final hf_model checkpoint
 # and the rollouter is cancelled.
@@ -276,6 +282,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.actor.optim.lr=${lr} \
     actor_rollout_ref.actor.optim.lr_warmup_steps=${lr_warmup_steps} \
     actor_rollout_ref.actor.optim.lr_decay_style=${lr_decay_style} \
+    actor_rollout_ref.actor.optim.lr_decay_steps=${lr_decay_steps} \
     actor_rollout_ref.actor.optim.weight_decay=${weight_decay} \
     actor_rollout_ref.actor.optim.clip_grad=${grad_clip} \
     +actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_cpu_offload=True \

@@ -41,22 +41,26 @@
 # shell, so they inherit the environment.
 # H100 EMULATION IS ON BY DEFAULT (for remote_h200's H200s, 139.8 GiB usable each). In this layout every GPU
 # holds one role, so each is emulated on its own:
-#   * gpu_memory_utilization=0.513  rollout GPUs: vLLM gets the H100 budget of the arm's 0.9,
-#                                   0.9 x 79.65 / 139.8 GiB = 71.7 GiB.
+#   * gpu_memory_utilization=0.5    rollout GPUs: vLLM gets 0.5 x 139.8 = 69.9 GiB, i.e. 0.88 of an H100 (79.65 GiB).
+#                                   Not the arm's 0.9 (0.513 here, 71.7 GiB): vLLM's budget excludes the NCCL
+#                                   weight sync's 2 x 2048 MB receive buffers and the FP8 re-quantization
+#                                   temporaries, and at 0.513 the 5+3 smoke (Qwen3-4B) peaked at 83,263 MiB on
+#                                   every rollout GPU, over an H100's 81,559.
 #   * VERL_GPU_MEM_CAP_GB=78        trainer GPUs: caps the Megatron trainer's allocator at a whole H100 (79.65 GiB)
 #                                   minus ~1.5 GiB outside it (CUDA context, NCCL, cuBLAS).
-# Both are tagged in exp_name (" h100-emu-78gb-gmu0.513"). The cap cannot bound vLLM: after each FP8 weight
+# Both are tagged in exp_name (" h100-emu-78gb-gmu0.5"). The cap cannot bound vLLM: after each FP8 weight
 # sync vLLM may hold a few GB over its budget, so sample nvidia-smi on the rollout GPUs; > ~80,000 MiB would not
 # fit a real H100 (81,559 MiB).
-# ON A REAL H100 OVERRIDE BOTH: VERL_GPU_MEM_CAP_GB= gpu_memory_utilization=0.9 bash <this script>
+# ON A REAL H100 OVERRIDE BOTH: VERL_GPU_MEM_CAP_GB= gpu_memory_utilization=0.88 bash <this script>
 # (an empty VERL_GPU_MEM_CAP_GB disables the cap).
 # SCHEDULE (differs from the bf16 arm): lr_warmup_steps=12 (linear, in optimizer updates; arm: 0),
 # validation and hf_model checkpoints every 12 updates (test_freq=12, save_freq=12; arm: 25), SEED=1.
-# All env-overridable; the warmup is tagged " warmup-12" in exp_name. max_updates must exceed the warmup.
+# All env-overridable; the warmup is tagged " warmup-12" in exp_name. The warmup must be shorter than lr_decay_steps
+# (default total_rollout_steps = 66000; Megatron asserts it), not than max_updates.
 set -euo pipefail
 export ROLLOUT_QUANT=${ROLLOUT_QUANT:-fp8}
 export VERL_GPU_MEM_CAP_GB=${VERL_GPU_MEM_CAP_GB-78}
-export gpu_memory_utilization=${gpu_memory_utilization:-0.513}
+export gpu_memory_utilization=${gpu_memory_utilization:-0.5}
 export lr_warmup_steps=${lr_warmup_steps:-12}
 export SEED=${SEED:-1}
 export test_freq=${test_freq:-12}
