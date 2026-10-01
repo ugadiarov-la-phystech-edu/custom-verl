@@ -35,7 +35,11 @@ SCRIPTS = REPO / "verl" / "experimental" / "fully_async_policy" / "shell" / "vcp
 _ARM = "grpo_novcpo_8gpu_dapo17k_5+3_resp8k_megatron_offload_replay_tau=8_k=32"
 QWEN = f"{_ARM}_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.5.sh"
 PANGU = f"{_ARM}_min-ess=1.07_ess-lr-scale=0.5_fresh=0.5_openpangu7b.sh"
-ALL = [QWEN, PANGU]
+QWEN_FP8 = f"{_ARM}_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.5_fp8.sh"
+QWEN_FP8_C8 = f"{_ARM}_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.5_fp8_tis-c8_token-mean.sh"
+ALL = [QWEN, PANGU, QWEN_FP8]
+QWEN_ARMS = (QWEN, QWEN_FP8)
+DEEPGEMM_VARS = ("CUDA_HOME", "DG_JIT_CACHE_DIR", "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER")
 
 # Script knobs that must not leak in from the caller's shell.
 SCRIPT_ENV_KNOBS = {
@@ -50,6 +54,15 @@ SCRIPT_ENV_KNOBS = {
     "log_dir",
     "CKPTS_DIR",
     "exp_name",
+    "ROLLOUT_QUANT",
+    "gpu_memory_utilization",
+    "lr_warmup_steps",
+    "test_freq",
+    "save_freq",
+    "rollout_is_threshold",
+    "loss_agg_mode",
+    "DEEPGEMM_CUDA_HOME",
+    *DEEPGEMM_VARS,
 }
 
 
@@ -74,14 +87,21 @@ def _run(script, env, args, tmp):
     )
     full_env.update(env)
     # the fully-async config's Hydra searchpath is relative: launch from the repo root, as the scripts say
-    return subprocess.run(
-        ["bash", str(SCRIPTS / script), *args, "--cfg", "job", "--resolve"],
-        cwd=REPO,
-        env=full_env,
-        capture_output=True,
-        text=True,
-        timeout=600,
-    )
+    for _ in range(2):
+        proc = subprocess.run(
+            ["bash", str(SCRIPTS / script), *args, "--cfg", "job", "--resolve"],
+            cwd=REPO,
+            env=full_env,
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        # Retry once only if the Python interpreter itself crashed (bash reports 128 + SIGSEGV), as in
+        # test_baseline_scripts_on_cpu.py: seen sporadically under 8 pytest-xdist workers. Real errors are not
+        # retried.
+        if proc.returncode != 128 + 11:
+            break
+    return proc
 
 
 @cache
@@ -166,11 +186,11 @@ class TestRecipe:
         assert c["actor_rollout_ref"]["actor"]["data_loader_seed"] == seed
         assert c["actor_rollout_ref"]["rollout"]["seed"] == seed
         assert c["async_training"]["replay_buffer"]["sampling_seed"] == seed
-        assert c["trainer"]["experiment_name"].endswith(f"seed-{seed}")
+        assert c["trainer"]["experiment_name"].endswith(f" seed-{seed}")
 
     def test_max_updates(self, script):
         assert compose(script)["trainer"]["total_training_steps"] is None
-        assert compose(script, max_updates="12")["trainer"]["total_training_steps"] == 12
+        assert compose(script, max_updates="13")["trainer"]["total_training_steps"] == 13
 
     def test_env_overrides_and_tags(self, script):
         c = compose(script, replay_min_fresh_ratio="0", replay_reuse_halflife="null", concurrency_ramp="null")
@@ -196,7 +216,7 @@ class TestRecipe:
         from verl.workers.config import ESSScalingConfig
 
         actor = omega_conf_to_dataclass(_cfg(script).actor_rollout_ref.actor)
-        min_ess = 1.1 if script == QWEN else 1.07
+        min_ess = 1.1 if script in QWEN_ARMS else 1.07
         assert actor.ess_scaling == ESSScalingConfig(enable=True, min_ess=min_ess, lr_scale=0.5, use_clipped=False)
         assert actor.policy_loss.loss_mode == "bypass_mode"
         assert actor.policy_loss.rollout_correction["loss_type"] == "reinforce"
@@ -225,7 +245,7 @@ class TestRecipe:
         monkeypatch.setattr(rollouter_cls, "_init_dump_executor", lambda self: None)
         r = rollouter_cls(config=_cfg(script), tokenizer=None)
         assert r.replay_mode and r.serialize_validation and r.pause_generation_during_save
-        assert r.concurrency_ramp == ([5, 12, 20] if script == QWEN else [4, 10, 20])
+        assert r.concurrency_ramp == ([5, 12, 20] if script in QWEN_ARMS else [4, 10, 20])
         assert r.ramp_first_size == 18
 
 
@@ -284,3 +304,304 @@ def test_the_arms_differ_only_where_intended():
 def test_unknown_override_fails():
     proc = _run(QWEN, {}, ("async_training.not_a_key=1",), Path("/tmp") / f"replay_compose_{os.getpid()}")
     assert proc.returncode != 0
+
+
+# --------------------------------------------------------------------------- fp8 rollout (QWEN_FP8 wrapper)
+
+
+class TestFp8Rollout:
+    def test_default_rollout_is_bf16(self):
+        c = compose(QWEN)
+        assert c["actor_rollout_ref"]["rollout"]["quantization"] is None
+        assert "rollout-fp8" not in c["trainer"]["experiment_name"]
+
+    def test_wrapper_sets_fp8(self):
+        c = compose(QWEN_FP8)
+        assert c["actor_rollout_ref"]["rollout"]["quantization"] == "fp8"
+        assert c["trainer"]["experiment_name"].endswith(" 0.1-wd warmup-12 rollout-fp8 seed-1")
+        # the objective that absorbs the FP8 mismatch is unchanged: token TIS against rollout log-probs
+        corr = c["algorithm"]["rollout_correction"]
+        assert (corr["rollout_is"], float(corr["rollout_is_threshold"]), corr["loss_type"]) == (
+            "token",
+            2.0,
+            "reinforce",
+        )
+        assert c["actor_rollout_ref"]["rollout"]["calculate_log_probs"] is True
+
+    def test_wrapper_differs_from_the_arm_only_by_rollout_precision(self):
+        def flat(d, prefix=""):
+            out = {}
+            for k, v in d.items():
+                if isinstance(v, dict):
+                    out.update(flat(v, f"{prefix}{k}."))
+                else:
+                    out[f"{prefix}{k}"] = v
+            return out
+
+        q, f = flat(compose(QWEN)), flat(compose(QWEN_FP8))
+        differing = {k for k in q.keys() | f.keys() if q.get(k) != f.get(k)}
+        name_derived = {k for k in differing if "experiment_name" in k or k.endswith("default_local_dir")}
+        # rollout precision, the H100 emulation's vLLM budget (the trainer cap is an env var, not config) and
+        # the wrappers' schedule
+        assert differing - name_derived == {
+            "actor_rollout_ref.rollout.quantization",
+            "actor_rollout_ref.rollout.gpu_memory_utilization",
+            "actor_rollout_ref.actor.optim.lr_warmup_steps",
+            "trainer.test_freq",
+            "trainer.save_freq",
+        }
+
+    def test_toggle_on_the_arm_equals_the_wrapper(self):
+        emu = dict(VERL_GPU_MEM_CAP_GB="78", gpu_memory_utilization="0.513")
+        schedule = dict(lr_warmup_steps="12", test_freq="12", save_freq="12", SEED="1")
+        assert compose(QWEN, ROLLOUT_QUANT="fp8", **emu, **schedule) == compose(QWEN_FP8)
+
+    def test_wrapper_can_be_switched_back_to_bf16(self):
+        real_h100 = dict(VERL_GPU_MEM_CAP_GB="", gpu_memory_utilization="0.9")
+        arm_schedule = dict(lr_warmup_steps="0", test_freq="25", save_freq="25")
+        assert compose(QWEN_FP8, ROLLOUT_QUANT="bf16", **real_h100, **arm_schedule) == compose(QWEN)
+
+    @pytest.mark.parametrize("script", QWEN_ARMS)
+    def test_invalid_rollout_quant_is_rejected(self, script, tmp_path):
+        proc = _run(script, {"ROLLOUT_QUANT": "int8"}, (), tmp_path)
+        assert proc.returncode == 2
+        assert "ROLLOUT_QUANT must be bf16 or fp8" in proc.stderr
+
+    def test_wrapper_forwards_hydra_overrides(self):
+        c = compose(QWEN_FP8, args=("trainer.total_training_steps=3",), SEED="7")
+        assert c["trainer"]["total_training_steps"] == 3
+        assert c["actor_rollout_ref"]["rollout"]["seed"] == 7
+        assert c["trainer"]["experiment_name"].endswith(" warmup-12 rollout-fp8 seed-7")
+
+
+def _env_seen_by_python(tmp_path, env, script=QWEN_FP8, names=DEEPGEMM_VARS):
+    """Run a wrapper with a stand-in python that prints the given env vars (default: the DeepGEMM ones)."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    fake = bindir / "python"
+    fake.write_text("#!/bin/sh\n" + "".join(f'echo "{v}=${{{v}-<unset>}}"\n' for v in names))
+    fake.chmod(0o755)
+    base = {k: v for k, v in os.environ.items() if k not in SCRIPT_ENV_KNOBS}
+    base.update({"PATH": f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}", "log_dir": str(tmp_path / "logs")})
+    base.update(env)
+    proc = subprocess.run(
+        ["bash", str(SCRIPTS / script)], cwd=REPO, env=base, capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    return dict(line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line)
+
+
+def _fake_toolkit(tmp_path):
+    toolkit = tmp_path / "cuda-12.9"
+    (toolkit / "bin").mkdir(parents=True)
+    nvcc = toolkit / "bin" / "nvcc"
+    nvcc.write_text("#!/bin/sh\n")
+    nvcc.chmod(0o755)
+    return toolkit
+
+
+class TestFp8DeepGemmEnv:
+    def test_toolkit_found_exports_all_three(self, tmp_path):
+        toolkit = _fake_toolkit(tmp_path)
+        seen = _env_seen_by_python(tmp_path, {"DEEPGEMM_CUDA_HOME": str(toolkit)})
+        assert seen["CUDA_HOME"] == str(toolkit)
+        assert seen["DG_JIT_CACHE_DIR"] == "/home/jovyan/ugadiarov/cache/deep_gemm"
+        assert seen["VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER"] == "0"
+
+    def test_missing_toolkit_exports_nothing(self, tmp_path):
+        seen = _env_seen_by_python(tmp_path, {"DEEPGEMM_CUDA_HOME": str(tmp_path / "missing")})
+        assert set(seen.values()) == {"<unset>"}
+
+    def test_existing_cuda_home_is_left_alone(self, tmp_path):
+        # e.g. remote_h200, whose activate.sh sets all three itself
+        toolkit = _fake_toolkit(tmp_path)
+        env = {"DEEPGEMM_CUDA_HOME": str(toolkit), "CUDA_HOME": "/opt/cuda", "DG_JIT_CACHE_DIR": "/data/dg"}
+        seen = _env_seen_by_python(tmp_path, env)
+        assert seen["CUDA_HOME"] == "/opt/cuda"
+        assert seen["DG_JIT_CACHE_DIR"] == "/data/dg"
+        assert seen["VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER"] == "<unset>"
+
+    def test_explicit_values_win_over_defaults(self, tmp_path):
+        toolkit = _fake_toolkit(tmp_path)
+        env = {
+            "DEEPGEMM_CUDA_HOME": str(toolkit),
+            "DG_JIT_CACHE_DIR": "/data/dg",
+            "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER": "1",
+        }
+        seen = _env_seen_by_python(tmp_path, env)
+        assert seen["CUDA_HOME"] == str(toolkit)
+        assert seen["DG_JIT_CACHE_DIR"] == "/data/dg"
+        assert seen["VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER"] == "1"
+
+
+# --------------------------------------------------------------------------- fp8 + sync-baseline TIS cap / aggregation
+
+
+def _flat(d, prefix=""):
+    out = {}
+    for k, v in d.items():
+        if isinstance(v, dict):
+            out.update(_flat(v, f"{prefix}{k}."))
+        else:
+            out[f"{prefix}{k}"] = v
+    return out
+
+
+def _differing(a, b):
+    fa, fb = _flat(a), _flat(b)
+    diff = {k for k in fa.keys() | fb.keys() if fa.get(k) != fb.get(k)}
+    return {k for k in diff if "experiment_name" not in k and not k.endswith("default_local_dir")}
+
+
+class TestFp8TisC8TokenMean:
+    def test_cap_and_aggregation(self):
+        c = compose(QWEN_FP8_C8)
+        assert float(c["algorithm"]["rollout_correction"]["rollout_is_threshold"]) == 8.0
+        # the worker's loss reads only policy_loss.rollout_correction: the cap must reach it too
+        assert (
+            float(c["actor_rollout_ref"]["actor"]["policy_loss"]["rollout_correction"]["rollout_is_threshold"]) == 8.0
+        )
+        assert c["actor_rollout_ref"]["actor"]["loss_agg_mode"] == "token-mean"
+        assert c["actor_rollout_ref"]["rollout"]["quantization"] == "fp8"
+        corr = c["algorithm"]["rollout_correction"]
+        assert (corr["rollout_is"], corr["loss_type"], corr["bypass_mode"]) == ("token", "reinforce", True)
+
+    def test_name(self):
+        name = compose(QWEN_FP8_C8)["trainer"]["experiment_name"]
+        assert " token-mean " in name
+        assert name.endswith(" 0.1-wd warmup-12 tis-C8 rollout-fp8 seed-1")
+
+    def test_differs_from_the_fp8_arm_only_by_cap_and_aggregation(self):
+        assert _differing(compose(QWEN_FP8), compose(QWEN_FP8_C8)) == {
+            "algorithm.rollout_correction.rollout_is_threshold",
+            "actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_is_threshold",
+            "actor_rollout_ref.actor.loss_agg_mode",
+            "critic.loss_agg_mode",  # interpolated from the actor's; inert (GRPO has no critic)
+        }
+
+    def test_equals_the_fp8_arm_with_the_two_knobs(self):
+        assert compose(QWEN_FP8_C8) == compose(QWEN_FP8, rollout_is_threshold="8", loss_agg_mode="token-mean")
+
+    def test_knobs_can_be_set_back(self):
+        assert compose(QWEN_FP8_C8, rollout_is_threshold="2.0", loss_agg_mode="seq-mean-token-mean") == compose(
+            QWEN_FP8
+        )
+
+    def test_base_default_cap_is_untagged(self):
+        c = compose(QWEN)
+        assert float(c["algorithm"]["rollout_correction"]["rollout_is_threshold"]) == 2.0
+        assert "tis-C" not in c["trainer"]["experiment_name"]
+        assert compose(QWEN, rollout_is_threshold="2") == c  # 2 == 2.0: no tag, same config
+
+    @pytest.mark.parametrize("bad", ["0", "-1", "abc", "8x"])
+    def test_invalid_cap_is_rejected(self, bad, tmp_path):
+        proc = _run(QWEN, {"rollout_is_threshold": bad}, (), tmp_path)
+        assert proc.returncode == 2
+        assert "rollout_is_threshold must be a positive number" in proc.stderr
+
+    def test_trainer_and_worker_accept_the_config(self):
+        from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
+        from verl.utils.config import omega_conf_to_dataclass
+
+        cfg = _cfg(QWEN_FP8_C8)
+        actor = omega_conf_to_dataclass(cfg.actor_rollout_ref.actor)
+        assert actor.loss_agg_mode == "token-mean"
+        assert float(actor.policy_loss.rollout_correction["rollout_is_threshold"]) == 8.0
+        cfg.trainer.logger = ["console"]
+        trainer_cls = FullyAsyncTrainer.__ray_metadata__.modified_class
+        t = trainer_cls(config=cfg, tokenizer=None, role_worker_mapping={}, resource_pool_manager=None)
+        assert t.replay_enable
+
+    def test_deepgemm_env_is_inherited_from_the_fp8_wrapper(self, tmp_path):
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        fake = bindir / "python"
+        fake.write_text("#!/bin/sh\n" + "".join(f'echo "{v}=${{{v}-<unset>}}"\n' for v in DEEPGEMM_VARS))
+        fake.chmod(0o755)
+        toolkit = _fake_toolkit(tmp_path)
+        env = {k: v for k, v in os.environ.items() if k not in SCRIPT_ENV_KNOBS}
+        env.update({"PATH": f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}", "log_dir": str(tmp_path / "logs")})
+        env["DEEPGEMM_CUDA_HOME"] = str(toolkit)
+        proc = subprocess.run(
+            ["bash", str(SCRIPTS / QWEN_FP8_C8)], cwd=REPO, env=env, capture_output=True, text=True, timeout=120
+        )
+        assert proc.returncode == 0, proc.stderr[-2000:]
+        seen = dict(line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line)
+        assert seen["CUDA_HOME"] == str(toolkit)
+        assert seen["VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER"] == "0"
+
+
+# --------------------------------------------------------------------------- H100 emulation defaults (fp8 wrappers)
+
+FP8_WRAPPERS = (QWEN_FP8, QWEN_FP8_C8)
+
+
+@pytest.mark.parametrize("script", FP8_WRAPPERS)
+class TestFp8H100Emulation:
+    def test_vllm_budget_and_tag(self, script):
+        c = compose(script)
+        assert c["actor_rollout_ref"]["rollout"]["gpu_memory_utilization"] == 0.513
+        assert " h100-emu-78gb-gmu0.513 " in c["trainer"]["experiment_name"]
+
+    def test_cap_reaches_the_trainer_env(self, script, tmp_path):
+        seen = _env_seen_by_python(tmp_path, {}, script=script, names=("VERL_GPU_MEM_CAP_GB",))
+        assert seen["VERL_GPU_MEM_CAP_GB"] == "78"
+
+    def test_real_h100_override(self, script, tmp_path):
+        c = compose(script, VERL_GPU_MEM_CAP_GB="", gpu_memory_utilization="0.9")
+        assert c["actor_rollout_ref"]["rollout"]["gpu_memory_utilization"] == 0.9
+        assert "h100-emu" not in c["trainer"]["experiment_name"]
+        env = {"VERL_GPU_MEM_CAP_GB": ""}
+        assert _env_seen_by_python(tmp_path, env, script=script, names=("VERL_GPU_MEM_CAP_GB",)) == {
+            "VERL_GPU_MEM_CAP_GB": ""
+        }
+
+    def test_explicit_values_win(self, script):
+        c = compose(script, VERL_GPU_MEM_CAP_GB="70", gpu_memory_utilization="0.45")
+        assert c["actor_rollout_ref"]["rollout"]["gpu_memory_utilization"] == 0.45
+        assert " h100-emu-70gb-gmu0.45 " in c["trainer"]["experiment_name"]
+
+
+def test_bf16_arm_does_not_emulate():
+    c = compose(QWEN)
+    assert c["actor_rollout_ref"]["rollout"]["gpu_memory_utilization"] == 0.9
+    assert "h100-emu" not in c["trainer"]["experiment_name"]
+
+
+# --------------------------------------------------------------------------- schedule (fp8 wrappers) and warmup knob
+
+
+@pytest.mark.parametrize("script", FP8_WRAPPERS)
+class TestFp8Schedule:
+    def test_defaults(self, script):
+        c = compose(script)
+        assert c["actor_rollout_ref"]["actor"]["optim"]["lr_warmup_steps"] == 12
+        assert (c["trainer"]["test_freq"], c["trainer"]["save_freq"]) == (12, 12)
+        assert c["data"]["seed"] == 1 and c["actor_rollout_ref"]["rollout"]["seed"] == 1
+        assert " warmup-12 " in c["trainer"]["experiment_name"]
+
+    def test_overridable(self, script):
+        c = compose(script, lr_warmup_steps="0", test_freq="5", save_freq="10", SEED="3")
+        assert c["actor_rollout_ref"]["actor"]["optim"]["lr_warmup_steps"] == 0
+        assert (c["trainer"]["test_freq"], c["trainer"]["save_freq"]) == (5, 10)
+        assert c["data"]["seed"] == 3
+        assert "warmup-" not in c["trainer"]["experiment_name"]
+
+    def test_warmup_must_be_shorter_than_the_update_cap(self, script, tmp_path):
+        proc = _run(script, {"max_updates": "12"}, (), tmp_path)
+        assert proc.returncode == 2
+        assert "lr_warmup_steps=12 must be < max_updates=12" in proc.stderr
+        assert compose(script, max_updates="13")["trainer"]["total_training_steps"] == 13
+
+
+class TestWarmupKnob:
+    def test_arm_default_is_untagged_zero(self):
+        c = compose(QWEN)
+        assert c["actor_rollout_ref"]["actor"]["optim"]["lr_warmup_steps"] == 0
+        assert "warmup-" not in c["trainer"]["experiment_name"]
+
+    @pytest.mark.parametrize("bad", ["-1", "1.5", "abc"])
+    def test_invalid_is_rejected(self, bad, tmp_path):
+        proc = _run(QWEN, {"lr_warmup_steps": bad}, (), tmp_path)
+        assert proc.returncode == 2
+        assert "lr_warmup_steps must be a non-negative integer" in proc.stderr

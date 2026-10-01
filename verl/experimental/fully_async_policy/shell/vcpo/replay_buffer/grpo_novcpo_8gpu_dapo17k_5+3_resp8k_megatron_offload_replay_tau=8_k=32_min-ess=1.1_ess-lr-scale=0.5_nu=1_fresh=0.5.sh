@@ -53,6 +53,13 @@
 #   * Added: actor_rollout_ref.rollout.seed=${SEED} (the source's vLLM seed was always 0).
 #   * Micro-batch size 1 is no longer required (the loss is micro-batch invariant); kept at 1 so the
 #     memory envelope of the source runs carries over.
+#
+# ROLLOUT PRECISION (not in the source): ROLLOUT_QUANT=bf16 (default) | fp8. fp8 = verl's native online
+# block-FP8 (actor_rollout_ref.rollout.quantization=fp8): the trainer stays bf16 and every weight sync
+# re-quantizes Linear weights to 128x128-block FP8 inside vLLM (the NCCL sync ships bf16). The token TIS
+# above already corrects the rollout/trainer mismatch, as FlashRL requires for quantized rollouts. Tagged
+# " rollout-fp8" in exp_name. fp8 with fully-async (standalone replicas, NCCL sync) is not covered by
+# verl's tests: smoke-test first. ..._fp8.sh next to this script sets it plus the DeepGEMM environment.
 set -xeuo pipefail
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
@@ -140,7 +147,12 @@ grad_clip=1.0
 
 # ================= Optimizer =================
 lr=1e-6
-lr_warmup_steps=0
+# Linear LR warmup in OPTIMIZER UPDATES (replay mode: one scheduler step per update). Tagged " warmup-<N>"
+# in exp_name when not 0.
+lr_warmup_steps=${lr_warmup_steps:-0}
+[[ "${lr_warmup_steps}" =~ ^[0-9]+$ ]] || { echo "lr_warmup_steps must be a non-negative integer, got '${lr_warmup_steps}'" >&2; exit 2; }
+warmup_tag=""
+if [[ "${lr_warmup_steps}" != "0" ]]; then warmup_tag=" warmup-${lr_warmup_steps}"; fi
 weight_decay=0.1
 lr_decay_style="constant"
 
@@ -156,10 +168,24 @@ ess_tag="min-ess-${min_ess}-lrscale-${ess_lr_scale}"
 bypass_mode=True
 loss_type=reinforce
 rollout_is="token"
-rollout_is_threshold="2.0"
+# TIS cap C (the source arm's 2.0). It bounds the FULL ratio pi_theta / pi_rollout, i.e. staleness (groups up to
+# k versions old) as well as any rollout/trainer numerical mismatch. Tagged " tis-C<value>" in exp_name when not 2.0.
+rollout_is_threshold=${rollout_is_threshold:-2.0}
+[[ "${rollout_is_threshold}" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk "BEGIN{exit !(${rollout_is_threshold} > 0)}" \
+    || { echo "rollout_is_threshold must be a positive number, got '${rollout_is_threshold}'" >&2; exit 2; }
+tis_tag=""
+if awk "BEGIN{exit !(${rollout_is_threshold} != 2.0)}"; then tis_tag=" tis-C${rollout_is_threshold}"; fi
 rollout_rs=null
 rollout_rs_threshold=null
 log_probs_pearson_corr=${log_probs_pearson_corr:-True}
+
+# ================= Rollout precision =================
+ROLLOUT_QUANT=${ROLLOUT_QUANT:-bf16}
+case "${ROLLOUT_QUANT}" in
+    bf16) rollout_quantization=null; quant_tag="" ;;
+    fp8) rollout_quantization=fp8; quant_tag=" rollout-fp8" ;;
+    *) echo "ROLLOUT_QUANT must be bf16 or fp8, got '${ROLLOUT_QUANT}'" >&2; exit 2 ;;
+esac
 
 # ================= Async Training =================
 # Generation quota aligned with the eviction horizon: groups older than k updates are evicted anyway.
@@ -203,6 +229,11 @@ total_rollout_steps=${total_rollout_steps:-66000}
 # null = the prompt budget decides. At the cap the trainer validates, writes a final hf_model checkpoint
 # and the rollouter is cancelled.
 max_updates=${max_updates:-null}
+# Megatron's LR scheduler asserts lr_warmup_steps < lr_decay_steps, and the update cap becomes the decay horizon.
+if [[ "${max_updates}" != "null" ]] && (( lr_warmup_steps >= max_updates )); then
+    echo "lr_warmup_steps=${lr_warmup_steps} must be < max_updates=${max_updates}; lower lr_warmup_steps (e.g. 0 for smoke runs) or raise max_updates" >&2
+    exit 2
+fi
 epochs=10000000
 # Model versions tick once per UPDATE: validate / checkpoint every 25 updates.
 test_freq=${test_freq:-25}
@@ -212,7 +243,7 @@ ckpt_save_contents="['hf_model']"
 resume_mode=disable
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd seed-${SEED}"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${warmup_tag}${tis_tag}${quant_tag} seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
 # log_dir: TensorBoard and the rollout / validation dumps; CKPTS_DIR: global_step_N/ checkpoints.
 log_dir=${log_dir:-"logs/${exp_name_safe}"}
@@ -303,6 +334,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.gpu_memory_utilization=${gpu_memory_utilization} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
     actor_rollout_ref.rollout.dtype=${precision_dtype} \
+    actor_rollout_ref.rollout.quantization=${rollout_quantization} \
     actor_rollout_ref.rollout.enable_chunked_prefill=${enable_chunked_prefill} \
     actor_rollout_ref.rollout.max_num_batched_tokens=${max_num_batched_tokens} \
     actor_rollout_ref.rollout.temperature=1.0 \
