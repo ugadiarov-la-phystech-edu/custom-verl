@@ -10,7 +10,7 @@
 set -euo pipefail
 export ROLLOUT_QUANT=${ROLLOUT_QUANT:-fp8}
 export VERL_GPU_MEM_CAP_GB=${VERL_GPU_MEM_CAP_GB-78}
-export gpu_memory_utilization=${gpu_memory_utilization:-0.513}
+export gpu_memory_utilization=${gpu_memory_utilization:-0.5}
 export lr_warmup_steps=${lr_warmup_steps:-12}
 export SEED=${SEED:-1}
 export test_freq=${test_freq:-12}

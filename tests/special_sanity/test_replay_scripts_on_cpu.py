@@ -57,6 +57,8 @@ SCRIPT_ENV_KNOBS = {
     "ROLLOUT_QUANT",
     "gpu_memory_utilization",
     "lr_warmup_steps",
+    "lr_decay_steps",
+    "total_rollout_steps",
     "test_freq",
     "save_freq",
     "rollout_is_threshold",
@@ -352,7 +354,7 @@ class TestFp8Rollout:
         }
 
     def test_toggle_on_the_arm_equals_the_wrapper(self):
-        emu = dict(VERL_GPU_MEM_CAP_GB="78", gpu_memory_utilization="0.513")
+        emu = dict(VERL_GPU_MEM_CAP_GB="78", gpu_memory_utilization="0.5")
         schedule = dict(lr_warmup_steps="12", test_freq="12", save_freq="12", SEED="1")
         assert compose(QWEN, ROLLOUT_QUANT="fp8", **emu, **schedule) == compose(QWEN_FP8)
 
@@ -540,16 +542,16 @@ FP8_WRAPPERS = (QWEN_FP8, QWEN_FP8_C8)
 class TestFp8H100Emulation:
     def test_vllm_budget_and_tag(self, script):
         c = compose(script)
-        assert c["actor_rollout_ref"]["rollout"]["gpu_memory_utilization"] == 0.513
-        assert " h100-emu-78gb-gmu0.513 " in c["trainer"]["experiment_name"]
+        assert c["actor_rollout_ref"]["rollout"]["gpu_memory_utilization"] == 0.5
+        assert " h100-emu-78gb-gmu0.5 " in c["trainer"]["experiment_name"]
 
     def test_cap_reaches_the_trainer_env(self, script, tmp_path):
         seen = _env_seen_by_python(tmp_path, {}, script=script, names=("VERL_GPU_MEM_CAP_GB",))
         assert seen["VERL_GPU_MEM_CAP_GB"] == "78"
 
     def test_real_h100_override(self, script, tmp_path):
-        c = compose(script, VERL_GPU_MEM_CAP_GB="", gpu_memory_utilization="0.9")
-        assert c["actor_rollout_ref"]["rollout"]["gpu_memory_utilization"] == 0.9
+        c = compose(script, VERL_GPU_MEM_CAP_GB="", gpu_memory_utilization="0.88")
+        assert c["actor_rollout_ref"]["rollout"]["gpu_memory_utilization"] == 0.88
         assert "h100-emu" not in c["trainer"]["experiment_name"]
         env = {"VERL_GPU_MEM_CAP_GB": ""}
         assert _env_seen_by_python(tmp_path, env, script=script, names=("VERL_GPU_MEM_CAP_GB",)) == {
@@ -587,11 +589,12 @@ class TestFp8Schedule:
         assert c["data"]["seed"] == 3
         assert "warmup-" not in c["trainer"]["experiment_name"]
 
-    def test_warmup_must_be_shorter_than_the_update_cap(self, script, tmp_path):
-        proc = _run(script, {"max_updates": "12"}, (), tmp_path)
+    def test_warmup_must_be_shorter_than_the_lr_decay_horizon(self, script, tmp_path):
+        proc = _run(script, {"total_rollout_steps": "12"}, (), tmp_path)  # lr_decay_steps defaults to it
         assert proc.returncode == 2
-        assert "lr_warmup_steps=12 must be < max_updates=12" in proc.stderr
-        assert compose(script, max_updates="13")["trainer"]["total_training_steps"] == 13
+        assert "lr_warmup_steps=12 must be < lr_decay_steps=12" in proc.stderr
+        # the update cap is not the scheduler horizon: a short capped run with the 12-update warmup is fine
+        assert compose(script, max_updates="3")["trainer"]["total_training_steps"] == 3
 
 
 class TestWarmupKnob:
@@ -605,3 +608,29 @@ class TestWarmupKnob:
         proc = _run(QWEN, {"lr_warmup_steps": bad}, (), tmp_path)
         assert proc.returncode == 2
         assert "lr_warmup_steps must be a non-negative integer" in proc.stderr
+
+
+# --------------------------------------------------------------------------- LR schedule horizon (all arms)
+
+
+@pytest.mark.parametrize("script", ALL)
+class TestLrDecayHorizon:
+    """The fully-async trainer builds Megatron's LR scheduler before it learns the run length
+    (optim.total_training_steps is still -1), so lr_decay_steps must be passed explicitly; Megatron asserts
+    lr_decay_steps > 0 and lr_warmup_steps < lr_decay_steps. Without it every launch dies at trainer init."""
+
+    def test_passed_and_valid(self, script):
+        optim = compose(script)["actor_rollout_ref"]["actor"]["optim"]
+        assert optim["lr_decay_steps"] == 66000  # = total_rollout_steps, as in the custom_vcpo source
+        assert 0 <= optim["lr_warmup_steps"] < optim["lr_decay_steps"]
+
+    def test_follows_total_rollout_steps_and_is_overridable(self, script):
+        assert compose(script, total_rollout_steps="64")["actor_rollout_ref"]["actor"]["optim"]["lr_decay_steps"] == 64
+        c = compose(script, lr_decay_steps="500")
+        assert c["actor_rollout_ref"]["actor"]["optim"]["lr_decay_steps"] == 500
+
+    @pytest.mark.parametrize("bad", ["0", "-5", "1.5"])
+    def test_invalid_is_rejected(self, script, bad, tmp_path):
+        proc = _run(script, {"lr_decay_steps": bad}, (), tmp_path)
+        assert proc.returncode == 2
+        assert "lr_decay_steps must be a positive integer" in proc.stderr

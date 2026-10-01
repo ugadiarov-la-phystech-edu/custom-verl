@@ -130,11 +130,12 @@ uv pip install "${IDX[@]}" -c "$CONSTRAINTS" \
     codetiming pylatexenc cachetools nvtx matplotlib ninja nvidia-mathdx pybind11 wheel onnxscript
 echo "transformers==$("$PY" -c 'import importlib.metadata as m; print(m.version("transformers"))')" >> "$CONSTRAINTS"
 
-echo "3. Install trl 0.27.0, torchcodec, vllm-omni and FlashAttention (prebuilt cp312/torch2.11/cu12)"
+echo "3. Install trl 0.27.0, torchcodec, vllm-omni, cupy and FlashAttention (prebuilt cp312/torch2.11/cu12)"
 uv pip install --no-deps trl==0.27.0
 uv pip install --no-deps torchcodec==0.16.0 --index-url "$TORCH_IDX"
 uv pip install "${IDX[@]}" -c "$CONSTRAINTS" nvidia-cudnn-frontend
 uv pip install "${IDX[@]}" -c "$CONSTRAINTS" vllm-omni==0.24.0
+uv pip install "${IDX[@]}" -c "$CONSTRAINTS" cupy-cuda12x==14.0.1
 uv pip install --no-deps "flash-attn @ ${FLASH_ATTN_WHEEL}"
 
 if [ "$USE_MEGATRON" -eq 1 ] || [ "$USE_DEEPGEMM" -eq 1 ]; then
@@ -205,7 +206,8 @@ import importlib, os
 import torch
 print("torch", torch.__version__, "cuda", torch.version.cuda, "available:", torch.cuda.is_available())
 mods = ["vllm", "vllm_omni", "transformers", "trl", "datasets", "ray", "tensordict", "transfer_queue",
-        "flash_attn", "flashinfer", "liger_kernel", "torchcodec", "verl"]
+        "flash_attn", "flashinfer", "liger_kernel", "torchcodec", "verl", "cupy",
+        "verl.checkpoint_engine.nccl_checkpoint_engine"]
 if os.environ["USE_MEGATRON"] == "1":
     mods += ["megatron.core", "megatron.bridge", "mbridge", "transformer_engine", "modelopt",
              "fused_weight_gradient_mlp_cuda", "amp_C"]
@@ -229,6 +231,11 @@ if torch.cuda.is_available():
         if any("libcudart.so.13" in l for l in libs):
             failed.append("te-cudart")
             print("  FAIL TE loaded the CUDA 13 runtime:", sorted(libs))
+    if "cupy" not in failed:
+        from cupy.cuda import nccl
+        comm = nccl.NcclCommunicator(1, nccl.get_unique_id(), 0)
+        assert comm.rank_id() == 0
+        print(f"  ok   GPU: cupy NCCL {nccl.get_version()} communicator")
     print("  ok   GPU: flash-attn" + (" + TransformerEngine" if os.environ["USE_MEGATRON"] == "1" else ""))
 if os.environ["USE_DEEPGEMM"] == "1":
     try:
