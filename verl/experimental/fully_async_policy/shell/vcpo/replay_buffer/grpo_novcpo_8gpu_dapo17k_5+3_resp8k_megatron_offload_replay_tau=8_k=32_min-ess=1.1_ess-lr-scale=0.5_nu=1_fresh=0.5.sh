@@ -75,7 +75,10 @@ calculate_entropy=True
 grad_clip=1.0
 
 lr=1e-6
-lr_warmup_steps=0
+lr_warmup_steps=${lr_warmup_steps:-0}
+[[ "${lr_warmup_steps}" =~ ^[0-9]+$ ]] || { echo "lr_warmup_steps must be a non-negative integer, got '${lr_warmup_steps}'" >&2; exit 2; }
+warmup_tag=""
+if [[ "${lr_warmup_steps}" != "0" ]]; then warmup_tag=" warmup-${lr_warmup_steps}"; fi
 weight_decay=0.1
 lr_decay_style="constant"
 
@@ -88,10 +91,21 @@ ess_tag="min-ess-${min_ess}-lrscale-${ess_lr_scale}"
 bypass_mode=True
 loss_type=reinforce
 rollout_is="token"
-rollout_is_threshold="2.0"
+rollout_is_threshold=${rollout_is_threshold:-2.0}
+[[ "${rollout_is_threshold}" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk "BEGIN{exit !(${rollout_is_threshold} > 0)}" \
+    || { echo "rollout_is_threshold must be a positive number, got '${rollout_is_threshold}'" >&2; exit 2; }
+tis_tag=""
+if awk "BEGIN{exit !(${rollout_is_threshold} != 2.0)}"; then tis_tag=" tis-C${rollout_is_threshold}"; fi
 rollout_rs=null
 rollout_rs_threshold=null
 log_probs_pearson_corr=${log_probs_pearson_corr:-True}
+
+ROLLOUT_QUANT=${ROLLOUT_QUANT:-bf16}
+case "${ROLLOUT_QUANT}" in
+    bf16) rollout_quantization=null; quant_tag="" ;;
+    fp8) rollout_quantization=fp8; quant_tag=" rollout-fp8" ;;
+    *) echo "ROLLOUT_QUANT must be bf16 or fp8, got '${ROLLOUT_QUANT}'" >&2; exit 2 ;;
+esac
 
 staleness_threshold=${staleness_threshold:-32.0}
 updates_per_param_sync=1
@@ -119,6 +133,10 @@ pause_generation_during_save=${pause_generation_during_save:-True}
 
 total_rollout_steps=${total_rollout_steps:-66000}
 max_updates=${max_updates:-null}
+if [[ "${max_updates}" != "null" ]] && (( lr_warmup_steps >= max_updates )); then
+    echo "lr_warmup_steps=${lr_warmup_steps} must be < max_updates=${max_updates}; lower lr_warmup_steps (e.g. 0 for smoke runs) or raise max_updates" >&2
+    exit 2
+fi
 epochs=10000000
 test_freq=${test_freq:-25}
 save_freq=${save_freq:-25}
@@ -126,7 +144,7 @@ max_actor_ckpt_to_keep=null
 ckpt_save_contents="['hf_model']"
 resume_mode=disable
 
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd seed-${SEED}"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${warmup_tag}${tis_tag}${quant_tag} seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
 log_dir=${log_dir:-"logs/${exp_name_safe}"}
 CKPTS_DIR=${CKPTS_DIR:-"${log_dir}"}
@@ -215,6 +233,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.gpu_memory_utilization=${gpu_memory_utilization} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${gen_tp} \
     actor_rollout_ref.rollout.dtype=${precision_dtype} \
+    actor_rollout_ref.rollout.quantization=${rollout_quantization} \
     actor_rollout_ref.rollout.enable_chunked_prefill=${enable_chunked_prefill} \
     actor_rollout_ref.rollout.max_num_batched_tokens=${max_num_batched_tokens} \
     actor_rollout_ref.rollout.temperature=1.0 \
