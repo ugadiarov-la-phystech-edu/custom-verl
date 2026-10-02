@@ -8,6 +8,7 @@
 #SBATCH --error=./slurm/%A_%x.err
 #SBATCH --job-name=grpo-novcpo-replay-ess-nu1-fresh0.5-fp8-tisc8-tokenmean
 set -euo pipefail
+export ROLLOUT_QUANT=${ROLLOUT_QUANT:-fp8}
 export rollout_is_threshold=${rollout_is_threshold:-8}
 export loss_agg_mode=${loss_agg_mode:-token-mean}
 export VERL_GPU_MEM_CAP_GB=${VERL_GPU_MEM_CAP_GB-78}
@@ -16,4 +17,10 @@ export lr_warmup_steps=${lr_warmup_steps:-12}
 export SEED=${SEED:-1}
 export test_freq=${test_freq:-12}
 export save_freq=${save_freq:-12}
+DEEPGEMM_CUDA_HOME=${DEEPGEMM_CUDA_HOME:-/home/jovyan/ugadiarov/cuda-12.9}
+if [[ -z "${CUDA_HOME:-}" && -x "${DEEPGEMM_CUDA_HOME}/bin/nvcc" ]]; then
+    export CUDA_HOME="${DEEPGEMM_CUDA_HOME}"
+    export DG_JIT_CACHE_DIR=${DG_JIT_CACHE_DIR:-/home/jovyan/ugadiarov/cache/deep_gemm}
+    export VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER=${VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER:-0}
+fi
 exec bash "$(dirname "${BASH_SOURCE[0]}")/grpo_novcpo_8gpu_dapo17k_5+3_resp8k_megatron_offload_replay_tau=8_k=32_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.5_fp8.sh" "$@"
