@@ -103,6 +103,9 @@ def _load_vllm_rollout_utils():
     fake_vllm_quant.apply_vllm_quant_patches = lambda: None
     fake_vllm_quant.is_fp8_model = lambda config: False
     fake_vllm_quant.load_quanted_weights = lambda *a, **k: []
+    fake_vllm_quant.is_int8_model = lambda config: False
+    fake_vllm_quant.is_refit_quant_model = lambda config: False
+    fake_vllm_quant.INT8_QUANT_ENABLED_ENV = "VERL_VLLM_INT8_QUANT_ENABLED"
 
     fake_platform = types.ModuleType("verl.plugin.platform")
     fake_platform.get_platform = lambda: None

@@ -59,6 +59,13 @@ from verl.utils.vllm.vllm_fp8_utils import (
     process_fp8_weights_after_loading,
     stage_fp8_params_for_loading,
 )
+from verl.utils.vllm.vllm_int8_utils import (  # noqa: F401  (INT8_QUANT_ENABLED_ENV re-exported)
+    INT8_QUANT_ENABLED_ENV,
+    build_int8_method_patchers,
+    process_int8_weights_after_loading,
+    quantize_int8_per_channel,
+    stage_int8_params_for_loading,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +97,31 @@ def is_fp8_model(vllm_config):
             return True
 
     return False
+
+
+def _is_int8_quant_args(args, *, dynamic: bool) -> bool:
+    return (
+        args is not None
+        and getattr(args, "num_bits", None) == 8
+        and str(getattr(args, "type", "")).lower().endswith("int")
+        and bool(getattr(args, "dynamic", False)) == dynamic
+    )
+
+
+def is_int8_model(vllm_config):
+    quant_config = getattr(vllm_config, "quant_config", None)
+    if type(quant_config).__name__ != "CompressedTensorsConfig":
+        return False
+    for scheme in (getattr(quant_config, "target_scheme_map", None) or {}).values():
+        if _is_int8_quant_args(scheme.get("weights"), dynamic=False) and _is_int8_quant_args(
+            scheme.get("input_activations"), dynamic=True
+        ):
+            return True
+    return False
+
+
+def is_refit_quant_model(vllm_config):
+    return is_fp8_model(vllm_config) or is_int8_model(vllm_config)
 
 
 # vLLM 0.24.0 (MoE refactor, vllm-project/vllm#41184) removed the ``FusedMoE``
@@ -210,6 +242,39 @@ def is_fp8_weight(name, model):
             if is_fp8_linear or is_fp8_moe:
                 fp8_state.fp8_param_names.add(name)
     return name in fp8_state.fp8_param_names
+
+
+@dataclass()
+class INT8State:
+    seen_params: set = field(default_factory=lambda: set())
+    int8_param_names: set = field(default_factory=lambda: set())
+
+
+int8_state: INT8State = INT8State()
+
+
+def is_int8_weight(name, model):
+    if name not in int8_state.seen_params:
+        int8_state.seen_params.add(name)
+        if name.endswith(".weight"):
+            module = get_module_from_param_name(model, name)
+            weight = getattr(module, "weight", None)
+            if isinstance(module, LinearBase) and weight is not None and weight.dtype == torch.int8:
+                int8_state.int8_param_names.add(name)
+    return name in int8_state.int8_param_names
+
+
+def quant_weights_int8(weights, model):
+    int8_state.seen_params.clear()
+    int8_state.int8_param_names.clear()
+    for k, v in weights:
+        if not is_int8_weight(k, model) or v.dtype == torch.int8:
+            yield (k, v)
+            continue
+        q, scale = quantize_int8_per_channel(v)
+        yield (k, q)
+        yield (k + "_scale", scale)
+        del v, q, scale
 
 
 def is_mxfp8_vllm_ascend(quant_config):
@@ -349,6 +414,7 @@ def prepare_quanted_weights_for_loading(model):
     reload_state: dict[str, Any] = {
         "fp8_layers": stage_fp8_params_for_loading(model),
         "mxfp4_moe_modules": stage_mxfp4_moe_params_for_loading(model),
+        "int8_layers": stage_int8_params_for_loading(model),
     }
     return reload_state
 
@@ -360,6 +426,7 @@ def process_quanted_weights_after_loading(model, reload_state):
     reload_state = reload_state or {}
     process_fp8_weights_after_loading(reload_state.get("fp8_layers") or [])
     process_mxfp4_moe_weights_after_loading(reload_state.get("mxfp4_moe_modules") or [])
+    process_int8_weights_after_loading(reload_state.get("int8_layers") or [])
 
 
 def load_quanted_weights(weights, model_runner, is_drafter=False):
@@ -376,7 +443,10 @@ def load_quanted_weights(weights, model_runner, is_drafter=False):
     vllm_dtype = model_runner.vllm_config.model_config.dtype
 
     weights = list(weights)
-    weights_quantized = quant_weights(weights, model, quant_config, dtype=vllm_dtype)
+    if is_int8_model(model_runner.vllm_config):
+        weights_quantized = quant_weights_int8(weights, model)
+    else:
+        weights_quantized = quant_weights(weights, model, quant_config, dtype=vllm_dtype)
 
     # Monkey patch the param class to their subclass, as certain models
     # will check the param type to call the proper weightloader
@@ -421,6 +491,6 @@ def apply_vllm_quant_patches():
         logger.debug("vLLM quantization patches already applied")
         return
 
-    for patcher in build_fp8_method_patchers(_get_vllm_version()):
+    for patcher in [*build_fp8_method_patchers(_get_vllm_version()), *build_int8_method_patchers()]:
         patcher.start()
         fp8_state.vllm_patches.append(patcher)

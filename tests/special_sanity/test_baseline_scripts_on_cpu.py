@@ -415,7 +415,7 @@ class TestQwenPrecisionAndTis:
         assert c["actor_rollout_ref"]["rollout"]["quantization"] is None
         assert c["algorithm"]["rollout_correction"]["rollout_is"] is None
         name = c["trainer"]["experiment_name"]
-        assert "tis-" not in name and "rollout-fp8" not in name
+        assert "tis-" not in name and "rollout-fp8" not in name and "rollout-int8" not in name
 
     def test_explicit_defaults_compose_identically_to_the_baseline(self):
         assert _diff(compose(QWEN), compose(QWEN, ROLLOUT_QUANT="bf16", TIS="False")) == set()
@@ -439,6 +439,21 @@ class TestQwenPrecisionAndTis:
         assert c["actor_rollout_ref"]["rollout"]["quantization"] == "fp8"
         assert c["algorithm"]["rollout_correction"]["rollout_is"] == "token"
         assert c["trainer"]["experiment_name"].endswith(" tis-C8 rollout-fp8 seed-1 h100-emu-76gb-gmu0.283")
+
+    def test_int8_tis(self):
+        c = compose(QWEN_TIS, ROLLOUT_QUANT="int8")
+        assert c["actor_rollout_ref"]["rollout"]["quantization"] == "int8"
+        assert c["algorithm"]["rollout_correction"]["rollout_is"] == "token"
+        assert c["trainer"]["experiment_name"].endswith(" tis-C8 rollout-int8 seed-1 h100-emu-76gb-gmu0.283")
+
+    def test_int8_is_accepted_by_the_rollout_config(self):
+        from omegaconf import OmegaConf
+
+        from verl.utils.config import omega_conf_to_dataclass
+        from verl.workers.config import RolloutConfig
+
+        rollout = OmegaConf.create(compose(QWEN_TIS, ROLLOUT_QUANT="int8")["actor_rollout_ref"]["rollout"])
+        assert omega_conf_to_dataclass(rollout, dataclass_type=RolloutConfig).quantization == "int8"
 
     def test_tis_script_uses_flashrl_parameters(self):
         c = compose(QWEN_TIS)
@@ -502,8 +517,13 @@ class TestQwenPrecisionAndTis:
     def test_nondefault_knobs_are_tagged_on_the_baseline(self, env, tag):
         assert tag in compose(QWEN, **env)["trainer"]["experiment_name"]
 
-    def test_fp8_tis_differs_from_bf16_tis_only_by_quantization(self):
-        diff = _diff(compose(QWEN_TIS), compose(QWEN_TIS, ROLLOUT_QUANT="fp8"))
+    @pytest.mark.parametrize("quant", ["fp8", "int8"])
+    def test_quantized_tis_differs_from_bf16_tis_only_by_quantization(self, quant):
+        diff = _diff(compose(QWEN_TIS), compose(QWEN_TIS, ROLLOUT_QUANT=quant))
+        assert diff == {"actor_rollout_ref.rollout.quantization"} | NAME_DERIVED_KEYS
+
+    def test_int8_and_fp8_differ_only_by_quantization(self):
+        diff = _diff(compose(QWEN_TIS, ROLLOUT_QUANT="fp8"), compose(QWEN_TIS, ROLLOUT_QUANT="int8"))
         assert diff == {"actor_rollout_ref.rollout.quantization"} | NAME_DERIVED_KEYS
 
     def test_tis_script_is_the_baseline_with_tis_and_flashrl_knobs(self):
@@ -571,14 +591,20 @@ class TestQwenPrecisionAndTis:
             assert c["actor_rollout_ref"]["rollout"]["quantization"] is None
             assert c["algorithm"]["rollout_correction"]["rollout_is"] is None
 
-    def test_fp8_without_tis_is_allowed_with_a_warning(self, tmp_path):
-        rc, out, err = _run(QWEN, env={"ROLLOUT_QUANT": "fp8"}, tmp=tmp_path)
+    @pytest.mark.parametrize("quant", ["fp8", "int8"])
+    def test_quantized_without_tis_is_allowed_with_a_warning(self, quant, tmp_path):
+        rc, out, err = _run(QWEN, env={"ROLLOUT_QUANT": quant}, tmp=tmp_path)
         assert rc == 0, err[-2000:]
-        assert "WARNING: ROLLOUT_QUANT=fp8 without TIS" in err
-        assert yaml.safe_load(out)["actor_rollout_ref"]["rollout"]["quantization"] == "fp8"
+        assert f"WARNING: ROLLOUT_QUANT={quant} without TIS" in err
+        assert yaml.safe_load(out)["actor_rollout_ref"]["rollout"]["quantization"] == quant
 
-    def test_no_warning_with_tis(self, tmp_path):
-        rc, _, err = _run(QWEN_TIS, env={"ROLLOUT_QUANT": "fp8"}, tmp=tmp_path)
+    @pytest.mark.parametrize("quant", ["fp8", "int8"])
+    def test_no_warning_with_tis(self, quant, tmp_path):
+        rc, _, err = _run(QWEN_TIS, env={"ROLLOUT_QUANT": quant}, tmp=tmp_path)
+        assert rc == 0 and "WARNING: ROLLOUT_QUANT" not in err
+
+    def test_no_warning_for_bf16_without_tis(self, tmp_path):
+        rc, _, err = _run(QWEN, env={}, tmp=tmp_path)
         assert rc == 0 and "WARNING: ROLLOUT_QUANT" not in err
 
 
@@ -586,8 +612,9 @@ class TestQwenPrecisionAndTis:
 @pytest.mark.parametrize(
     "env, message",
     [
-        ({"ROLLOUT_QUANT": "int8"}, "ROLLOUT_QUANT must be"),
+        ({"ROLLOUT_QUANT": "int4"}, "ROLLOUT_QUANT must be"),
         ({"ROLLOUT_QUANT": "FP8"}, "ROLLOUT_QUANT must be"),
+        ({"ROLLOUT_QUANT": "INT8"}, "ROLLOUT_QUANT must be"),
         ({"TIS": "yes"}, "TIS must be"),
         ({"TIS_THRESHOLD": "abc"}, "TIS_THRESHOLD must be"),
         ({"TIS_THRESHOLD": "0"}, "TIS_THRESHOLD must be"),
@@ -649,7 +676,7 @@ class TestDynamicBatchSize:
         from verl.trainer.ppo.utils import need_critic, need_reference_policy
         from verl.utils.config import validate_config
 
-        for c in (compose(QWEN_TIS), compose(QWEN_TIS, ROLLOUT_QUANT="fp8")):
+        for c in (compose(QWEN_TIS), compose(QWEN_TIS, ROLLOUT_QUANT="fp8"), compose(QWEN_TIS, ROLLOUT_QUANT="int8")):
             cfg = OmegaConf.create(c)
             validate_config(config=cfg, use_reference_policy=need_reference_policy(cfg), use_critic=need_critic(cfg))
 

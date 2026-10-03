@@ -83,7 +83,8 @@ TIS_THRESHOLD=${TIS_THRESHOLD:-2.0}
 case "${ROLLOUT_QUANT}" in
     bf16) rollout_quantization=null; quant_tag="" ;;
     fp8) rollout_quantization=fp8; quant_tag=" rollout-fp8" ;;
-    *) echo "ROLLOUT_QUANT must be bf16 or fp8, got '${ROLLOUT_QUANT}'" >&2; exit 2 ;;
+    int8) rollout_quantization=int8; quant_tag=" rollout-int8" ;;
+    *) echo "ROLLOUT_QUANT must be bf16, fp8 or int8, got '${ROLLOUT_QUANT}'" >&2; exit 2 ;;
 esac
 [[ "${TIS_THRESHOLD}" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk "BEGIN{exit !(${TIS_THRESHOLD} > 0)}" || { echo "TIS_THRESHOLD must be a positive number, got '${TIS_THRESHOLD}'" >&2; exit 2; }
 case "${TIS}" in
@@ -91,8 +92,8 @@ case "${TIS}" in
     False|false|0) rollout_is=null; tis_tag="" ;;
     *) echo "TIS must be True or False, got '${TIS}'" >&2; exit 2 ;;
 esac
-if [[ "${rollout_quantization}" == "fp8" && "${rollout_is}" == "null" ]]; then
-    echo "WARNING: ROLLOUT_QUANT=fp8 without TIS; quantized rollouts without TIS collapsed in FlashRL's runs" >&2
+if [[ "${rollout_quantization}" != "null" && "${rollout_is}" == "null" ]]; then
+    echo "WARNING: ROLLOUT_QUANT=${ROLLOUT_QUANT} without TIS; quantized rollouts without TIS degraded sharply in FlashRL's runs" >&2
 fi
 
 DYNAMIC_BSZ=${DYNAMIC_BSZ:-False}

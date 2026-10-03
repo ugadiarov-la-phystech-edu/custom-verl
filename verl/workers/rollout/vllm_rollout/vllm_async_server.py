@@ -1031,10 +1031,17 @@ class vLLMHttpServer:
             logger.info(f"QAT quantization config injected (quant_method={quant_method})")
             hf_overrides["quantization_config"] = quantization_config_dict
         elif quantization is not None:
-            # Handle other quantization methods (fp8, torchao)
-            _SUPPORTED_QUANTIZATION = ["fp8", "torchao", "ascend"]
+            _SUPPORTED_QUANTIZATION = ["fp8", "int8", "torchao", "ascend"]
             if quantization not in _SUPPORTED_QUANTIZATION:
                 raise ValueError(f"Currently only support {_SUPPORTED_QUANTIZATION} quantization, got: {quantization}")
+
+            if quantization == "int8":
+                from verl.utils.vllm.vllm_int8_utils import INT8_QUANT_ENABLED_ENV, build_int8_w8a8_quant_config
+
+                hf_overrides["quantization_config"] = build_int8_w8a8_quant_config(self.model_config.hf_config)
+                quantization = "compressed-tensors"
+                apply_vllm_quant_patches()
+                os.environ[INT8_QUANT_ENABLED_ENV] = "1"
 
             if quantization == "fp8":
                 # Ignore MoE router layers for FP8 quantization
