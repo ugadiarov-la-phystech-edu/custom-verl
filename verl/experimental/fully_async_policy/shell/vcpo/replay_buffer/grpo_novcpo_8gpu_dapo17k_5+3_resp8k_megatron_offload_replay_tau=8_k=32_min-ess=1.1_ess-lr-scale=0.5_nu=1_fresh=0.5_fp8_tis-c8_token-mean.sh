@@ -12,7 +12,12 @@
 #   ..._nu=1_fresh=0.5_fp8.sh (read its header and the base arm's) plus
 #   * rollout_is_threshold=8   (base arm: 2.0; as in examples/baselines/run_qwen3-8b_dapo17k_grpo_sync_tis_B128xn16_mini32_megatron.sh)
 #   * loss_agg_mode=token-mean (base arm: seq-mean-token-mean; as in the sync baselines)
-# Both are env-overridable and visible in exp_name (" tis-C8", " token-mean").
+#   * DYNAMIC_BSZ=True         (base arm: micro-batch 1; as in the sync TIS baseline): sequences are packed into
+#                              micro-batches of up to DYNAMIC_BSZ_MAX_TOKENS=10240 tokens per GPU (one full-length
+#                              sequence, so the per-pass memory peak stays at the micro-batch-1 worst case). The
+#                              objective and the ESS brake are unchanged; see the base arm's "Dynamic batch size"
+#                              block. DYNAMIC_BSZ=False restores micro-batch 1.
+# All three are env-overridable and visible in exp_name (" tis-C8", " token-mean", " dynbsz-10240").
 #
 # NOT THE SYNC BASELINE'S SEMANTICS. In the sync baseline the TIS weight is pi_old / pi_vllm with pi_old the
 # generating parameters, so the cap of 8 bounds only the FP8/bf16 mismatch, and a PPO clip handles policy drift.
@@ -48,6 +53,7 @@ set -euo pipefail
 export ROLLOUT_QUANT=${ROLLOUT_QUANT:-fp8}
 export rollout_is_threshold=${rollout_is_threshold:-8}
 export loss_agg_mode=${loss_agg_mode:-token-mean}
+export DYNAMIC_BSZ=${DYNAMIC_BSZ:-True}
 export VERL_GPU_MEM_CAP_GB=${VERL_GPU_MEM_CAP_GB-78}
 export gpu_memory_utilization=${gpu_memory_utilization:-0.5}
 export lr_warmup_steps=${lr_warmup_steps:-12}

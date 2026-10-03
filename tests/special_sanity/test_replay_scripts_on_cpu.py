@@ -63,6 +63,9 @@ SCRIPT_ENV_KNOBS = {
     "save_freq",
     "rollout_is_threshold",
     "loss_agg_mode",
+    "DYNAMIC_BSZ",
+    "DYNAMIC_BSZ_MAX_TOKENS",
+    "DYNAMIC_BSZ_LOG_PROB_MAX_TOKENS",
     "DEEPGEMM_CUDA_HOME",
     *DEEPGEMM_VARS,
 }
@@ -455,6 +458,19 @@ def _differing(a, b):
     return {k for k in diff if "experiment_name" not in k and not k.endswith("default_local_dir")}
 
 
+# Keys DYNAMIC_BSZ=True changes. The ref.* and critic.* ones are interpolated from the actor/rollout keys and
+# inert here (no reference policy, no critic).
+DYNBSZ_KEYS = {
+    "actor_rollout_ref.actor.use_dynamic_bsz",
+    "actor_rollout_ref.actor.ppo_max_token_len_per_gpu",
+    "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz",
+    "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu",
+    "actor_rollout_ref.ref.log_prob_use_dynamic_bsz",
+    "actor_rollout_ref.ref.log_prob_max_token_len_per_gpu",
+    "critic.use_dynamic_bsz",
+}
+
+
 class TestFp8TisC8TokenMean:
     def test_cap_and_aggregation(self):
         c = compose(QWEN_FP8_C8)
@@ -471,23 +487,26 @@ class TestFp8TisC8TokenMean:
     def test_name(self):
         name = compose(QWEN_FP8_C8)["trainer"]["experiment_name"]
         assert " token-mean " in name
-        assert name.endswith(" 0.1-wd warmup-12 tis-C8 rollout-fp8 seed-1")
+        assert name.endswith(" 0.1-wd warmup-12 dynbsz-10240 tis-C8 rollout-fp8 seed-1")
 
-    def test_differs_from_the_fp8_arm_only_by_cap_and_aggregation(self):
+    def test_differs_from_the_fp8_arm_only_by_cap_aggregation_and_dynbsz(self):
         assert _differing(compose(QWEN_FP8), compose(QWEN_FP8_C8)) == {
             "algorithm.rollout_correction.rollout_is_threshold",
             "actor_rollout_ref.actor.policy_loss.rollout_correction.rollout_is_threshold",
             "actor_rollout_ref.actor.loss_agg_mode",
             "critic.loss_agg_mode",  # interpolated from the actor's; inert (GRPO has no critic)
+            *DYNBSZ_KEYS,
         }
 
-    def test_equals_the_fp8_arm_with_the_two_knobs(self):
-        assert compose(QWEN_FP8_C8) == compose(QWEN_FP8, rollout_is_threshold="8", loss_agg_mode="token-mean")
+    def test_equals_the_fp8_arm_with_the_three_knobs(self):
+        assert compose(QWEN_FP8_C8) == compose(
+            QWEN_FP8, rollout_is_threshold="8", loss_agg_mode="token-mean", DYNAMIC_BSZ="True"
+        )
 
     def test_knobs_can_be_set_back(self):
-        assert compose(QWEN_FP8_C8, rollout_is_threshold="2.0", loss_agg_mode="seq-mean-token-mean") == compose(
-            QWEN_FP8
-        )
+        assert compose(
+            QWEN_FP8_C8, rollout_is_threshold="2.0", loss_agg_mode="seq-mean-token-mean", DYNAMIC_BSZ="False"
+        ) == compose(QWEN_FP8)
 
     def test_base_default_cap_is_untagged(self):
         c = compose(QWEN)
@@ -634,3 +653,71 @@ class TestLrDecayHorizon:
         proc = _run(script, {"lr_decay_steps": bad}, (), tmp_path)
         assert proc.returncode == 2
         assert "lr_decay_steps must be a positive integer" in proc.stderr
+
+
+# --------------------------------------------------------------------------- dynamic batch size toggle
+
+
+class TestDynamicBatchSize:
+    def test_default_is_off_and_untagged(self):
+        for script in (QWEN, QWEN_FP8, PANGU):
+            c = compose(script)
+            assert c["actor_rollout_ref"]["actor"]["use_dynamic_bsz"] is False
+            assert c["actor_rollout_ref"]["rollout"]["log_prob_use_dynamic_bsz"] is False
+            assert "dynbsz" not in c["trainer"]["experiment_name"]
+        assert compose(QWEN, DYNAMIC_BSZ="False") == compose(QWEN)
+
+    def test_on_sets_flags_and_caps_consistently(self):
+        c = compose(QWEN, DYNAMIC_BSZ="True")
+        actor, rollout = c["actor_rollout_ref"]["actor"], c["actor_rollout_ref"]["rollout"]
+        # engine_workers.py asserts these two flags are equal and both caps set
+        assert actor["use_dynamic_bsz"] is rollout["log_prob_use_dynamic_bsz"] is True
+        # default cap: one full-length sequence, the micro-batch-1 memory worst case
+        assert actor["ppo_max_token_len_per_gpu"] == c["data"]["max_prompt_length"] + c["data"]["max_response_length"]
+        assert actor["ppo_max_token_len_per_gpu"] == rollout["log_prob_max_token_len_per_gpu"] == 10240
+        assert _differing(compose(QWEN), c) == DYNBSZ_KEYS
+        assert c["trainer"]["experiment_name"].endswith(" 0.1-wd dynbsz-10240 seed-1")
+
+    def test_caps_are_configurable(self):
+        c = compose(QWEN, DYNAMIC_BSZ="True", DYNAMIC_BSZ_MAX_TOKENS="16384", DYNAMIC_BSZ_LOG_PROB_MAX_TOKENS="20480")
+        assert c["actor_rollout_ref"]["actor"]["ppo_max_token_len_per_gpu"] == 16384
+        assert c["actor_rollout_ref"]["rollout"]["log_prob_max_token_len_per_gpu"] == 20480
+        assert " dynbsz-16384 " in c["trainer"]["experiment_name"]
+
+    def test_log_prob_cap_follows_training_cap(self):
+        c = compose(QWEN, DYNAMIC_BSZ="True", DYNAMIC_BSZ_MAX_TOKENS="12288")
+        assert c["actor_rollout_ref"]["rollout"]["log_prob_max_token_len_per_gpu"] == 12288
+
+    def test_tis_c8_wrapper_enables_it_and_can_switch_it_off(self):
+        assert compose(QWEN_FP8_C8)["actor_rollout_ref"]["actor"]["use_dynamic_bsz"] is True
+        off = compose(QWEN_FP8_C8, DYNAMIC_BSZ="False")
+        assert off["actor_rollout_ref"]["actor"]["use_dynamic_bsz"] is False
+        assert "dynbsz" not in off["trainer"]["experiment_name"]
+
+    def test_trainer_and_worker_accept_the_config(self):
+        from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
+        from verl.utils.config import omega_conf_to_dataclass
+
+        cfg = _cfg(QWEN_FP8_C8)
+        actor = omega_conf_to_dataclass(cfg.actor_rollout_ref.actor)
+        assert actor.use_dynamic_bsz is True and actor.ppo_max_token_len_per_gpu == 10240
+        cfg.trainer.logger = ["console"]
+        trainer_cls = FullyAsyncTrainer.__ray_metadata__.modified_class
+        t = trainer_cls(config=cfg, tokenizer=None, role_worker_mapping={}, resource_pool_manager=None)
+        assert t.replay_enable and t.replay_first_mini_size == 18
+
+
+@pytest.mark.parametrize("script", [QWEN, QWEN_FP8_C8])
+@pytest.mark.parametrize(
+    "env, message",
+    [
+        ({"DYNAMIC_BSZ": "maybe"}, "DYNAMIC_BSZ must be"),
+        ({"DYNAMIC_BSZ": "True", "DYNAMIC_BSZ_MAX_TOKENS": "8192"}, "must be >= max_prompt_length"),
+        ({"DYNAMIC_BSZ": "True", "DYNAMIC_BSZ_MAX_TOKENS": "abc"}, "must be positive integers"),
+        ({"DYNAMIC_BSZ": "True", "DYNAMIC_BSZ_LOG_PROB_MAX_TOKENS": "4096"}, "must be >= max_prompt_length"),
+    ],
+)
+def test_invalid_dynbsz_settings_are_rejected(script, env, message, tmp_path):
+    proc = _run(script, env, (), tmp_path)
+    assert proc.returncode == 2
+    assert message in proc.stderr

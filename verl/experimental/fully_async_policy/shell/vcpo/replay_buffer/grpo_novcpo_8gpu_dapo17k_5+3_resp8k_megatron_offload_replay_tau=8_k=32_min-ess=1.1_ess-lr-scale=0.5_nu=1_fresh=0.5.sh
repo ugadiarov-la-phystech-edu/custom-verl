@@ -51,8 +51,9 @@
 #     opportunistic_epochs.*, ppo_epochs*, save_queue_state, replay_buffer.save_state} (the trainer
 #     rejects the unported ones if enabled). The recompute_* overrides lost their `+` (the keys exist).
 #   * Added: actor_rollout_ref.rollout.seed=${SEED} (the source's vLLM seed was always 0).
-#   * Micro-batch size 1 is no longer required (the loss is micro-batch invariant); kept at 1 so the
-#     memory envelope of the source runs carries over.
+#   * Micro-batch size 1 is no longer required (the loss is micro-batch invariant); kept at 1 by default so
+#     the memory envelope of the source runs carries over. DYNAMIC_BSZ=True packs sequences instead (see the
+#     "Dynamic batch size" block).
 #
 # ROLLOUT PRECISION (not in the source): ROLLOUT_QUANT=bf16 (default) | fp8. fp8 = verl's native online
 # block-FP8 (actor_rollout_ref.rollout.quantization=fp8): the trainer stays bf16 and every weight sync
@@ -125,10 +126,46 @@ train_prompt_bsz=0
 gen_prompt_bsz=1
 train_prompt_mini_bsz=${train_prompt_mini_bsz:-33} # 33*16=528 seqs; mini*n must divide by trainer DP=3
 micro_bsz_per_gpu=1
-use_dynamic_bsz=False
 log_prob_micro_bsz_per_gpu=1
 # Per-engine in-flight group cap (the source's bsz_per_dp_rank): 5 engines x 33 = 165 groups
 concurrent_samples_per_replica=${concurrent_samples_per_replica:-${train_prompt_mini_bsz}}
+
+# ================= Dynamic batch size (toggle) =================
+# DYNAMIC_BSZ=False (default) keeps one sequence per forward/backward pass (micro-batch 1), the source's
+# memory envelope. DYNAMIC_BSZ=True packs each rank's share of a mini-batch into micro-batches of up to
+# DYNAMIC_BSZ_MAX_TOKENS tokens (sequence-length balanced across DP ranks, same micro-batch count on every
+# rank; verl/utils/seqlen_balancing.py). It does NOT change the objective: the loss is normalized by the
+# whole mini-batch (also the smaller first one), and the ESS brake sees one log-IS sum per sequence whatever
+# the packing. Only the training/rollout_actor_probs_pearson_corr diagnostic, an unweighted mean over
+# micro-batches, shifts slightly. Short responses share a pass -> fewer, fuller passes in update_actor.
+#   DYNAMIC_BSZ_MAX_TOKENS          per-GPU token cap for training micro-batches. Must be >= one full
+#       sequence (max_prompt_length + max_response_length = 10240, the default), which keeps the per-pass
+#       peak at the micro-batch-1 worst case (one 10240-token sequence; memory scales with TOKENS per
+#       micro-batch, dominated by the full-vocabulary fp32 logits). Raising it needs a fresh OOM smoke.
+#   DYNAMIC_BSZ_LOG_PROB_MAX_TOKENS token cap for forward-only log-prob passes (default: same; replay mode
+#       reuses the cached rollout log-probs, but verl requires the cap whenever the flag is on).
+# Tagged " dynbsz-<cap>" in exp_name.
+DYNAMIC_BSZ=${DYNAMIC_BSZ:-False}
+DYNAMIC_BSZ_MAX_TOKENS=${DYNAMIC_BSZ_MAX_TOKENS:-$((max_prompt_length + max_response_length))}
+DYNAMIC_BSZ_LOG_PROB_MAX_TOKENS=${DYNAMIC_BSZ_LOG_PROB_MAX_TOKENS:-${DYNAMIC_BSZ_MAX_TOKENS}}
+dynbsz_args=()
+dynbsz_tag=""
+case "${DYNAMIC_BSZ}" in
+    True|true|1)
+        use_dynamic_bsz=True
+        for cap in "${DYNAMIC_BSZ_MAX_TOKENS}" "${DYNAMIC_BSZ_LOG_PROB_MAX_TOKENS}"; do
+            [[ "${cap}" =~ ^[1-9][0-9]*$ ]] || { echo "DYNAMIC_BSZ token caps must be positive integers, got '${cap}'" >&2; exit 2; }
+            (( cap >= max_prompt_length + max_response_length )) || { echo "DYNAMIC_BSZ token caps must be >= max_prompt_length + max_response_length = $((max_prompt_length + max_response_length)), got ${cap}" >&2; exit 2; }
+        done
+        dynbsz_args=(
+            actor_rollout_ref.actor.ppo_max_token_len_per_gpu="${DYNAMIC_BSZ_MAX_TOKENS}"
+            actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="${DYNAMIC_BSZ_LOG_PROB_MAX_TOKENS}"
+        )
+        dynbsz_tag=" dynbsz-${DYNAMIC_BSZ_MAX_TOKENS}"
+        ;;
+    False|false|0) use_dynamic_bsz=False ;;
+    *) echo "DYNAMIC_BSZ must be True or False, got '${DYNAMIC_BSZ}'" >&2; exit 2 ;;
+esac
 
 # ================= Algorithm =================
 adv_estimator=grpo
@@ -248,7 +285,7 @@ ckpt_save_contents="['hf_model']"
 resume_mode=disable
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${warmup_tag}${tis_tag}${quant_tag} seed-${SEED}"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${warmup_tag}${dynbsz_tag}${tis_tag}${quant_tag} seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
 # log_dir: TensorBoard and the rollout / validation dumps; CKPTS_DIR: global_step_N/ checkpoints.
 log_dir=${log_dir:-"logs/${exp_name_safe}"}
@@ -387,4 +424,4 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     async_training.replay_buffer.requires_mini_batches="${replay_requires_mini_batches}" \
     async_training.replay_buffer.sampling_seed="${replay_sampling_seed}" \
     async_training.replay_buffer.reuse_halflife="${replay_reuse_halflife}" \
-    async_training.replay_buffer.min_fresh_ratio="${replay_min_fresh_ratio}" "$@"
+    async_training.replay_buffer.min_fresh_ratio="${replay_min_fresh_ratio}" "${dynbsz_args[@]}" "$@"
