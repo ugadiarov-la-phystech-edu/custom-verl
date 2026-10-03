@@ -214,7 +214,8 @@ class TestRecipe:
     def test_logs_go_to_log_dir(self, script):
         c = compose(script)
         assert c["trainer"]["default_local_dir"].endswith("/logs")
-        assert c["trainer"]["rollout_data_dir"] == c["trainer"]["default_local_dir"]
+        # per-update rollout dumps (<step>.jsonl) are off
+        assert c["trainer"]["rollout_data_dir"] is None
 
     def test_worker_side_actor_config(self, script):
         from verl.utils.config import omega_conf_to_dataclass

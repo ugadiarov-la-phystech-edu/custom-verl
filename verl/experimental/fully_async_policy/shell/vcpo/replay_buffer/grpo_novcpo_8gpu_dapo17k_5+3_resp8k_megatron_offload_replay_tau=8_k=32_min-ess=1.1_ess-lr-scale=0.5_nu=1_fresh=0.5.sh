@@ -280,7 +280,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     trainer.max_actor_ckpt_to_keep=${max_actor_ckpt_to_keep} \
     "actor_rollout_ref.actor.checkpoint.save_contents=${ckpt_save_contents}" \
     trainer.resume_mode=${resume_mode} \
-    trainer.rollout_data_dir="${log_dir}" \
+    trainer.rollout_data_dir=null \
     trainer.log_val_generations=${log_val_generations} \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.nnodes="${NNODES}" \
