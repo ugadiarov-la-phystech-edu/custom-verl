@@ -35,6 +35,7 @@ QWEN = "run_qwen3-8b_dapo17k_grpo_sync_B128xn16_mini32_megatron.sh"
 PANGU = "run_openpangu7b_dapo17k_grpo_sync_B128xn16_mini32_megatron.sh"
 ORZ = "run_orz7b_orz72k_grpo_sync_B128xn16_mini32_megatron.sh"
 QWEN_TIS = "run_qwen3-8b_dapo17k_grpo_sync_tis_B128xn16_mini32_megatron.sh"
+QWEN25_TIS = "run_qwen2.5-7b_dapo17k_grpo_sync_tis_B128xn16_mini32_megatron.sh"
 ALL = [QWEN, PANGU, ORZ]
 
 
@@ -58,6 +59,10 @@ SCRIPT_ENV_KNOBS = {
     "DYNAMIC_BSZ_MAX_TOKENS",
     "DYNAMIC_BSZ_LOG_PROB_MAX_TOKENS",
     "DEEPGEMM_CUDA_HOME",
+    "MODEL_PATH",
+    "model_tag",
+    "train_prompt_bsz",
+    "train_prompt_mini_bsz",
 }
 
 
@@ -810,3 +815,120 @@ class TestDeepGemmEnv:
     def test_config_is_unaffected(self, tmp_path):
         toolkit = _fake_toolkit(tmp_path)
         assert _diff(compose(QWEN_TIS), compose(QWEN_TIS, DEEPGEMM_CUDA_HOME=str(toolkit))) == set()
+
+
+# --------------------------------------------------------------------------- Qwen2.5-7B base TIS arm
+
+
+CADENCE_KEYS = {"trainer.test_freq", "trainer.save_freq"}
+# critic.ppo_mini_batch_size is interpolated from the actor's; inert (GRPO has no critic).
+BATCH_KEYS = {"data.train_batch_size", "actor_rollout_ref.actor.ppo_mini_batch_size", "critic.ppo_mini_batch_size"}
+# What the Qwen2.5-7B script sets differently from the Qwen3-8B TIS script.
+QWEN25_OWN = {
+    "MODEL_PATH": "Qwen/Qwen2.5-7B",
+    "model_tag": "Qwen2.5-7B",
+    "train_prompt_bsz": "140",
+    "train_prompt_mini_bsz": "35",
+    "test_freq": "5",
+    "save_freq": "5",
+}
+
+
+class TestQwen25BaseTis:
+    def test_model_and_name(self):
+        c = compose(QWEN25_TIS)
+        assert c["actor_rollout_ref"]["model"]["path"] == "Qwen/Qwen2.5-7B"
+        name = c["trainer"]["experiment_name"]
+        assert " DAPO17K-AIME24-25 Qwen2.5-7B tp1dp8 " in name and "Qwen3" not in name
+        assert name.endswith(" 0.1-wd clip-0.2-0.28-c10.0 warmup-3 dynbsz-10240 tis-C8 seed-1 h100-emu-76gb-gmu0.283")
+
+    def test_is_the_qwen3_tis_arm_with_only_the_model_swapped(self):
+        swapped = compose(QWEN_TIS, **QWEN25_OWN)
+        assert _diff(swapped, compose(QWEN25_TIS)) == set()
+        changed = _diff(compose(QWEN_TIS), compose(QWEN25_TIS)) - NAME_DERIVED_KEYS - CADENCE_KEYS - BATCH_KEYS
+        assert "actor_rollout_ref.model.path" in changed
+        for key in changed:  # everything else that changes is derived from the model path
+            assert key.endswith(("path", "served_model_name")) or ".model." in key, key
+
+    def test_env_knobs_still_apply(self):
+        c = compose(QWEN25_TIS, TIS="False", DYNAMIC_BSZ="False", weight_decay="0.01", max_updates="40")
+        assert c["algorithm"]["rollout_correction"]["rollout_is"] is None
+        assert c["actor_rollout_ref"]["actor"]["use_dynamic_bsz"] is False
+        assert c["actor_rollout_ref"]["actor"]["optim"]["weight_decay"] == 0.01
+        assert c["trainer"]["total_training_steps"] == 10  # 40 updates / 4 per step
+
+    def test_runs_the_base_launcher_not_the_qwen3_tis_script(self):
+        code = [ln for ln in (SCRIPTS / QWEN25_TIS).read_text().splitlines() if not ln.lstrip().startswith("#")]
+        execs = [ln for ln in code if ln.lstrip().startswith("exec ")]
+        assert len(execs) == 1 and QWEN in execs[0]
+        assert not any(QWEN_TIS in ln for ln in code)
+
+    def test_batch_140_prompts_mini_35(self):
+        c = compose(QWEN25_TIS)
+        assert c["data"]["train_batch_size"] == 140
+        assert c["actor_rollout_ref"]["actor"]["ppo_mini_batch_size"] == 35
+        assert " B-140xn16 mini-35 " in c["trainer"]["experiment_name"]
+        assert compose(QWEN25_TIS, max_updates="200")["trainer"]["total_training_steps"] == 50  # 4 updates per step
+        c = compose(QWEN25_TIS, train_prompt_bsz="128", train_prompt_mini_bsz="32")
+        assert (c["data"]["train_batch_size"], c["actor_rollout_ref"]["actor"]["ppo_mini_batch_size"]) == (128, 32)
+
+    def test_validates_and_saves_every_5_steps(self):
+        c = compose(QWEN25_TIS)
+        assert (c["trainer"]["test_freq"], c["trainer"]["save_freq"]) == (5, 5)
+        c = compose(QWEN25_TIS, test_freq="3", save_freq="4")
+        assert (c["trainer"]["test_freq"], c["trainer"]["save_freq"]) == (3, 4)
+
+    def test_exports_the_same_parameters_as_the_qwen3_tis_script(self):
+        def exports(script):
+            text = (SCRIPTS / script).read_text()
+            return {ln.strip() for ln in text.splitlines() if ln.startswith("export ")}
+
+        qwen25, qwen3 = exports(QWEN25_TIS), exports(QWEN_TIS)
+        own = tuple(f"export {k}=" for k in QWEN25_OWN)
+        own_lines = {ln for ln in qwen25 if ln.startswith(own)}
+        assert len(own_lines) == len(QWEN25_OWN)
+        assert qwen25 - own_lines == {ln for ln in qwen3 if not ln.startswith(own)}
+
+    def test_keeps_the_flashrl_tis_knobs(self):
+        c = compose(QWEN25_TIS)
+        actor = c["actor_rollout_ref"]["actor"]
+        assert c["algorithm"]["rollout_correction"]["rollout_is"] == "token"
+        assert c["algorithm"]["rollout_correction"]["rollout_is_threshold"] == 8.0
+        assert (actor["clip_ratio_low"], actor["clip_ratio_high"], actor["clip_ratio_c"]) == (0.2, 0.28, 10.0)
+        assert actor["optim"]["lr_warmup_steps"] == 3 and actor["optim"]["weight_decay"] == 0.1
+        assert actor["use_dynamic_bsz"] is True
+        assert c["actor_rollout_ref"]["rollout"]["gpu_memory_utilization"] == 0.283
+
+    def test_no_external_lib_needed(self):
+        # Megatron-Bridge's Qwen2Bridge maps the QKV biases itself
+        assert compose(QWEN25_TIS)["actor_rollout_ref"]["model"].get("external_lib") is None
+
+    @pytest.mark.parametrize("quant", ["fp8", "int8"])
+    def test_rollout_precision_toggle(self, quant):
+        c = compose(QWEN25_TIS, ROLLOUT_QUANT=quant)
+        assert c["actor_rollout_ref"]["rollout"]["quantization"] == quant
+        assert f" tis-C8 rollout-{quant} seed-1 " in c["trainer"]["experiment_name"] + " "
+
+    def test_explicit_model_path_wins(self):
+        c = compose(QWEN25_TIS, MODEL_PATH="/models/qwen2.5-7b")
+        assert c["actor_rollout_ref"]["model"]["path"] == "/models/qwen2.5-7b"
+        assert " Qwen2.5-7B tp1dp8 " in c["trainer"]["experiment_name"]
+
+    def test_h100_emulation_can_be_switched_off(self):
+        c = compose(QWEN25_TIS, VERL_GPU_MEM_CAP_GB="", gpu_memory_utilization="0.5")
+        assert c["actor_rollout_ref"]["rollout"]["gpu_memory_utilization"] == 0.5
+        assert "h100-emu" not in c["trainer"]["experiment_name"]
+
+    def test_qwen3_arms_keep_their_name(self):
+        for script in (QWEN, QWEN_TIS):
+            name = compose(script)["trainer"]["experiment_name"]
+            assert " DAPO17K-AIME24-25 Qwen3-8B tp1dp8 " in name
+
+    def test_passes_verl_config_validation(self):
+        from omegaconf import OmegaConf
+
+        from verl.trainer.ppo.utils import need_critic, need_reference_policy
+        from verl.utils.config import validate_config
+
+        cfg = OmegaConf.create(compose(QWEN25_TIS))
+        validate_config(config=cfg, use_reference_policy=need_reference_policy(cfg), use_critic=need_critic(cfg))
