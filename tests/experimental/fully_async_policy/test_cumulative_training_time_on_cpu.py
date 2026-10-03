@@ -268,6 +268,38 @@ class TestRollouterSide:
         asyncio.run(r.do_validate())
         assert (r.cumulative_validation_time >= 0.05) is anchored
 
+    @pytest.mark.parametrize("serialize", [True, False])
+    def test_validation_accounts_the_frozen_window_when_serialized(self, serialize):
+        # serialized: generation is frozen from the freeze to the unfreeze, and the trainer excludes all of it,
+        # so the shift of later samples must cover the freeze too (as end_save_pause does for saves)
+        r = _bare_rollouter(serialize=serialize)
+        r.first_sample_time = 1.0
+        freeze = r._freeze_inflight_generation
+
+        async def slow_freeze():
+            await freeze()
+            await asyncio.sleep(0.2)
+
+        r._freeze_inflight_generation = slow_freeze
+        r._validate = lambda: time.sleep(0.05) or {}
+        out = asyncio.run(r.do_validate())
+        assert out["rollouter/validate_time"] < 0.2  # the validation alone
+        assert (r.cumulative_validation_time >= 0.25) is serialize
+        assert r.cumulative_validation_time >= 0.05
+
+    def test_failed_validation_is_not_accounted(self):
+        r = _bare_rollouter(serialize=True)
+        r.first_sample_time = 1.0
+
+        def boom():
+            raise RuntimeError("validation failed")
+
+        r._validate = boom
+        with pytest.raises(RuntimeError):
+            asyncio.run(r.do_validate())
+        assert r.cumulative_validation_time == 0.0
+        assert not r.is_hard_paused()
+
     @pytest.mark.parametrize("anchored", [True, False])
     def test_save_pause_counts_after_the_anchor_only(self, anchored):
         r = _bare_rollouter()

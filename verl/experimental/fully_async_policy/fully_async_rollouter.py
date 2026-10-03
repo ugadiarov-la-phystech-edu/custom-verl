@@ -705,17 +705,21 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
     async def do_validate(self):
         """Run validation and return metrics.
         """
+        pause_start = time.time()
         if self.serialize_validation:
             await self._begin_hard_pause("validation")
         try:
             timing_raw = {}
             with marked_timer("rollouter/validate_time", timing_raw, color="green"):
                 val_metrics: dict = self._validate()
-            if self.first_sample_time is not None:
-                self.cumulative_validation_time += timing_raw["rollouter/validate_time"]
         finally:
             if self.serialize_validation:
                 await self._end_hard_pause("validation")
+        if self.first_sample_time is not None:
+            if self.serialize_validation:
+                self.cumulative_validation_time += time.time() - pause_start
+            else:
+                self.cumulative_validation_time += timing_raw["rollouter/validate_time"]
         return timing_raw | val_metrics
 
     async def begin_save_pause(self):
