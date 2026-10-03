@@ -259,23 +259,30 @@ calculate_log_probs=True
 
 # ================= Rollout precision / TIS toggles =================
 # Defaults reproduce the baseline (bf16 rollout, no correction). Both toggles are tagged in exp_name.
-#   ROLLOUT_QUANT=bf16|fp8  vLLM rollout precision. fp8 = verl's native online block-FP8
+#   ROLLOUT_QUANT=bf16|fp8|int8  vLLM rollout precision. fp8 = verl's native online block-FP8
 #       (actor_rollout_ref.rollout.quantization=fp8): the trainer stays bf16 and every weight sync
 #       re-quantizes Linear weights to 128x128-block FP8 inside vLLM; embeddings, lm_head and norms stay
 #       bf16. The same gpu_memory_utilization now leaves ~8 GB more for KV cache (weights halve).
+#       int8 = online W8A8-INT8 (rollout.quantization=int8, verl/utils/vllm/vllm_int8_utils.py): per-output-
+#       channel symmetric INT8 weights rounded to nearest at every weight sync (no calibration), per-token
+#       dynamic INT8 activations, CUTLASS int8 GEMMs; lm_head, embeddings and norms stay bf16. Expect a larger
+#       rollout/trainer mismatch than fp8 and, on Hopper (INT8 TOPS = FP8 TFLOPS), no speedup over fp8; see
+#       notes/int8_rollout_rtn_vs_flashrl_calibration.md.
 #   TIS=False|True          truncated importance sampling (Yao et al., "Your Efficient RL Framework
 #       Secretly Brings You Off-Policy RL Training"): every token's PPO loss is scaled by
 #       min(pi_trainer_old / pi_vllm, TIS_THRESHOLD), computed from the cached rollout log-probs
 #       (algorithm.rollout_correction.rollout_is=token, decoupled mode, bypass_mode=false).
 #   TIS_THRESHOLD           the cap C (default 2.0, as in verl's FP8 guide and FlashRL's TIS-2).
-# FP8 rollout without TIS collapsed in FlashRL's experiments; it is allowed here only for ablations.
+# Quantized (FP8/INT8) rollout without TIS degraded sharply in FlashRL's experiments (INT8 collapsed on DAPO-32B);
+# it is allowed here only for ablations.
 ROLLOUT_QUANT=${ROLLOUT_QUANT:-bf16}
 TIS=${TIS:-False}
 TIS_THRESHOLD=${TIS_THRESHOLD:-2.0}
 case "${ROLLOUT_QUANT}" in
     bf16) rollout_quantization=null; quant_tag="" ;;
     fp8) rollout_quantization=fp8; quant_tag=" rollout-fp8" ;;
-    *) echo "ROLLOUT_QUANT must be bf16 or fp8, got '${ROLLOUT_QUANT}'" >&2; exit 2 ;;
+    int8) rollout_quantization=int8; quant_tag=" rollout-int8" ;;
+    *) echo "ROLLOUT_QUANT must be bf16, fp8 or int8, got '${ROLLOUT_QUANT}'" >&2; exit 2 ;;
 esac
 [[ "${TIS_THRESHOLD}" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk "BEGIN{exit !(${TIS_THRESHOLD} > 0)}" || { echo "TIS_THRESHOLD must be a positive number, got '${TIS_THRESHOLD}'" >&2; exit 2; }
 case "${TIS}" in
@@ -283,8 +290,8 @@ case "${TIS}" in
     False|false|0) rollout_is=null; tis_tag="" ;;
     *) echo "TIS must be True or False, got '${TIS}'" >&2; exit 2 ;;
 esac
-if [[ "${rollout_quantization}" == "fp8" && "${rollout_is}" == "null" ]]; then
-    echo "WARNING: ROLLOUT_QUANT=fp8 without TIS; quantized rollouts without TIS collapsed in FlashRL's runs" >&2
+if [[ "${rollout_quantization}" != "null" && "${rollout_is}" == "null" ]]; then
+    echo "WARNING: ROLLOUT_QUANT=${ROLLOUT_QUANT} without TIS; quantized rollouts without TIS degraded sharply in FlashRL's runs" >&2
 fi
 
 # ================= Dynamic batch size (toggle) =================

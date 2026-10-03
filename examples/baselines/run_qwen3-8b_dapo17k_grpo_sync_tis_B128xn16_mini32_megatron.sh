@@ -12,6 +12,7 @@
 #
 #   bash examples/baselines/run_qwen3-8b_dapo17k_grpo_sync_tis_B128xn16_mini32_megatron.sh                     # bf16 + TIS
 #   ROLLOUT_QUANT=fp8 bash examples/baselines/run_qwen3-8b_dapo17k_grpo_sync_tis_B128xn16_mini32_megatron.sh   # fp8 + TIS
+#   ROLLOUT_QUANT=int8 bash examples/baselines/run_qwen3-8b_dapo17k_grpo_sync_tis_B128xn16_mini32_megatron.sh  # int8 + TIS
 #
 # FLASHRL PARAMETERS. Four knobs follow FlashRL's DAPO-Qwen2.5-32B recipe (yaof20/verl, branch
 # flash-rl, recipe/flash_rl/dapo_qwen32b_{bf16,int8}.sh), overriding the baseline, plus a shorter warmup:
