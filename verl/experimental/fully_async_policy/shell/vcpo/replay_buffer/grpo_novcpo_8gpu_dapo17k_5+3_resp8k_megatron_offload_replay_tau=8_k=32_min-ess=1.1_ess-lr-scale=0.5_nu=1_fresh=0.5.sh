@@ -78,6 +78,9 @@ export PYTHONUNBUFFERED=1
 #   aime-2024.parquet (data_source=math_dapo) -> val-core/math_dapo/acc/mean@1
 #   aime-2025.parquet (data_source=aime2025_dapo) -> val-core/aime2025_dapo/acc/mean@1
 MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-8B"}
+# Model name in exp_name; set together with MODEL_PATH by wrappers that swap the model
+# (..._fp8_tis-c8_token-mean_qwen2.5-7b.sh).
+model_tag=${model_tag:-"Qwen3-8B"}
 TRAIN_FILE=${TRAIN_FILE:-"/home/jovyan/datasets/math_datasets/dapo/dapo-math-17k.parquet"}
 TEST_FILE=${TEST_FILE:-"['/home/jovyan/datasets/math_datasets/dapo/aime-2024.parquet','/home/jovyan/datasets/math_datasets/dapo/aime-2025.parquet']"}
 project_name='vcpo'
@@ -114,7 +117,7 @@ max_response_length=${max_response_length:-8192}
 max_num_batched_tokens=$((max_prompt_length + max_response_length))
 
 # ================= Megatron Parallelism =================
-train_tp=1 # only valid TP for 3 trainer GPUs (pure DP); the ESS brake also needs pp=1, cp=1
+train_tp=1 # pure DP (the only valid TP for 3 or 5 trainer GPUs); the ESS brake also needs pp=1, cp=1
 train_pp=1
 train_cp=1
 sequence_parallel=False # requires TP>1
@@ -124,7 +127,7 @@ precision_dtype="bfloat16"
 # ================= Batch Sizes =================
 train_prompt_bsz=0
 gen_prompt_bsz=1
-train_prompt_mini_bsz=${train_prompt_mini_bsz:-33} # 33*16=528 seqs; mini*n must divide by trainer DP=3
+train_prompt_mini_bsz=${train_prompt_mini_bsz:-33} # 33*16=528 seqs; mini*n must divide by trainer DP (3 here)
 micro_bsz_per_gpu=1
 log_prob_micro_bsz_per_gpu=1
 # Per-engine in-flight group cap (the source's bsz_per_dp_rank): 5 engines x 33 = 165 groups
@@ -285,7 +288,7 @@ ckpt_save_contents="['hf_model']"
 resume_mode=disable
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${warmup_tag}${dynbsz_tag}${tis_tag}${quant_tag} seed-${SEED}"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 ${model_tag} ${n_gpus_rollout}-${n_gpus_training} tp${train_tp}dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${warmup_tag}${dynbsz_tag}${tis_tag}${quant_tag} seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
 # log_dir: TensorBoard (per-update rollout dumps are off: trainer.rollout_data_dir=null); CKPTS_DIR: global_step_N/ checkpoints.
 log_dir=${log_dir:-"logs/${exp_name_safe}"}

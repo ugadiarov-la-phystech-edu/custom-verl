@@ -37,6 +37,10 @@ QWEN = f"{_ARM}_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.5.sh"
 PANGU = f"{_ARM}_min-ess=1.07_ess-lr-scale=0.5_fresh=0.5_openpangu7b.sh"
 QWEN_FP8 = f"{_ARM}_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.5_fp8.sh"
 QWEN_FP8_C8 = f"{_ARM}_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.5_fp8_tis-c8_token-mean.sh"
+QWEN25_FP8_C8 = (
+    "grpo_novcpo_8gpu_dapo17k_3+5_resp8k_megatron_offload_replay_tau=8_k=32"
+    "_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.5_fp8_tis-c8_token-mean_qwen2.5-7b.sh"
+)
 ALL = [QWEN, PANGU, QWEN_FP8]
 QWEN_ARMS = (QWEN, QWEN_FP8)
 DEEPGEMM_VARS = ("CUDA_HOME", "DG_JIT_CACHE_DIR", "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER")
@@ -67,6 +71,11 @@ SCRIPT_ENV_KNOBS = {
     "DYNAMIC_BSZ_MAX_TOKENS",
     "DYNAMIC_BSZ_LOG_PROB_MAX_TOKENS",
     "DEEPGEMM_CUDA_HOME",
+    "MODEL_PATH",
+    "model_tag",
+    "n_gpus_rollout",
+    "train_prompt_mini_bsz",
+    "concurrent_samples_per_replica",
     *DEEPGEMM_VARS,
 }
 
@@ -553,9 +562,93 @@ class TestFp8TisC8TokenMean:
         assert seen["VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER"] == "0"
 
 
+# --------------------------------------------------------------------------- Qwen2.5-7B base, 3+5 layout
+
+
+QWEN25_OWN = {
+    "MODEL_PATH": "Qwen/Qwen2.5-7B",
+    "model_tag": "Qwen2.5-7B",
+    "n_gpus_rollout": "3",
+    "train_prompt_mini_bsz": "35",
+    "test_freq": "20",
+    "save_freq": "20",
+}
+
+
+class TestQwen25Base3p5:
+    def test_model_layout_and_cadence(self):
+        c = compose(QWEN25_FP8_C8)
+        assert c["actor_rollout_ref"]["model"]["path"] == "Qwen/Qwen2.5-7B"
+        assert (c["rollout"]["n_gpus_per_node"], c["trainer"]["n_gpus_per_node"]) == (3, 5)
+        assert c["actor_rollout_ref"]["actor"]["ppo_mini_batch_size"] == 35
+        assert c["async_training"]["concurrent_samples_per_replica"] == 35
+        assert (c["trainer"]["test_freq"], c["trainer"]["save_freq"]) == (20, 20)
+        assert c["actor_rollout_ref"]["model"].get("external_lib") is None  # Qwen2Bridge maps the QKV biases
+
+    def test_name(self):
+        name = compose(QWEN25_FP8_C8)["trainer"]["experiment_name"]
+        assert " DAPO17K-AIME24 Qwen2.5-7B 3-5 tp1dp5 hdo B-35 token-mean " in name and "Qwen3" not in name
+        assert name.endswith(" 0.1-wd warmup-12 dynbsz-10240 tis-C8 rollout-fp8 seed-1")
+
+    def test_is_the_tis_c8_arm_with_only_the_requested_changes(self):
+        assert compose(QWEN25_FP8_C8) == compose(QWEN_FP8_C8, **QWEN25_OWN)
+
+    def test_exports_the_same_parameters_as_the_tis_c8_arm(self):
+        def exports(script):
+            return {ln.strip() for ln in (SCRIPTS / script).read_text().splitlines() if ln.startswith("export ")}
+
+        own = tuple(f"export {k}=" for k in QWEN25_OWN)
+        qwen25, qwen3 = exports(QWEN25_FP8_C8), exports(QWEN_FP8_C8)
+        own_lines = {ln for ln in qwen25 if ln.startswith(own)}
+        assert len(own_lines) == len(QWEN25_OWN)
+        assert qwen25 - own_lines == {ln for ln in qwen3 if not ln.startswith(own)}
+
+    def test_runs_the_fp8_wrapper_like_the_tis_c8_arm(self):
+        def execs(script):
+            return [ln for ln in (SCRIPTS / script).read_text().splitlines() if ln.lstrip().startswith("exec ")]
+
+        assert execs(QWEN25_FP8_C8) == execs(QWEN_FP8_C8)
+        assert QWEN_FP8 in execs(QWEN25_FP8_C8)[0]
+
+    def test_knobs_still_apply(self):
+        c = compose(QWEN25_FP8_C8, MODEL_PATH="/models/qwen2.5-7b", test_freq="10", DYNAMIC_BSZ="False")
+        assert c["actor_rollout_ref"]["model"]["path"] == "/models/qwen2.5-7b"
+        assert c["trainer"]["test_freq"] == 10 and c["trainer"]["save_freq"] == 20
+        assert c["actor_rollout_ref"]["actor"]["use_dynamic_bsz"] is False
+        assert " Qwen2.5-7B 3-5 tp1dp5 " in c["trainer"]["experiment_name"]
+
+    def test_qwen3_arms_keep_their_name(self):
+        for script in (QWEN, QWEN_FP8, QWEN_FP8_C8):
+            assert " DAPO17K-AIME24 Qwen3-8B 5-3 tp1dp3 hdo B-33 " in compose(script)["trainer"]["experiment_name"]
+
+    def test_trainer_rollouter_and_worker_accept_the_config(self, monkeypatch):
+        from verl.experimental.fully_async_policy import fully_async_rollouter as mod
+        from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
+        from verl.utils.config import omega_conf_to_dataclass
+
+        cfg = _cfg(QWEN25_FP8_C8)
+        actor = omega_conf_to_dataclass(cfg.actor_rollout_ref.actor)
+        assert actor.loss_agg_mode == "token-mean" and actor.use_dynamic_bsz is True
+        cfg.trainer.logger = ["console"]
+        trainer_cls = FullyAsyncTrainer.__ray_metadata__.modified_class
+        t = trainer_cls(config=cfg, tokenizer=None, role_worker_mapping={}, resource_pool_manager=None)
+        assert t.replay_enable
+        assert t.replay_first_mini_size == 20  # 0.5 x 35 -> 18, raised to 20 (20 x 16 splits over dp=5)
+
+        rollouter_cls = mod.FullyAsyncRollouter.__ray_metadata__.modified_class
+        monkeypatch.setattr(mod, "create_rl_dataset", lambda *a, **k: [0] * 8)
+        monkeypatch.setattr(mod, "create_rl_sampler", lambda *a, **k: None)
+        monkeypatch.setattr(
+            rollouter_cls, "_create_dataloader", lambda self, *a, **k: setattr(self, "train_dataloader", [0] * 8)
+        )
+        monkeypatch.setattr(rollouter_cls, "_init_dump_executor", lambda self: None)
+        r = rollouter_cls(config=_cfg(QWEN25_FP8_C8), tokenizer=None)
+        assert r.concurrency_ramp == [5, 12, 20] and r.ramp_first_size == 20
+
+
 # --------------------------------------------------------------------------- H100 emulation defaults (fp8 wrappers)
 
-FP8_WRAPPERS = (QWEN_FP8, QWEN_FP8_C8)
+FP8_WRAPPERS = (QWEN_FP8, QWEN_FP8_C8, QWEN25_FP8_C8)
 
 
 @pytest.mark.parametrize("script", FP8_WRAPPERS)
@@ -598,7 +691,8 @@ class TestFp8Schedule:
     def test_defaults(self, script):
         c = compose(script)
         assert c["actor_rollout_ref"]["actor"]["optim"]["lr_warmup_steps"] == 12
-        assert (c["trainer"]["test_freq"], c["trainer"]["save_freq"]) == (12, 12)
+        freq = 20 if script == QWEN25_FP8_C8 else 12
+        assert (c["trainer"]["test_freq"], c["trainer"]["save_freq"]) == (freq, freq)
         assert c["data"]["seed"] == 1 and c["actor_rollout_ref"]["rollout"]["seed"] == 1
         assert " warmup-12 " in c["trainer"]["experiment_name"]
 
