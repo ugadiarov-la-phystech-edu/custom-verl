@@ -56,9 +56,30 @@ train_prompt_bsz=0
 gen_prompt_bsz=1
 train_prompt_mini_bsz=${train_prompt_mini_bsz:-33}
 micro_bsz_per_gpu=1
-use_dynamic_bsz=False
 log_prob_micro_bsz_per_gpu=1
 concurrent_samples_per_replica=${concurrent_samples_per_replica:-${train_prompt_mini_bsz}}
+
+DYNAMIC_BSZ=${DYNAMIC_BSZ:-False}
+DYNAMIC_BSZ_MAX_TOKENS=${DYNAMIC_BSZ_MAX_TOKENS:-$((max_prompt_length + max_response_length))}
+DYNAMIC_BSZ_LOG_PROB_MAX_TOKENS=${DYNAMIC_BSZ_LOG_PROB_MAX_TOKENS:-${DYNAMIC_BSZ_MAX_TOKENS}}
+dynbsz_args=()
+dynbsz_tag=""
+case "${DYNAMIC_BSZ}" in
+    True|true|1)
+        use_dynamic_bsz=True
+        for cap in "${DYNAMIC_BSZ_MAX_TOKENS}" "${DYNAMIC_BSZ_LOG_PROB_MAX_TOKENS}"; do
+            [[ "${cap}" =~ ^[1-9][0-9]*$ ]] || { echo "DYNAMIC_BSZ token caps must be positive integers, got '${cap}'" >&2; exit 2; }
+            (( cap >= max_prompt_length + max_response_length )) || { echo "DYNAMIC_BSZ token caps must be >= max_prompt_length + max_response_length = $((max_prompt_length + max_response_length)), got ${cap}" >&2; exit 2; }
+        done
+        dynbsz_args=(
+            actor_rollout_ref.actor.ppo_max_token_len_per_gpu="${DYNAMIC_BSZ_MAX_TOKENS}"
+            actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="${DYNAMIC_BSZ_LOG_PROB_MAX_TOKENS}"
+        )
+        dynbsz_tag=" dynbsz-${DYNAMIC_BSZ_MAX_TOKENS}"
+        ;;
+    False|false|0) use_dynamic_bsz=False ;;
+    *) echo "DYNAMIC_BSZ must be True or False, got '${DYNAMIC_BSZ}'" >&2; exit 2 ;;
+esac
 
 adv_estimator=grpo
 loss_agg_mode=${loss_agg_mode:-"seq-mean-token-mean"}
@@ -146,7 +167,7 @@ max_actor_ckpt_to_keep=null
 ckpt_save_contents="['hf_model']"
 resume_mode=disable
 
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${warmup_tag}${tis_tag}${quant_tag} seed-${SEED}"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${warmup_tag}${dynbsz_tag}${tis_tag}${quant_tag} seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
 log_dir=${log_dir:-"logs/${exp_name_safe}"}
 CKPTS_DIR=${CKPTS_DIR:-"${log_dir}"}
@@ -283,4 +304,4 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     async_training.replay_buffer.requires_mini_batches="${replay_requires_mini_batches}" \
     async_training.replay_buffer.sampling_seed="${replay_sampling_seed}" \
     async_training.replay_buffer.reuse_halflife="${replay_reuse_halflife}" \
-    async_training.replay_buffer.min_fresh_ratio="${replay_min_fresh_ratio}" "$@"
+    async_training.replay_buffer.min_fresh_ratio="${replay_min_fresh_ratio}" "${dynbsz_args[@]}" "$@"

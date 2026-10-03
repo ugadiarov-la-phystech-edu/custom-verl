@@ -11,6 +11,7 @@ set -euo pipefail
 export ROLLOUT_QUANT=${ROLLOUT_QUANT:-fp8}
 export rollout_is_threshold=${rollout_is_threshold:-8}
 export loss_agg_mode=${loss_agg_mode:-token-mean}
+export DYNAMIC_BSZ=${DYNAMIC_BSZ:-True}
 export VERL_GPU_MEM_CAP_GB=${VERL_GPU_MEM_CAP_GB-78}
 export gpu_memory_utilization=${gpu_memory_utilization:-0.5}
 export lr_warmup_steps=${lr_warmup_steps:-12}
