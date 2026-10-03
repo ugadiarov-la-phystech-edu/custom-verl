@@ -287,7 +287,7 @@ resume_mode=disable
 # ================= Logging =================
 exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 Qwen3-8B ${n_gpus_rollout}-${n_gpus_training} tp1dp3 hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${warmup_tag}${dynbsz_tag}${tis_tag}${quant_tag} seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
-# log_dir: TensorBoard and the rollout / validation dumps; CKPTS_DIR: global_step_N/ checkpoints.
+# log_dir: TensorBoard (per-update rollout dumps are off: trainer.rollout_data_dir=null); CKPTS_DIR: global_step_N/ checkpoints.
 log_dir=${log_dir:-"logs/${exp_name_safe}"}
 CKPTS_DIR=${CKPTS_DIR:-"${log_dir}"}
 mkdir -p -- "${log_dir}" "${CKPTS_DIR}"
@@ -400,7 +400,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     trainer.max_actor_ckpt_to_keep=${max_actor_ckpt_to_keep} \
     "actor_rollout_ref.actor.checkpoint.save_contents=${ckpt_save_contents}" \
     trainer.resume_mode=${resume_mode} \
-    trainer.rollout_data_dir="${log_dir}" \
+    trainer.rollout_data_dir=null \
     trainer.log_val_generations=${log_val_generations} \
     trainer.default_local_dir="${CKPTS_DIR}" \
     trainer.nnodes="${NNODES}" \
