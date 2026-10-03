@@ -720,7 +720,15 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
 
         With async_training.serialize_validation all generation is frozen for the duration (see
         _begin_hard_pause), so validation neither competes with nor overlaps training rollouts.
+
+        cumulative_validation_time (post-anchor only) shifts later samples' virtual arrival times. Serialized,
+        it accounts the whole frozen window (freeze, validation, unfreeze), as end_save_pause does for saves:
+        generation is held for all of it and the trainer excludes all of it. Not serialized, it accounts the
+        validation alone, which over-corrects: _validate() blocks this actor's event loop, but the agent-loop
+        workers are separate actors, so requests already in flight keep decoding on the servers meanwhile and
+        cumulative_training_time is then biased low.
         """
+        pause_start = time.time()
         if self.serialize_validation:
             await self._begin_hard_pause("validation")
         try:
@@ -728,12 +736,14 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             with marked_timer("rollouter/validate_time", timing_raw, color="green"):
                 # _validate drives the agent loop synchronously and blocks this actor's event loop
                 val_metrics: dict = self._validate()
-            if self.first_sample_time is not None:
-                # generation is held (event loop blocked, or serialized) for the whole validation
-                self.cumulative_validation_time += timing_raw["rollouter/validate_time"]
         finally:
             if self.serialize_validation:
                 await self._end_hard_pause("validation")
+        if self.first_sample_time is not None:
+            if self.serialize_validation:
+                self.cumulative_validation_time += time.time() - pause_start
+            else:
+                self.cumulative_validation_time += timing_raw["rollouter/validate_time"]
         return timing_raw | val_metrics
 
     async def begin_save_pause(self):

@@ -1193,7 +1193,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         """fully_async/timing/*: wall time since the rollouter's first training draw, the cumulative
         validation and checkpoint-save times, and cumulative_training_time, the wall clock an identical run
         with neither validation nor checkpointing would have needed (the virtual timeline). No-op until the
-        first training sample was drawn."""
+        first training sample was drawn. Exact (up to the re-prefill of requests aborted by the freeze) only with
+        async_training.serialize_validation; otherwise in-flight requests keep decoding during validation and
+        cumulative_training_time is biased low (see FullyAsyncRollouter.do_validate)."""
         first = rollouter_timing.get("first_sample_time")
         if first is None:
             return

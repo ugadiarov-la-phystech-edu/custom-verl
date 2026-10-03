@@ -55,6 +55,8 @@ async_training:
 
   # Stop-the-world validation: freeze all generation (no new samples, in-flight requests aborted and
   # held for a partial-rollout resume) while the rollouter validates. Requires partial_rollout.
+  # fully_async/timing/cumulative_training_time is exact only with this on; off, requests in flight keep
+  # decoding during validation and the metric is biased low.
   serialize_validation: False
 
   # Stop-the-world checkpoint saves: freeze generation for the whole trainer checkpoint save, as above.
