@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import asyncio
+import json
 import logging
 import math
 import os
@@ -1354,6 +1355,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             ray.get(self.rollouter.end_save_pause.remote())
 
     def _save_checkpoint_inner(self):
+        # Snapshot of the timing totals for timing_state.json, taken before anything is written so the
+        # save's own duration is excluded (as from cumulative_training_time).
+        save_start = time.time()
+        rollouter_timing = ray.get(self.rollouter.get_timing_state.remote())
         # Warning: Currently, to align the training process and metrics of colocate,
         # we use current_param_version instead of global step.
         # This can be logically aligned with the original self.global_steps of colocate
@@ -1409,12 +1414,44 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 max_ckpt_to_keep=max_critic_ckpt_to_keep,
             )
         ray.get(self.rollouter.save_checkpoint.remote(local_global_step_folder))
+        self._save_timing_state(local_global_step_folder, save_start, rollouter_timing)
         # latest checkpointed iteration tracker (for atomic usage)
         local_latest_checkpointed_iteration = os.path.join(
             self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt"
         )
         with open(local_latest_checkpointed_iteration, "w") as f:
             f.write(str(self.current_param_version))
+
+    def _save_timing_state(self, local_global_step_folder: str, save_start: float, rollouter_timing: dict) -> None:
+        """Write global_step_N/timing_state.json: the fully_async/timing/* totals at the start of this save
+        (same keys as the custom_vcpo source), so every checkpoint records the training time it took to reach.
+
+        cumulative_training_time is the virtual-timeline value (the wall clock a run with neither validation
+        nor checkpointing would have needed), matching the metric logged at this step. All totals are 0 before
+        the rollouter's first training draw. Informational only: a resume does not read it back, so a resumed
+        run restarts the timing metrics at zero."""
+        first = rollouter_timing.get("first_sample_time")
+        if first is not None:
+            virtual_now = self._virtual_now(save_start)
+            wall_time = save_start - first
+            validation_time = rollouter_timing["cumulative_validation_time"]
+            save_time = self.cumulative_save_time
+            training_time = virtual_now - first if virtual_now is not None else 0.0
+        else:
+            wall_time = validation_time = save_time = training_time = 0.0
+        fmt = "%Y-%m-%d %H:%M:%S"
+        timing_state = {
+            "wall_time_since_first_sample": wall_time,
+            "cumulative_validation_time": validation_time,
+            "cumulative_save_time": save_time,
+            "cumulative_training_time": training_time,
+            # human-readable anchors (local time)
+            "first_sample_datetime": datetime.fromtimestamp(first).strftime(fmt) if first is not None else None,
+            "checkpoint_saved_datetime": datetime.fromtimestamp(save_start).strftime(fmt),
+        }
+        os.makedirs(local_global_step_folder, exist_ok=True)
+        with open(os.path.join(local_global_step_folder, "timing_state.json"), "w") as f:
+            json.dump(timing_state, f, indent=2)
 
     async def load_checkpoint(self):
         if self.config.trainer.resume_mode == "disable":

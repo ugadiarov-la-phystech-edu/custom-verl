@@ -17,11 +17,15 @@ The trainer replays the pipeline schedule with validation- and save-caused delay
 starts at max(trainer free, batch virtual-ready time) -- a sample is virtually ready at its enqueue time
 minus the rollouter's validation and save pauses before it -- and advances by its busy time minus the
 validation wait and the checkpoint save. The rollouter anchors the clock at its first training draw and
-stamps every enqueued sample.
+stamps every enqueued sample. Every checkpoint records the totals in global_step_N/timing_state.json.
 """
 
 import asyncio
+import contextlib
+import json
+import os
 import time
+from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
@@ -341,3 +345,186 @@ class TestRollouterSide:
     def test_unstamped_sample_defaults(self):
         rs = RolloutSample(full_batch=None, sample_id="x", epoch=0, rollout_status={})
         assert (rs.enqueue_time, rs.validation_pause_before, rs.checkpoint_pause_before) == (None, 0.0, 0.0)
+
+
+# --------------------------------------------------------------------------- timing_state.json in checkpoints
+
+FMT = "%Y-%m-%d %H:%M:%S"
+TIMING_KEYS = {
+    "wall_time_since_first_sample",
+    "cumulative_validation_time",
+    "cumulative_save_time",
+    "cumulative_training_time",
+    "first_sample_datetime",
+    "checkpoint_saved_datetime",
+}
+
+
+def _rollouter_timing(first=100.0, validation=5.0, pause=0.0):
+    return {"first_sample_time": first, "cumulative_validation_time": validation, "cumulative_checkpoint_pause": pause}
+
+
+def _saved(t, folder, save_start, timing):
+    t._save_timing_state(str(folder), save_start, timing)
+    return json.loads((folder / "timing_state.json").read_text())
+
+
+class TestTimingStateFile:
+    def test_mid_step_save(self, tmp_path):
+        # the values of custom_vcpo's test_timing_state_checkpoint_roundtrip
+        t = _bare_trainer()
+        t.cumulative_save_time = 2.0
+        t._step_virtual_start, t._step_actual_start, t._step_wait_valid_time = 120.0, 130.0, 5.0
+        assert _saved(t, tmp_path, 150.0, _rollouter_timing()) == {
+            "wall_time_since_first_sample": 50.0,
+            "cumulative_validation_time": 5.0,
+            "cumulative_save_time": 2.0,
+            "cumulative_training_time": 35.0,  # 120 + (150 - 130) - 5 - 100
+            "first_sample_datetime": datetime.fromtimestamp(100.0).strftime(FMT),
+            "checkpoint_saved_datetime": datetime.fromtimestamp(150.0).strftime(FMT),
+        }
+
+    def test_save_between_steps_uses_where_the_last_step_ended(self, tmp_path):
+        t = _bare_trainer()
+        _step(t, 110, [_stamped(110)], close_at=150)
+        state = _saved(t, tmp_path, 400.0, _rollouter_timing())
+        assert state["cumulative_training_time"] == 50.0  # virtual_free_time 150 - first 100
+        assert state["wall_time_since_first_sample"] == 300.0
+
+    def test_equals_the_logged_metric_at_the_same_moment(self, tmp_path):
+        t = _bare_trainer()
+        t.cumulative_save_time = 7.0
+        _step(t, 110, [_stamped(110)], close_at=150, wait_valid=4)
+        t._open_virtual_step(160, [_stamped(158)])
+        timing = _rollouter_timing(first=100.0, validation=4.0, pause=6.0)
+        logged = {}
+        t._add_cumulative_time_metrics(logged, timing, now=170.0)
+        state = _saved(t, tmp_path, 170.0, timing)
+        for key in ("wall_time_since_first_sample", "cumulative_validation_time", "cumulative_save_time"):
+            assert state[key] == logged[f"fully_async/timing/{key}"], key
+        assert state["cumulative_training_time"] == logged["fully_async/timing/cumulative_training_time"]
+
+    def test_before_the_first_training_sample_everything_is_zero(self, tmp_path):
+        t = _bare_trainer()
+        t.cumulative_save_time = 3.0  # no anchor yet: not counted, as in the metrics
+        state = _saved(t, tmp_path, 50.0, _rollouter_timing(first=None, validation=0.0))
+        assert state == {
+            "wall_time_since_first_sample": 0.0,
+            "cumulative_validation_time": 0.0,
+            "cumulative_save_time": 0.0,
+            "cumulative_training_time": 0.0,
+            "first_sample_datetime": None,
+            "checkpoint_saved_datetime": datetime.fromtimestamp(50.0).strftime(FMT),
+        }
+
+    def test_anchored_but_no_step_opened_yet(self, tmp_path):
+        state = _saved(_bare_trainer(), tmp_path, 130.0, _rollouter_timing())
+        assert state["cumulative_training_time"] == 0.0 and state["wall_time_since_first_sample"] == 30.0
+
+    def test_creates_the_folder_and_overwrites(self, tmp_path):
+        t = _bare_trainer()
+        folder = tmp_path / "global_step_3"
+        _saved(t, folder, 120.0, _rollouter_timing())
+        assert _saved(t, folder, 140.0, _rollouter_timing())["wall_time_since_first_sample"] == 40.0
+        assert [p.name for p in folder.iterdir()] == ["timing_state.json"]
+
+
+def _checkpointing_trainer(tmp_path, monkeypatch, timing, actor_save_s=30.0, step=12):
+    """A bare trainer whose _save_checkpoint_inner runs for real on a fake clock: the actor save takes
+    actor_save_s seconds, the rollouter returns `timing`."""
+    from verl.experimental.fully_async_policy import fully_async_trainer as trainer_mod
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(trainer_mod.time, "time", lambda: clock["now"])
+    monkeypatch.setattr(trainer_mod.ray, "get", lambda x: x)
+
+    @contextlib.contextmanager
+    def fake_timer(name, timing_raw, **kwargs):  # marked_timer on the fake clock
+        start = clock["now"]
+        yield
+        timing_raw[name] = timing_raw.get(name, 0.0) + clock["now"] - start
+
+    monkeypatch.setattr(trainer_mod, "marked_timer", fake_timer)
+    calls = []
+
+    def actor_save(local_path, remote_path, version, max_ckpt_to_keep=None):
+        calls.append(("actor", version))
+        clock["now"] += actor_save_s
+
+    def rollouter_save(folder):
+        calls.append(("rollouter", folder))
+        os.makedirs(folder, exist_ok=True)
+
+    def get_timing_state():
+        calls.append(("timing", clock["now"]))
+        return dict(timing)
+
+    t = _bare_trainer()
+    t.current_param_version = step
+    t.use_critic = False
+    t.actor_rollout_wg = SimpleNamespace(save_checkpoint=actor_save)
+    t.rollouter = SimpleNamespace(
+        save_checkpoint=SimpleNamespace(remote=rollouter_save),
+        get_timing_state=SimpleNamespace(remote=get_timing_state),
+    )
+    t.config = OmegaConf.create(
+        {
+            "trainer": {"default_local_dir": str(tmp_path), "default_hdfs_dir": None, "max_actor_ckpt_to_keep": None},
+            "async_training": {"pause_generation_during_save": False},
+        }
+    )
+    return t, clock, calls
+
+
+class TestTimingStateInCheckpoints:
+    def test_written_next_to_the_checkpoint(self, tmp_path, monkeypatch):
+        t, _, calls = _checkpointing_trainer(tmp_path, monkeypatch, _rollouter_timing(first=900.0))
+        t._save_checkpoint_inner()
+        state = json.loads((tmp_path / "global_step_12" / "timing_state.json").read_text())
+        assert set(state) == TIMING_KEYS
+        assert (tmp_path / "latest_checkpointed_iteration.txt").read_text() == "12"
+        assert [c[0] for c in calls] == ["timing", "actor", "rollouter"]
+
+    def test_snapshot_excludes_the_saves_own_duration(self, tmp_path, monkeypatch):
+        t, clock, _ = _checkpointing_trainer(tmp_path, monkeypatch, _rollouter_timing(first=900.0), actor_save_s=30.0)
+        t._step_virtual_start, t._step_actual_start = 950.0, 960.0
+        t.cumulative_save_time = 4.0
+        t._save_checkpoint_inner()
+        assert clock["now"] == 1030.0  # the save took 30 s
+        state = json.loads((tmp_path / "global_step_12" / "timing_state.json").read_text())
+        assert state["wall_time_since_first_sample"] == 100.0  # 1000 - 900, at the start of the save
+        assert state["cumulative_training_time"] == 90.0  # 950 + (1000 - 960) - 900
+        assert state["cumulative_save_time"] == 4.0  # earlier saves only
+        assert state["checkpoint_saved_datetime"] == datetime.fromtimestamp(1000.0).strftime(FMT)
+
+    def test_each_checkpoint_counts_the_earlier_saves(self, tmp_path, monkeypatch):
+        t, clock, _ = _checkpointing_trainer(tmp_path, monkeypatch, _rollouter_timing(first=900.0), actor_save_s=30.0)
+        t.last_ckpt_version, t.max_steps_duration, t.timing_raw = 0, 0, {}
+        t.config.trainer.save_freq, t.config.trainer.esi_redundant_time = 12, 0
+        # step 12: data at 900, busy 100 s, then a 30 s save; the clock closes after the save (as in fit_step)
+        t._open_virtual_step(900.0, [_stamped(900.0)])
+        t._fit_save_checkpoint()
+        t._advance_virtual_clock()
+        assert t.virtual_free_time == 1000.0
+        # step 24: its batch arrived right after the stop-the-world save, i.e. 30 s late; busy 50 s
+        t.current_param_version = 24
+        t._step_save_time = 0.0
+        t._open_virtual_step(clock["now"], [_stamped(clock["now"], checkpoint_before=30.0)])
+        clock["now"] += 50.0
+        t._fit_save_checkpoint()
+        first = json.loads((tmp_path / "global_step_12" / "timing_state.json").read_text())
+        second = json.loads((tmp_path / "global_step_24" / "timing_state.json").read_text())
+        assert first["cumulative_save_time"] == 0.0 and second["cumulative_save_time"] == 30.0
+        assert first["cumulative_training_time"] == 100.0
+        # the first save's 30 s is not training time: the second step starts where the first one ended
+        assert second["cumulative_training_time"] == 150.0
+        assert second["wall_time_since_first_sample"] == 180.0
+
+    def test_stop_the_world_save_writes_it_too(self, tmp_path, monkeypatch):
+        t, _, calls = _checkpointing_trainer(tmp_path, monkeypatch, _rollouter_timing(first=900.0))
+        t.config.async_training.pause_generation_during_save = True
+        t.rollouter.begin_save_pause = SimpleNamespace(remote=lambda: calls.append(("begin",)))
+        t.rollouter.end_save_pause = SimpleNamespace(remote=lambda: calls.append(("end",)))
+        t._save_checkpoint()
+        assert [c[0] for c in calls] == ["begin", "timing", "actor", "rollouter", "end"]
+        assert (tmp_path / "global_step_12" / "timing_state.json").exists()
