@@ -76,6 +76,10 @@ SCRIPT_ENV_KNOBS = {
     "n_gpus_rollout",
     "train_prompt_mini_bsz",
     "concurrent_samples_per_replica",
+    "KV_CACHE_DTYPE",
+    "ATTN_BACKEND",
+    "VLLM_LOG_STATS",
+    "ROLLOUT_MAX_MODEL_LEN",
     *DEEPGEMM_VARS,
 }
 
@@ -813,6 +817,115 @@ class TestDynamicBatchSize:
     ],
 )
 def test_invalid_dynbsz_settings_are_rejected(script, env, message, tmp_path):
+    proc = _run(script, env, (), tmp_path)
+    assert proc.returncode == 2
+    assert message in proc.stderr
+
+
+# --------------------------------------------------------------------------- rollout engine knobs (vLLM)
+
+# The explicit defaults of the "Rollout engine knobs" block: setting them must compose to the plain arm.
+ENGINE_KNOB_DEFAULTS = {
+    "KV_CACHE_DTYPE": "auto",
+    "ATTN_BACKEND": "default",
+    "VLLM_LOG_STATS": "False",
+    "ROLLOUT_MAX_MODEL_LEN": "null",
+}
+KV_KEY = "actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype"
+ATTN_KEY = "actor_rollout_ref.rollout.engine_kwargs.vllm.attention_backend"
+ALL_ENGINE_KNOBS = {
+    "KV_CACHE_DTYPE": "fp8_e4m3",
+    "ATTN_BACKEND": "FLASHINFER",
+    "VLLM_LOG_STATS": "True",
+    "ROLLOUT_MAX_MODEL_LEN": "10240",
+}
+
+
+class TestRolloutEngineKnobs:
+    @pytest.mark.parametrize("script", [QWEN, QWEN_FP8, QWEN_FP8_C8, PANGU])
+    def test_defaults_leave_the_arm_untouched(self, script):
+        c = compose(script)
+        r = c["actor_rollout_ref"]["rollout"]
+        assert r["engine_kwargs"]["vllm"] == {}
+        assert r["disable_log_stats"] is True and r["max_model_len"] is None
+        name = c["trainer"]["experiment_name"]
+        assert " kv-" not in name and " attn-" not in name
+        assert compose(script, **ENGINE_KNOB_DEFAULTS) == c
+
+    @pytest.mark.parametrize("dtype", ["fp8", "fp8_e4m3", "fp8_e5m2"])
+    def test_fp8_kv_cache_reaches_the_engine_kwargs_and_the_name(self, dtype):
+        c = compose(QWEN_FP8_C8, KV_CACHE_DTYPE=dtype)
+        assert c["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"] == {"kv_cache_dtype": dtype}
+        assert c["trainer"]["experiment_name"].endswith(f" dynbsz-10240 tis-C8 rollout-fp8 kv-{dtype} seed-1")
+        # the KV dtype is the only change: FP8 weights, TIS C=8, token-mean and the H100 budget stay as they were
+        assert _differing(compose(QWEN_FP8_C8), c) == {KV_KEY}
+
+    def test_attention_backend_pin(self):
+        c = compose(QWEN, ATTN_BACKEND="FLASHINFER")
+        assert c["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"] == {"attention_backend": "FLASHINFER"}
+        assert c["trainer"]["experiment_name"].endswith(" 0.1-wd attn-flashinfer seed-1")
+        assert _differing(compose(QWEN), c) == {ATTN_KEY}
+
+    def test_kv_and_backend_tags_sit_between_quant_and_seed(self):
+        c = compose(QWEN_FP8, KV_CACHE_DTYPE="fp8", ATTN_BACKEND="FLASH_ATTN")
+        assert c["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"] == {
+            "kv_cache_dtype": "fp8",
+            "attention_backend": "FLASH_ATTN",
+        }
+        assert c["trainer"]["experiment_name"].endswith(" warmup-12 rollout-fp8 kv-fp8 attn-flash-attn seed-1")
+
+    def test_log_stats_is_metrics_only_and_untagged(self):
+        c = compose(QWEN, VLLM_LOG_STATS="True")
+        assert c["actor_rollout_ref"]["rollout"]["disable_log_stats"] is False
+        assert _differing(compose(QWEN), c) == {"actor_rollout_ref.rollout.disable_log_stats"}
+        assert c["trainer"]["experiment_name"] == compose(QWEN)["trainer"]["experiment_name"]
+
+    def test_max_model_len_is_untagged(self):
+        c = compose(QWEN, ROLLOUT_MAX_MODEL_LEN="10240")
+        assert c["actor_rollout_ref"]["rollout"]["max_model_len"] == 10240
+        assert _differing(compose(QWEN), c) == {"actor_rollout_ref.rollout.max_model_len"}
+        assert c["trainer"]["experiment_name"] == compose(QWEN)["trainer"]["experiment_name"]
+
+    def test_trainer_rollouter_and_worker_accept_all_knobs(self, monkeypatch):
+        from verl.experimental.fully_async_policy import fully_async_rollouter as mod
+        from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
+        from verl.utils.config import omega_conf_to_dataclass
+        from verl.workers.config import RolloutConfig
+
+        cfg = _cfg(QWEN_FP8_C8, **ALL_ENGINE_KNOBS)
+        rollout = omega_conf_to_dataclass(cfg.actor_rollout_ref.rollout, dataclass_type=RolloutConfig)
+        assert dict(rollout.engine_kwargs["vllm"]) == {"kv_cache_dtype": "fp8_e4m3", "attention_backend": "FLASHINFER"}
+        assert rollout.disable_log_stats is False and rollout.max_model_len == 10240
+        assert rollout.quantization == "fp8"
+        cfg.trainer.logger = ["console"]
+        trainer_cls = FullyAsyncTrainer.__ray_metadata__.modified_class
+        t = trainer_cls(config=cfg, tokenizer=None, role_worker_mapping={}, resource_pool_manager=None)
+        assert t.replay_enable
+
+        rollouter_cls = mod.FullyAsyncRollouter.__ray_metadata__.modified_class
+        monkeypatch.setattr(mod, "create_rl_dataset", lambda *a, **k: [0] * 8)
+        monkeypatch.setattr(mod, "create_rl_sampler", lambda *a, **k: None)
+        monkeypatch.setattr(
+            rollouter_cls, "_create_dataloader", lambda self, *a, **k: setattr(self, "train_dataloader", [0] * 8)
+        )
+        monkeypatch.setattr(rollouter_cls, "_init_dump_executor", lambda self: None)
+        r = rollouter_cls(config=_cfg(QWEN_FP8_C8, **ALL_ENGINE_KNOBS), tokenizer=None)
+        assert r.replay_mode and r.concurrency_ramp == [5, 12, 20]
+
+
+@pytest.mark.parametrize("script", [QWEN, QWEN_FP8_C8])
+@pytest.mark.parametrize(
+    "env, message",
+    [
+        ({"KV_CACHE_DTYPE": "int8"}, "KV_CACHE_DTYPE must be"),
+        ({"KV_CACHE_DTYPE": "FP8"}, "KV_CACHE_DTYPE must be"),
+        ({"ATTN_BACKEND": "flashinfer"}, "ATTN_BACKEND must be"),
+        ({"VLLM_LOG_STATS": "yes"}, "VLLM_LOG_STATS must be"),
+        ({"ROLLOUT_MAX_MODEL_LEN": "8192"}, "must be >= max_prompt_length"),
+        ({"ROLLOUT_MAX_MODEL_LEN": "abc"}, "positive integer"),
+    ],
+)
+def test_invalid_engine_knobs_are_rejected(script, env, message, tmp_path):
     proc = _run(script, env, (), tmp_path)
     assert proc.returncode == 2
     assert message in proc.stderr

@@ -297,6 +297,61 @@ if [[ "${rollout_quantization}" != "null" && "${rollout_is}" == "null" ]]; then
     echo "WARNING: ROLLOUT_QUANT=${ROLLOUT_QUANT} without TIS; quantized rollouts without TIS degraded sharply in FlashRL's runs" >&2
 fi
 
+# ================= Rollout engine knobs (vLLM) =================
+# Config-only levers for the FP8 rollout speed-up (notes/rollout_speedup_fp8_proposal.md). The defaults reproduce
+# today's runs exactly; the two knobs that change the rollout policy are tagged in exp_name.
+#   KV_CACHE_DTYPE=auto|fp8|fp8_e4m3|fp8_e5m2  vLLM KV-cache dtype (+actor_rollout_ref.rollout.engine_kwargs.vllm.
+#       kv_cache_dtype; auto = the model dtype, bf16). fp8 (= fp8_e4m3 on CUDA) halves the KV bytes per token
+#       (Qwen3-8B: 36 layers x 8 KV heads x 128 x 2 x 2 B = 144 KiB -> 72 KiB), i.e. ~2x the resident sequences
+#       inside the same gpu_memory_utilization budget - the lever the FP8-RL report measured at +38% rollout
+#       throughput on Qwen3-8B (papers/2601.18150v2.pdf). Needs FlashAttention 3, vLLM's default on Hopper and the
+#       only backend that accepts FP8 KV on SM90; with FA3 the queries are quantized too, so Q/K/V all enter
+#       attention in FP8. K/V scales stay at vLLM's default 1.0 (no calibration). It changes the rollout policy:
+#       keep TIS on and watch rollout_corr/kl and training/rollout_actor_probs_pearson_corr. Tagged " kv-<dtype>".
+#   ATTN_BACKEND=default|FLASH_ATTN|FLASHINFER|TRITON_ATTN  pins vLLM's attention backend (+engine_kwargs.vllm.
+#       attention_backend, vLLM enum names); default = vLLM's own choice (FLASH_ATTN with FA3 on Hopper). For A/B
+#       runs only. Tagged " attn-<name>".
+#   VLLM_LOG_STATS=False|True  True sets actor_rollout_ref.rollout.disable_log_stats=False: every vLLM replica then
+#       logs running/waiting requests, KV-cache usage and preemptions every 10 s - the only way to see preemption
+#       in verl 0.9.0's logs. Metrics only, untagged.
+#   ROLLOUT_MAX_MODEL_LEN=null|<int>  actor_rollout_ref.rollout.max_model_len. null lets verl take the model's
+#       max_position_embeddings (40,960 for Qwen3-8B), which only inflates vLLM's "maximum concurrency" estimate;
+#       10240 (= max_prompt_length + max_response_length) is the honest value. Must be >= that sum. Untagged (no
+#       effect on the objective).
+KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-auto}
+ATTN_BACKEND=${ATTN_BACKEND:-default}
+VLLM_LOG_STATS=${VLLM_LOG_STATS:-False}
+ROLLOUT_MAX_MODEL_LEN=${ROLLOUT_MAX_MODEL_LEN:-null}
+engine_args=()
+kv_tag=""
+case "${KV_CACHE_DTYPE}" in
+    auto) ;;
+    fp8|fp8_e4m3|fp8_e5m2)
+        engine_args+=(+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype="${KV_CACHE_DTYPE}")
+        kv_tag=" kv-${KV_CACHE_DTYPE}"
+        ;;
+    *) echo "KV_CACHE_DTYPE must be auto, fp8, fp8_e4m3 or fp8_e5m2, got '${KV_CACHE_DTYPE}'" >&2; exit 2 ;;
+esac
+attn_tag=""
+case "${ATTN_BACKEND}" in
+    default) ;;
+    FLASH_ATTN|FLASHINFER|TRITON_ATTN)
+        engine_args+=(+actor_rollout_ref.rollout.engine_kwargs.vllm.attention_backend="${ATTN_BACKEND}")
+        attn_tag=" attn-$(echo "${ATTN_BACKEND}" | tr 'A-Z_' 'a-z-')"
+        ;;
+    *) echo "ATTN_BACKEND must be default, FLASH_ATTN, FLASHINFER or TRITON_ATTN, got '${ATTN_BACKEND}'" >&2; exit 2 ;;
+esac
+case "${VLLM_LOG_STATS}" in
+    True|true|1) engine_args+=(actor_rollout_ref.rollout.disable_log_stats=False) ;;
+    False|false|0) ;;
+    *) echo "VLLM_LOG_STATS must be True or False, got '${VLLM_LOG_STATS}'" >&2; exit 2 ;;
+esac
+if [[ "${ROLLOUT_MAX_MODEL_LEN}" != "null" ]]; then
+    [[ "${ROLLOUT_MAX_MODEL_LEN}" =~ ^[1-9][0-9]*$ ]] || { echo "ROLLOUT_MAX_MODEL_LEN must be a positive integer or null, got '${ROLLOUT_MAX_MODEL_LEN}'" >&2; exit 2; }
+    (( ROLLOUT_MAX_MODEL_LEN >= max_prompt_length + max_response_length )) || { echo "ROLLOUT_MAX_MODEL_LEN must be >= max_prompt_length + max_response_length = $((max_prompt_length + max_response_length)), got ${ROLLOUT_MAX_MODEL_LEN}" >&2; exit 2; }
+    engine_args+=(actor_rollout_ref.rollout.max_model_len="${ROLLOUT_MAX_MODEL_LEN}")
+fi
+
 # ================= Dynamic batch size (toggle) =================
 # DYNAMIC_BSZ=False (default) keeps one sequence per forward/backward pass (micro-batch 1), whose memory
 # envelope the MEMORY block measured. DYNAMIC_BSZ=True packs each rank's share of a mini-batch into
@@ -372,7 +427,7 @@ NNODES=${NNODES:-1}
 n_gpus_per_node=${n_gpus_per_node:-8}
 
 # ================= Logging =================
-exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} mini-${train_prompt_mini_bsz} ppo-epochs-${ppo_epochs} DAPO17K-AIME24-25 ${model_tag} tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${clip_tag}${warmup_tag}${dynbsz_tag}${tis_tag}${quant_tag} seed-${SEED}${emu_tag}"}
+exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} mini-${train_prompt_mini_bsz} ppo-epochs-${ppo_epochs} DAPO17K-AIME24-25 ${model_tag} tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${clip_tag}${warmup_tag}${dynbsz_tag}${tis_tag}${quant_tag}${kv_tag}${attn_tag} seed-${SEED}${emu_tag}"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -474,4 +529,4 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes="${NNODES}" \
     trainer.n_gpus_per_node="${n_gpus_per_node}" \
     trainer.total_training_steps=${total_training_steps} \
-    trainer.total_epochs=${total_epochs} "${dynbsz_args[@]}" "$@"
+    trainer.total_epochs=${total_epochs} "${engine_args[@]}" "${dynbsz_args[@]}" "$@"

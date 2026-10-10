@@ -63,6 +63,10 @@ SCRIPT_ENV_KNOBS = {
     "model_tag",
     "train_prompt_bsz",
     "train_prompt_mini_bsz",
+    "KV_CACHE_DTYPE",
+    "ATTN_BACKEND",
+    "VLLM_LOG_STATS",
+    "ROLLOUT_MAX_MODEL_LEN",
 }
 
 
@@ -726,6 +730,118 @@ def test_tis_default_warmup_needs_more_than_three_rollout_steps(tmp_path):
     rc, _, err = _run(QWEN_TIS, env={"max_updates": "12"}, tmp=tmp_path)  # 3 rollout steps = 3 warmup steps
     assert rc == 2, err[-2000:]
     assert "lr_warmup_steps=3 must be < the 3 rollout steps" in err
+
+
+# --------------------------------------------------------------------------- rollout engine knobs (vLLM)
+
+# The explicit defaults of the "Rollout engine knobs" block: setting them must compose to the plain recipe.
+ENGINE_KNOB_DEFAULTS = {
+    "KV_CACHE_DTYPE": "auto",
+    "ATTN_BACKEND": "default",
+    "VLLM_LOG_STATS": "False",
+    "ROLLOUT_MAX_MODEL_LEN": "null",
+}
+KV_KEY = "actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype"
+ATTN_KEY = "actor_rollout_ref.rollout.engine_kwargs.vllm.attention_backend"
+
+
+class TestRolloutEngineKnobs:
+    @pytest.mark.parametrize("script", [QWEN, QWEN_TIS])
+    def test_defaults_leave_the_recipe_untouched(self, script):
+        c = compose(script)
+        r = c["actor_rollout_ref"]["rollout"]
+        assert r["engine_kwargs"]["vllm"] == {}
+        assert r["disable_log_stats"] is True and r["max_model_len"] is None
+        name = c["trainer"]["experiment_name"]
+        assert " kv-" not in name and " attn-" not in name
+        assert _diff(c, compose(script, **ENGINE_KNOB_DEFAULTS)) == set()
+
+    @pytest.mark.parametrize("dtype", ["fp8", "fp8_e4m3", "fp8_e5m2"])
+    def test_fp8_kv_cache_reaches_the_engine_kwargs_and_the_name(self, dtype):
+        c = compose(QWEN_TIS, ROLLOUT_QUANT="fp8", KV_CACHE_DTYPE=dtype)
+        assert c["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"] == {"kv_cache_dtype": dtype}
+        assert c["trainer"]["experiment_name"].endswith(f" tis-C8 rollout-fp8 kv-{dtype} seed-1 h100-emu-76gb-gmu0.283")
+        # the KV dtype is the only change: the weight quantization, TIS and memory budget stay as they were
+        assert _diff(compose(QWEN_TIS, ROLLOUT_QUANT="fp8"), c) == {KV_KEY} | NAME_DERIVED_KEYS
+
+    def test_fp8_kv_cache_without_fp8_weights_is_allowed(self):
+        c = compose(QWEN, KV_CACHE_DTYPE="fp8")
+        assert c["actor_rollout_ref"]["rollout"]["quantization"] is None
+        assert c["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"] == {"kv_cache_dtype": "fp8"}
+        assert c["trainer"]["experiment_name"].endswith(" 0.01-wd kv-fp8 seed-1")
+
+    def test_attention_backend_pin(self):
+        c = compose(QWEN_TIS, ATTN_BACKEND="FLASHINFER")
+        assert c["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"] == {"attention_backend": "FLASHINFER"}
+        assert " attn-flashinfer seed-1 " in c["trainer"]["experiment_name"]
+        assert _diff(compose(QWEN_TIS), c) == {ATTN_KEY} | NAME_DERIVED_KEYS
+
+    def test_kv_and_backend_tags_sit_between_quant_and_seed(self):
+        c = compose(QWEN_TIS, ROLLOUT_QUANT="fp8", KV_CACHE_DTYPE="fp8", ATTN_BACKEND="FLASH_ATTN")
+        assert c["actor_rollout_ref"]["rollout"]["engine_kwargs"]["vllm"] == {
+            "kv_cache_dtype": "fp8",
+            "attention_backend": "FLASH_ATTN",
+        }
+        assert c["trainer"]["experiment_name"].endswith(
+            " tis-C8 rollout-fp8 kv-fp8 attn-flash-attn seed-1 h100-emu-76gb-gmu0.283"
+        )
+
+    def test_log_stats_is_metrics_only_and_untagged(self):
+        c = compose(QWEN, VLLM_LOG_STATS="True")
+        assert c["actor_rollout_ref"]["rollout"]["disable_log_stats"] is False
+        assert _diff(compose(QWEN), c) == {"actor_rollout_ref.rollout.disable_log_stats"}
+
+    def test_max_model_len_is_untagged(self):
+        c = compose(QWEN, ROLLOUT_MAX_MODEL_LEN="10240")
+        assert c["actor_rollout_ref"]["rollout"]["max_model_len"] == 10240
+        assert _diff(compose(QWEN), c) == {"actor_rollout_ref.rollout.max_model_len"}
+
+    def test_all_knobs_pass_verl_config_validation(self):
+        from omegaconf import OmegaConf
+
+        from verl.trainer.ppo.utils import need_critic, need_reference_policy
+        from verl.utils.config import omega_conf_to_dataclass, validate_config
+        from verl.workers.config import RolloutConfig
+
+        c = compose(
+            QWEN_TIS,
+            ROLLOUT_QUANT="fp8",
+            KV_CACHE_DTYPE="fp8_e4m3",
+            ATTN_BACKEND="FLASHINFER",
+            VLLM_LOG_STATS="True",
+            ROLLOUT_MAX_MODEL_LEN="10240",
+        )
+        cfg = OmegaConf.create(c)
+        validate_config(config=cfg, use_reference_policy=need_reference_policy(cfg), use_critic=need_critic(cfg))
+        rollout = omega_conf_to_dataclass(cfg.actor_rollout_ref.rollout, dataclass_type=RolloutConfig)
+        assert dict(rollout.engine_kwargs["vllm"]) == {"kv_cache_dtype": "fp8_e4m3", "attention_backend": "FLASHINFER"}
+        assert rollout.disable_log_stats is False and rollout.max_model_len == 10240
+        assert rollout.quantization == "fp8"
+
+    def test_knobs_do_not_leak_into_other_arms(self):
+        for script in (PANGU, ORZ):
+            r = compose(script)["actor_rollout_ref"]["rollout"]
+            assert r["engine_kwargs"]["vllm"] == {} and r["disable_log_stats"] is True
+
+
+@pytest.mark.parametrize("script", [QWEN, QWEN_TIS])
+@pytest.mark.parametrize(
+    "env, message",
+    [
+        ({"KV_CACHE_DTYPE": "int8"}, "KV_CACHE_DTYPE must be"),
+        ({"KV_CACHE_DTYPE": "FP8"}, "KV_CACHE_DTYPE must be"),
+        ({"ATTN_BACKEND": "flashinfer"}, "ATTN_BACKEND must be"),
+        ({"ATTN_BACKEND": "FA3"}, "ATTN_BACKEND must be"),
+        ({"VLLM_LOG_STATS": "yes"}, "VLLM_LOG_STATS must be"),
+        ({"ROLLOUT_MAX_MODEL_LEN": "8192"}, "must be >= max_prompt_length"),
+        ({"ROLLOUT_MAX_MODEL_LEN": "abc"}, "positive integer"),
+        ({"ROLLOUT_MAX_MODEL_LEN": "0"}, "positive integer"),
+    ],
+)
+def test_invalid_engine_knobs_fail_fast(script, env, message, tmp_path):
+    rc, _, err = _run(script, env=env, tmp=tmp_path)
+    assert rc == 2, err[-2000:]
+    assert message in err
 
 
 # --------------------------------------------------------------------------- DeepGEMM env (TIS script)

@@ -227,6 +227,62 @@ case "${ROLLOUT_QUANT}" in
     *) echo "ROLLOUT_QUANT must be bf16 or fp8, got '${ROLLOUT_QUANT}'" >&2; exit 2 ;;
 esac
 
+# ================= Rollout engine knobs (vLLM) =================
+# Config-only levers for the FP8 rollout speed-up (notes/rollout_speedup_fp8_proposal.md). The defaults reproduce
+# today's runs exactly; the two knobs that change the rollout policy are tagged in exp_name.
+#   KV_CACHE_DTYPE=auto|fp8|fp8_e4m3|fp8_e5m2  vLLM KV-cache dtype (+actor_rollout_ref.rollout.engine_kwargs.vllm.
+#       kv_cache_dtype; auto = the model dtype, bf16). fp8 (= fp8_e4m3 on CUDA) halves the KV bytes per token
+#       (Qwen3-8B: 144 KiB -> 72 KiB), i.e. ~2x the resident sequences per replica inside the same
+#       gpu_memory_utilization budget - the lever the FP8-RL report measured at +38% rollout throughput on Qwen3-8B
+#       (papers/2601.18150v2.pdf). Needs FlashAttention 3 (vLLM's default on Hopper, the only backend accepting
+#       FP8 KV on SM90); with FA3 the queries are quantized too. K/V scales stay at vLLM's default 1.0. It changes
+#       the rollout policy: the token TIS and the ESS brake absorb it, watch rollout_corr/kl, staleness/ess and
+#       training/rollout_actor_probs_pearson_corr. Tagged " kv-<dtype>". NOTE: the trainer consumes 33 groups per
+#       update whatever the rollouters deliver, so a faster rollouter shows up as a higher replay/minibatch_new_ratio
+#       and lower staleness, not as shorter wall-clock, until the GPU split or the mini-batch changes.
+#   ATTN_BACKEND=default|FLASH_ATTN|FLASHINFER|TRITON_ATTN  pins vLLM's attention backend (+engine_kwargs.vllm.
+#       attention_backend, vLLM enum names); default = vLLM's own choice (FLASH_ATTN with FA3 on Hopper). For A/B
+#       runs only. Tagged " attn-<name>".
+#   VLLM_LOG_STATS=False|True  True sets actor_rollout_ref.rollout.disable_log_stats=False: every vLLM replica then
+#       logs running/waiting requests, KV-cache usage and preemptions every 10 s - the only way to see preemption
+#       in verl 0.9.0's logs. Metrics only, untagged.
+#   ROLLOUT_MAX_MODEL_LEN=null|<int>  actor_rollout_ref.rollout.max_model_len. null lets verl take the model's
+#       max_position_embeddings (40,960 for Qwen3-8B), which only inflates vLLM's "maximum concurrency" estimate;
+#       10240 (= max_prompt_length + max_response_length) is the honest value. Must be >= that sum. Untagged.
+KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-auto}
+ATTN_BACKEND=${ATTN_BACKEND:-default}
+VLLM_LOG_STATS=${VLLM_LOG_STATS:-False}
+ROLLOUT_MAX_MODEL_LEN=${ROLLOUT_MAX_MODEL_LEN:-null}
+engine_args=()
+kv_tag=""
+case "${KV_CACHE_DTYPE}" in
+    auto) ;;
+    fp8|fp8_e4m3|fp8_e5m2)
+        engine_args+=(+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype="${KV_CACHE_DTYPE}")
+        kv_tag=" kv-${KV_CACHE_DTYPE}"
+        ;;
+    *) echo "KV_CACHE_DTYPE must be auto, fp8, fp8_e4m3 or fp8_e5m2, got '${KV_CACHE_DTYPE}'" >&2; exit 2 ;;
+esac
+attn_tag=""
+case "${ATTN_BACKEND}" in
+    default) ;;
+    FLASH_ATTN|FLASHINFER|TRITON_ATTN)
+        engine_args+=(+actor_rollout_ref.rollout.engine_kwargs.vllm.attention_backend="${ATTN_BACKEND}")
+        attn_tag=" attn-$(echo "${ATTN_BACKEND}" | tr 'A-Z_' 'a-z-')"
+        ;;
+    *) echo "ATTN_BACKEND must be default, FLASH_ATTN, FLASHINFER or TRITON_ATTN, got '${ATTN_BACKEND}'" >&2; exit 2 ;;
+esac
+case "${VLLM_LOG_STATS}" in
+    True|true|1) engine_args+=(actor_rollout_ref.rollout.disable_log_stats=False) ;;
+    False|false|0) ;;
+    *) echo "VLLM_LOG_STATS must be True or False, got '${VLLM_LOG_STATS}'" >&2; exit 2 ;;
+esac
+if [[ "${ROLLOUT_MAX_MODEL_LEN}" != "null" ]]; then
+    [[ "${ROLLOUT_MAX_MODEL_LEN}" =~ ^[1-9][0-9]*$ ]] || { echo "ROLLOUT_MAX_MODEL_LEN must be a positive integer or null, got '${ROLLOUT_MAX_MODEL_LEN}'" >&2; exit 2; }
+    (( ROLLOUT_MAX_MODEL_LEN >= max_prompt_length + max_response_length )) || { echo "ROLLOUT_MAX_MODEL_LEN must be >= max_prompt_length + max_response_length = $((max_prompt_length + max_response_length)), got ${ROLLOUT_MAX_MODEL_LEN}" >&2; exit 2; }
+    engine_args+=(actor_rollout_ref.rollout.max_model_len="${ROLLOUT_MAX_MODEL_LEN}")
+fi
+
 # ================= Async Training =================
 # Generation quota aligned with the eviction horizon: groups older than k updates are evicted anyway.
 staleness_threshold=${staleness_threshold:-32.0}
@@ -288,7 +344,7 @@ ckpt_save_contents="['hf_model']"
 resume_mode=disable
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 ${model_tag} ${n_gpus_rollout}-${n_gpus_training} tp${train_tp}dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${warmup_tag}${dynbsz_tag}${tis_tag}${quant_tag} seed-${SEED}"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 ${model_tag} ${n_gpus_rollout}-${n_gpus_training} tp${train_tp}dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${warmup_tag}${dynbsz_tag}${tis_tag}${quant_tag}${kv_tag}${attn_tag} seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
 # log_dir: TensorBoard (per-update rollout dumps are off: trainer.rollout_data_dir=null); CKPTS_DIR: global_step_N/ checkpoints.
 log_dir=${log_dir:-"logs/${exp_name_safe}"}
@@ -427,4 +483,4 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     async_training.replay_buffer.requires_mini_batches="${replay_requires_mini_batches}" \
     async_training.replay_buffer.sampling_seed="${replay_sampling_seed}" \
     async_training.replay_buffer.reuse_halflife="${replay_reuse_halflife}" \
-    async_training.replay_buffer.min_fresh_ratio="${replay_min_fresh_ratio}" "${dynbsz_args[@]}" "$@"
+    async_training.replay_buffer.min_fresh_ratio="${replay_min_fresh_ratio}" "${engine_args[@]}" "${dynbsz_args[@]}" "$@"
