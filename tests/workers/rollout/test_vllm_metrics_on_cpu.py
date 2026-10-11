@@ -14,6 +14,8 @@
 """CPU tests for the online vLLM metrics monitor (verl/workers/rollout/vllm_metrics.py) and its sync-trainer wiring.
 
 The replay rollouter's wiring is tested in tests/experimental/fully_async_policy/test_rollouter_replay_on_cpu.py.
+The v1 trainer's wiring (trainer.use_v1=true, which the sync baselines use) is tested in
+tests/trainer/ppo/v1/test_vllm_metrics_wiring_on_cpu.py; TestSyncTrainerWiring below covers the v0 RayPPOTrainer.
 """
 
 import importlib.util

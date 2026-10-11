@@ -89,6 +89,7 @@ from verl.utils.tracking import DapoFilteredRewardTableLogger, Tracking, Validat
 from verl.workers.config import CriticConfig, DistillationConfig, HFModelConfig
 from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker, TrainingWorkerConfig
 from verl.workers.rollout.llm_server import LLMServerClient, LLMServerManager
+from verl.workers.rollout.vllm_metrics import maybe_create_vllm_metrics_monitor
 from verl.workers.utils.losses import value_loss
 from verl.workers.utils.padding import response_from_nested, response_to_nested
 
@@ -122,6 +123,10 @@ class PPOTrainer(ABC):
     Args:
         config: DictConfig from yaml config file.
     """
+
+    # vLLM engine metrics (vllm/*) for TensorBoard; set in _setup when rollout.disable_log_stats=False
+    # (see verl/workers/rollout/vllm_metrics.py).
+    vllm_metrics_monitor = None
 
     def __init__(self, config: DictConfig):
         self.config = config
@@ -352,6 +357,13 @@ class PPOTrainer(ABC):
         self.llm_server_manager: LLMServerManager = LLMServerManager.create(
             config=self.config, worker_group=self.actor_rollout_wg, rollout_resource_pool=actor_rollout_resource_pool
         )
+        # sync: polls only while a training batch is generating (the colocated replicas sleep in between);
+        # async modes: generation spans step boundaries, so it polls continuously. Validation is excluded in both.
+        self.vllm_metrics_monitor = maybe_create_vllm_metrics_monitor(
+            self.config.actor_rollout_ref.rollout,
+            self._vllm_metrics_addresses,
+            active=self.trainer_mode != "sync",
+        )
 
         # 10. initialize checkpoint engine manager
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
@@ -413,14 +425,13 @@ class PPOTrainer(ABC):
 
         # perform validation before training
         if self.config.trainer.get("val_before_train", True):
-            self.on_validate_begin()
-            val_metrics = self._validate()
-            self.on_validate_end()
+            val_metrics = self._run_validation()
             assert val_metrics, f"{val_metrics=}"
             pprint(f"Initial validation metrics: {val_metrics}")
             self.logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 self._shutdown_dump_executor()
+                self._stop_vllm_metrics_monitor()
                 return
 
         # Running totals behind the fully_async/timing/* metrics (see compute_cumulative_timing_metrics).
@@ -472,9 +483,7 @@ class PPOTrainer(ABC):
                 is_last_step or self.global_steps % self.config.trainer.test_freq == 0
             ):
                 with marked_timer("testing", self.timing_raw, color="green"):
-                    self.on_validate_begin()
-                    val_metrics: dict = self._validate()
-                    self.on_validate_end()
+                    val_metrics: dict = self._run_validation()
                     if is_last_step:
                         last_val_metrics = val_metrics
                 metrics.update(val_metrics)
@@ -492,6 +501,8 @@ class PPOTrainer(ABC):
             tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
 
             dapo_filtered_reward_counts = metrics.pop(DAPO_FILTERED_REWARD_COUNTS_KEY, None)
+            if self.vllm_metrics_monitor is not None:
+                metrics.update(self.vllm_metrics_monitor.collect())
             self.logger.log(data=metrics, step=self.global_steps)
             if dapo_filtered_reward_counts:
                 self.dapo_filtered_reward_logger.log(
@@ -503,6 +514,7 @@ class PPOTrainer(ABC):
             current_epoch = (self.global_steps - 1) // self.steps_per_epoch
             if is_last_step:
                 self._shutdown_dump_executor()
+                self._stop_vllm_metrics_monitor()
                 pprint(f"Final validation metrics: {last_val_metrics}")
                 progress_bar.close()
                 return
@@ -510,6 +522,7 @@ class PPOTrainer(ABC):
         self.on_train_end()
         # Ensure dump executor is shut down when training loop ends without reaching is_last_step
         self._shutdown_dump_executor()
+        self._stop_vllm_metrics_monitor()
 
     def step(self, metrics: dict, timing_raw: dict) -> KVBatchMeta:
         train_batch_size = self.config.data.train_batch_size
@@ -519,6 +532,7 @@ class PPOTrainer(ABC):
         )
         sample_batch_size = train_batch_size // self.parameter_sync_step
 
+        self._open_vllm_metrics_window()
         self._add_batch_to_generate()
 
         metrics_aggregator = MetricsAggregator()
@@ -543,11 +557,14 @@ class PPOTrainer(ABC):
         # 1. sample batch from replay buffer
         with marked_timer("gen", timing_raw, color="red"):
             self.on_sample_begin()
-            batch, off_policy_metrics = self.replay_buffer.sample(
-                global_steps=self.global_steps,
-                partition_id="train",
-                batch_size=sample_batch_size,
-            )
+            try:
+                batch, off_policy_metrics = self.replay_buffer.sample(
+                    global_steps=self.global_steps,
+                    partition_id="train",
+                    batch_size=sample_batch_size,
+                )
+            finally:
+                self._close_vllm_metrics_window()
             metrics.update(off_policy_metrics)
             batch.extra_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
             self.on_sample_end()
@@ -589,6 +606,44 @@ class PPOTrainer(ABC):
                 batch = self._update_actor(batch, metrics=metrics)
 
         return batch
+
+    # ------------------------------ vLLM metrics ------------------------------
+
+    def _vllm_metrics_addresses(self) -> list[str]:
+        """All rollout servers, including the standalone replicas of separate_async."""
+        addresses = list(self.llm_server_manager.server_addresses)
+        standalone = getattr(self, "standalone_server_manager", None)
+        if standalone is not None:
+            addresses.extend(standalone.server_addresses)
+        return addresses
+
+    def _open_vllm_metrics_window(self):
+        """sync: start polling when a training batch is dispatched."""
+        if self.vllm_metrics_monitor is not None and self.trainer_mode == "sync":
+            self.vllm_metrics_monitor.resume()
+
+    def _close_vllm_metrics_window(self):
+        """sync: stop polling once the step's batch is collected (before on_sample_end sleeps the replicas)."""
+        if self.vllm_metrics_monitor is not None and self.trainer_mode == "sync":
+            self.vllm_metrics_monitor.pause()
+
+    def _run_validation(self) -> dict:
+        """Validation with the vLLM metrics monitor held, so validation requests stay out of vllm/*."""
+        self.on_validate_begin()
+        if self.vllm_metrics_monitor is not None:
+            self.vllm_metrics_monitor.pause("validation")
+        try:
+            val_metrics = self._validate()
+        finally:
+            if self.vllm_metrics_monitor is not None:
+                self.vllm_metrics_monitor.resume("validation")
+        self.on_validate_end()
+        return val_metrics
+
+    def _stop_vllm_metrics_monitor(self):
+        if self.vllm_metrics_monitor is not None:
+            self.vllm_metrics_monitor.stop()
+            self.vllm_metrics_monitor = None
 
     # ------------------------------ abstract methods ------------------------------
 
