@@ -72,6 +72,7 @@ from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.rollout.llm_server import LLMServerManager
+from verl.workers.rollout.vllm_metrics import maybe_create_vllm_metrics_monitor
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 
@@ -290,6 +291,10 @@ class RayPPOTrainer:
     managing actor rollouts, critic training, and reward computation with Ray backend.
     Supports various model architectures including FSDP, Megatron, vLLM, and SGLang integration.
     """
+
+    # Polls the vLLM servers' /metrics into vllm/* step metrics; set in init_workers when
+    # rollout.disable_log_stats=False (see verl/workers/rollout/vllm_metrics.py).
+    vllm_metrics_monitor = None
 
     # TODO: support each role have individual ray_worker_group_cls,
     # i.e., support different backend of different role
@@ -951,6 +956,11 @@ class RayPPOTrainer:
         self.llm_server_manager = LLMServerManager.create(
             config=self.config, worker_group=self.actor_rollout_wg, rollout_resource_pool=actor_rollout_resource_pool
         )
+        # Paused outside training generation (_generate_sequences_with_vllm_metrics), so validation and the
+        # trainer phases, when the colocated servers sleep, do not enter the vllm/* step metrics.
+        self.vllm_metrics_monitor = maybe_create_vllm_metrics_monitor(
+            self.config.actor_rollout_ref.rollout, lambda: list(self.llm_server_manager.server_addresses), active=False
+        )
 
         # if enable_agent_reward_loop, we directly pass reward_loop_workers to agent loop manager
         # to stream reward computation with actor rollout
@@ -1386,6 +1396,21 @@ class RayPPOTrainer:
         critic_output = DataProto.from_single_dict(data={}, meta_info={"metrics": output})
         return critic_output
 
+    def _generate_sequences_with_vllm_metrics(self, gen_batch: DataProto) -> DataProto:
+        """Training-rollout generation; the vLLM metrics monitor polls only for its duration."""
+        if self.vllm_metrics_monitor is None:
+            return self.async_rollout_manager.generate_sequences(gen_batch)
+        self.vllm_metrics_monitor.resume()
+        try:
+            return self.async_rollout_manager.generate_sequences(gen_batch)
+        finally:
+            self.vllm_metrics_monitor.pause()
+
+    def _stop_vllm_metrics_monitor(self):
+        if self.vllm_metrics_monitor is not None:
+            self.vllm_metrics_monitor.stop()
+            self.vllm_metrics_monitor = None
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1426,6 +1451,7 @@ class RayPPOTrainer:
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
                 self._shutdown_dump_executor()
+                self._stop_vllm_metrics_monitor()
                 return
 
         # add tqdm
@@ -1494,7 +1520,7 @@ class RayPPOTrainer:
                     with marked_timer("gen", timing_raw, color="red"):
                         if curr_step_profile:
                             self.llm_server_manager.start_profile()
-                        combined_gen_output = self.async_rollout_manager.generate_sequences(combined_gen_batch)
+                        combined_gen_output = self._generate_sequences_with_vllm_metrics(combined_gen_batch)
                         self.checkpoint_manager.sleep_replicas()
                         if curr_step_profile:
                             self.llm_server_manager.stop_profile()
@@ -1771,6 +1797,9 @@ class RayPPOTrainer:
                     )
                 )
 
+                if self.vllm_metrics_monitor is not None:
+                    metrics.update(self.vllm_metrics_monitor.collect())
+
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
 
@@ -1782,6 +1811,7 @@ class RayPPOTrainer:
                     if hasattr(self.actor_rollout_wg, "async_calls_finalize_fn_exec"):
                         self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=True)
                     self._shutdown_dump_executor()
+                    self._stop_vllm_metrics_monitor()
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
                     return
@@ -1794,3 +1824,4 @@ class RayPPOTrainer:
 
         # Ensure dump executor is shut down when training loop ends without reaching is_last_step
         self._shutdown_dump_executor()
+        self._stop_vllm_metrics_monitor()

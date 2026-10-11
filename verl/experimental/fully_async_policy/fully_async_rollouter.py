@@ -52,6 +52,7 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.llm_server import FullyAsyncLLMServerClient, LLMServerClient, LLMServerManager
 from verl.workers.rollout.replica import RolloutReplica
 from verl.workers.rollout.utils import update_prometheus_config
+from verl.workers.rollout.vllm_metrics import maybe_create_vllm_metrics_monitor
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -339,6 +340,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
     and putting them into MessageQueue
     Based on the mature implementation improvements of OneStepOffRayTrainer
     """
+
+    # Polls the vLLM servers' /metrics into vllm/* metrics, reported per parameter version by reset_staleness();
+    # set in _init_async_rollout_manager when rollout.disable_log_stats=False (verl/workers/rollout/vllm_metrics.py).
+    vllm_metrics_monitor = None
 
     def __init__(
         self,
@@ -691,6 +696,8 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             self._step_generated_samples = 0
 
             timing_raw["dynamic_resource/rollout_resource_utilization"] = self._compute_rollout_resource_utilization()
+            if self.vllm_metrics_monitor is not None:
+                timing_raw.update(self.vllm_metrics_monitor.collect())
             if self.replay_mode:
                 timing_raw.update(self._pop_group_outcome_metrics())
 
@@ -729,6 +736,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         cumulative_training_time is then biased low.
         """
         pause_start = time.time()
+        self._hold_vllm_metrics("validation", True)
         if self.serialize_validation:
             await self._begin_hard_pause("validation")
         try:
@@ -739,6 +747,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         finally:
             if self.serialize_validation:
                 await self._end_hard_pause("validation")
+            self._hold_vllm_metrics("validation", False)
         if self.first_sample_time is not None:
             if self.serialize_validation:
                 self.cumulative_validation_time += time.time() - pause_start
@@ -746,15 +755,26 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 self.cumulative_validation_time += timing_raw["rollouter/validate_time"]
         return timing_raw | val_metrics
 
+    def _hold_vllm_metrics(self, reason: str, hold: bool):
+        """Keep validation requests and frozen windows out of the vllm/* training-rollout metrics."""
+        if self.vllm_metrics_monitor is None:
+            return
+        if hold:
+            self.vllm_metrics_monitor.pause(reason)
+        else:
+            self.vllm_metrics_monitor.resume(reason)
+
     async def begin_save_pause(self):
         """Freeze generation for a whole trainer checkpoint save (async_training.pause_generation_during_save)."""
         self._save_pause_start = time.time()
+        self._hold_vllm_metrics("save", True)
         await self._begin_hard_pause("save")
 
     async def end_save_pause(self):
         """Resume generation after a trainer checkpoint save; the frozen window shifts later samples'
         virtual arrival times (post-anchor only)."""
         await self._end_hard_pause("save")
+        self._hold_vllm_metrics("save", False)
         if self._save_pause_start is not None and self.first_sample_time is not None:
             self.cumulative_checkpoint_pause += time.time() - self._save_pause_start
         self._save_pause_start = None
@@ -1021,6 +1041,10 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.llm_server_manager = await FullyAsyncLLMServerManager.create(
             config=self.config,
             worker_group=self.get_hybrid_worker_group(),
+        )
+        # Follows replicas added / removed at run time; held during validation and save freezes.
+        self.vllm_metrics_monitor = maybe_create_vllm_metrics_monitor(
+            self.config.actor_rollout_ref.rollout, lambda: list(self.llm_server_manager.server_addresses)
         )
         self.async_rollout_manager = await FullyAsyncAgentLoopManager.create(
             config=self.config,

@@ -18,6 +18,7 @@
 - concurrency ramp wired into the dispatch cap
 - stop-the-world pauses (serialized validation, checkpoint saves): freeze order, nesting, and that
   neither the monitor loop nor reset_staleness resumes generation underneath them
+- vLLM metrics monitor: reset_staleness reports its vllm/* window, and validation and save freezes hold it
 - MessageQueue.get_available_samples non-blocking drain
 - the async_training keys and their off defaults, and the __init__ validation
 """
@@ -527,6 +528,87 @@ class TestTrainerSavePause:
         with pytest.raises(RuntimeError, match="disk full"):
             t._save_checkpoint()
         assert events == ["begin", "save", "end"]
+
+
+# ------------------------------------------------------------------ vLLM metrics monitor
+
+
+class _RecordingMonitor:
+    """Stands in for VllmMetricsMonitor, logging its calls into the rollouter's event list."""
+
+    def __init__(self, events):
+        self.events = events
+        self.collected = 0
+
+    def pause(self, reason="default"):
+        self.events.append(("monitor_pause", reason))
+
+    def resume(self, reason="default"):
+        self.events.append(("monitor_resume", reason))
+
+    def collect(self):
+        self.collected += 1
+        return {"vllm/kv_cache_usage/mean": 0.5, "vllm/num_preemptions": 3.0}
+
+
+class TestVllmMetricsMonitor:
+    def _rollouter(self, serialize=False):
+        r = _bare_rollouter(serialize=serialize)
+        r.idle_start_time = r.step_start_time = 0.0
+        r._completed_steps = 1
+        r._step_samples_history = []
+        r._STEP_HISTORY_SIZE = 10
+        r._active_count_history = [(0.0, 0, 1)]
+        return r
+
+    def test_off_by_default(self):
+        r = self._rollouter()
+        assert FullyAsyncRollouter.vllm_metrics_monitor is None
+        timing = asyncio.run(r.reset_staleness())
+        assert not any(k.startswith("vllm/") for k in timing)
+
+    def test_reset_staleness_reports_one_window_per_parameter_version(self):
+        r = self._rollouter()
+        r.vllm_metrics_monitor = _RecordingMonitor(r.events)
+        timing = asyncio.run(r.reset_staleness())
+        assert timing["vllm/kv_cache_usage/mean"] == 0.5
+        assert timing["vllm/num_preemptions"] == 3.0
+        assert r.vllm_metrics_monitor.collected == 1
+
+    @pytest.mark.parametrize("serialize", [True, False])
+    def test_validation_is_excluded(self, serialize):
+        r = self._rollouter(serialize=serialize)
+        r.vllm_metrics_monitor = _RecordingMonitor(r.events)
+        r._validate = lambda: {"val/score": 1.0}
+        asyncio.run(r.do_validate())
+        names = [e[0] for e in r.events]
+        assert r.events[0] == ("monitor_pause", "validation")
+        assert r.events[-1] == ("monitor_resume", "validation")
+        if serialize:  # held before the freeze, released after the hold is lifted
+            assert ("set_hold", True) in r.events and ("set_hold", False) in r.events
+            assert names.index("monitor_pause") < names.index("set_hold")
+            assert r.events.index(("set_hold", False)) < names.index("monitor_resume")
+
+    def test_failed_validation_releases_the_hold(self):
+        r = self._rollouter(serialize=True)
+        r.vllm_metrics_monitor = _RecordingMonitor(r.events)
+
+        def boom():
+            raise RuntimeError("validation failed")
+
+        r._validate = boom
+        with pytest.raises(RuntimeError, match="validation failed"):
+            asyncio.run(r.do_validate())
+        assert r.events[-1] == ("monitor_resume", "validation")
+
+    def test_save_freeze_is_excluded(self):
+        r = self._rollouter()
+        r.vllm_metrics_monitor = _RecordingMonitor(r.events)
+        asyncio.run(r.begin_save_pause())
+        assert r.events[0] == ("monitor_pause", "save")
+        r.events.clear()
+        asyncio.run(r.end_save_pause())
+        assert r.events == [("set_hold", False), ("monitor_resume", "save")]
 
 
 # ------------------------------------------------------------------ message queue drain
