@@ -36,6 +36,7 @@ PANGU = "run_openpangu7b_dapo17k_grpo_sync_B128xn16_mini32_megatron.sh"
 ORZ = "run_orz7b_orz72k_grpo_sync_B128xn16_mini32_megatron.sh"
 QWEN_TIS = "run_qwen3-8b_dapo17k_grpo_sync_tis_B128xn16_mini32_megatron.sh"
 QWEN25_TIS = "run_qwen2.5-7b_dapo17k_grpo_sync_tis_B128xn16_mini32_megatron.sh"
+QWEN25_OVERLONG = "run_qwen2.5-7b_dapo17k_grpo_sync_tis_overlong_B128xn16_mini32_megatron.sh"
 ALL = [QWEN, PANGU, ORZ]
 
 
@@ -67,6 +68,8 @@ SCRIPT_ENV_KNOBS = {
     "ATTN_BACKEND",
     "VLLM_LOG_STATS",
     "ROLLOUT_MAX_MODEL_LEN",
+    "OVERLONG_BUFFER_LEN",
+    "OVERLONG_PENALTY_FACTOR",
 }
 
 
@@ -1048,3 +1051,101 @@ class TestQwen25BaseTis:
 
         cfg = OmegaConf.create(compose(QWEN25_TIS))
         validate_config(config=cfg, use_reference_policy=need_reference_policy(cfg), use_critic=need_critic(cfg))
+
+
+# --------------------------------------------------------------------------- DAPO overlong reward shaping
+
+# Keys the overlong toggle adds or changes.
+OVERLONG_KEYS = {
+    "reward.reward_manager.name",
+    "reward.reward_kwargs.overlong_buffer_cfg.enable",
+    "reward.reward_kwargs.overlong_buffer_cfg.len",
+    "reward.reward_kwargs.overlong_buffer_cfg.penalty_factor",
+    "reward.reward_kwargs.overlong_buffer_cfg.log",
+    "reward.reward_kwargs.max_resp_len",
+}
+
+
+@pytest.mark.parametrize("script", [QWEN, QWEN_TIS, QWEN25_TIS])
+def test_overlong_penalty_is_off_by_default(script):
+    c = compose(script)
+    assert c["reward"]["reward_manager"]["name"] == "naive"
+    assert "reward_kwargs" not in c["reward"]
+    assert "overlong" not in c["trainer"]["experiment_name"]
+
+
+class TestQwen25Overlong:
+    def test_dapo_reward_manager_with_soft_overlong_penalty(self):
+        reward = compose(QWEN25_OVERLONG)["reward"]
+        assert reward["reward_manager"]["name"] == "dapo"
+        assert reward["reward_manager"]["source"] == "register"
+        assert reward["reward_kwargs"] == {
+            "overlong_buffer_cfg": {"enable": True, "len": 2048, "penalty_factor": 1.0, "log": True},
+            "max_resp_len": 8192,
+        }
+
+    def test_name(self):
+        name = compose(QWEN25_OVERLONG)["trainer"]["experiment_name"]
+        assert name.endswith(" tis-C8 overlong-2048-pf1.0 seed-1 h100-emu-76gb-gmu0.283")
+
+    def test_is_the_qwen25_tis_arm_plus_only_the_overlong_penalty(self):
+        changed = _diff(compose(QWEN25_TIS), compose(QWEN25_OVERLONG))
+        assert changed - NAME_DERIVED_KEYS == OVERLONG_KEYS
+
+    def test_no_dynamic_sampling(self):
+        c = compose(QWEN25_OVERLONG)
+        assert c["algorithm"]["filter_groups"]["enable"] is False
+        assert c["data"].get("gen_batch_size") is None
+
+    def test_buffer_zero_is_the_tis_script(self):
+        assert _diff(compose(QWEN25_TIS), compose(QWEN25_OVERLONG, OVERLONG_BUFFER_LEN="0")) == set()
+
+    def test_knobs_apply(self):
+        c = compose(QWEN25_OVERLONG, OVERLONG_BUFFER_LEN="1024", OVERLONG_PENALTY_FACTOR="0.5")
+        cfg = c["reward"]["reward_kwargs"]["overlong_buffer_cfg"]
+        assert (cfg["len"], cfg["penalty_factor"]) == (1024, 0.5)
+        assert " overlong-1024-pf0.5 seed-1 " in c["trainer"]["experiment_name"]
+
+    def test_tis_script_knobs_still_apply(self):
+        c = compose(QWEN25_OVERLONG, train_prompt_bsz="144", train_prompt_mini_bsz="36", lr_warmup_steps="0")
+        assert (c["data"]["train_batch_size"], c["actor_rollout_ref"]["actor"]["ppo_mini_batch_size"]) == (144, 36)
+        assert c["actor_rollout_ref"]["actor"]["optim"]["lr_warmup_steps"] == 0
+
+    def test_runs_the_qwen25_tis_script(self):
+        code = [ln for ln in (SCRIPTS / QWEN25_OVERLONG).read_text().splitlines() if not ln.lstrip().startswith("#")]
+        execs = [ln for ln in code if ln.lstrip().startswith("exec ")]
+        assert len(execs) == 1 and QWEN25_TIS in execs[0]
+
+    def test_reward_manager_reads_the_composed_config(self):
+        from omegaconf import OmegaConf
+
+        from verl.experimental.reward_loop.reward_manager.dapo import DAPORewardManager
+
+        cfg = OmegaConf.create(compose(QWEN25_OVERLONG))
+        manager = DAPORewardManager(cfg, tokenizer=None, compute_score=lambda **kw: 0.0)
+        assert manager.max_resp_len == 8192
+        assert manager.overlong_buffer_cfg.enable is True and manager.overlong_buffer_cfg.len == 2048
+
+    def test_passes_verl_config_validation(self):
+        from omegaconf import OmegaConf
+
+        from verl.trainer.ppo.utils import need_critic, need_reference_policy
+        from verl.utils.config import validate_config
+
+        cfg = OmegaConf.create(compose(QWEN25_OVERLONG))
+        validate_config(config=cfg, use_reference_policy=need_reference_policy(cfg), use_critic=need_critic(cfg))
+
+
+@pytest.mark.parametrize(
+    "env, message",
+    [
+        ({"OVERLONG_BUFFER_LEN": "-1"}, "OVERLONG_BUFFER_LEN must be a non-negative integer"),
+        ({"OVERLONG_BUFFER_LEN": "2k"}, "OVERLONG_BUFFER_LEN must be a non-negative integer"),
+        ({"OVERLONG_BUFFER_LEN": "8192"}, "OVERLONG_BUFFER_LEN must be < max_response_length = 8192"),
+        ({"OVERLONG_PENALTY_FACTOR": "0"}, "OVERLONG_PENALTY_FACTOR must be a positive number"),
+        ({"OVERLONG_PENALTY_FACTOR": "x"}, "OVERLONG_PENALTY_FACTOR must be a positive number"),
+    ],
+)
+def test_invalid_overlong_settings_fail_fast(env, message, tmp_path):
+    rc, _, err = _run(QWEN25_OVERLONG, env, tmp=tmp_path)
+    assert rc == 2 and message in err

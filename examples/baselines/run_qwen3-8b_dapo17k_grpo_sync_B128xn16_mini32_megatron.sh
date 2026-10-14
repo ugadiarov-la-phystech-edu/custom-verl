@@ -390,6 +390,40 @@ case "${DYNAMIC_BSZ}" in
     *) echo "DYNAMIC_BSZ must be True or False, got '${DYNAMIC_BSZ}'" >&2; exit 2 ;;
 esac
 
+# ================= DAPO overlong reward shaping (toggle) =================
+# OVERLONG_BUFFER_LEN=0 (default) keeps verl's naive reward manager: the reward is the math_dapo score
+# (+1 / -1), so a truncated response (no final "Answer:" line) simply scores -1. OVERLONG_BUFFER_LEN=L > 0
+# switches to the DAPO reward manager (verl/experimental/reward_loop/reward_manager/dapo.py) with DAPO's soft
+# overlong punishment (Yu et al. 2025, arXiv:2503.14476, section 3.4): a response of len tokens gets
+#   reward += min(-(len - (max_response_length - L)) / L * OVERLONG_PENALTY_FACTOR, 0)
+# i.e. no penalty up to max_response_length - L, then a linear ramp to -OVERLONG_PENALTY_FACTOR at the cap.
+# DAPO / FlashRL used L = 4096 under a 20,480 cap (the last 20%). The penalty also applies to validation
+# rewards, but val-core/*/acc/mean@1 reads the scorer's own acc, which it does not touch.
+# This is the ONLY overlong handling: no overlong filtering (truncated responses are not masked out of the
+# loss; verl's DAPO recipe and FlashRL ran without it) and no dynamic sampling (algorithm.filter_groups
+# stays off). overlong_buffer_cfg.log=True records overlong_reward / overlong per response; they surface as
+# val-aux/<data_source>/overlong_reward/* and overlong/* (the training path does not aggregate reward extras).
+#   OVERLONG_PENALTY_FACTOR  penalty at the cap (default 1.0, as in DAPO).
+# Tagged in exp_name.
+OVERLONG_BUFFER_LEN=${OVERLONG_BUFFER_LEN:-0}
+OVERLONG_PENALTY_FACTOR=${OVERLONG_PENALTY_FACTOR:-1.0}
+[[ "${OVERLONG_BUFFER_LEN}" =~ ^[0-9]+$ ]] || { echo "OVERLONG_BUFFER_LEN must be a non-negative integer (0 = off), got '${OVERLONG_BUFFER_LEN}'" >&2; exit 2; }
+reward_args=()
+overlong_tag=""
+if (( OVERLONG_BUFFER_LEN > 0 )); then
+    (( OVERLONG_BUFFER_LEN < max_response_length )) || { echo "OVERLONG_BUFFER_LEN must be < max_response_length = ${max_response_length}, got ${OVERLONG_BUFFER_LEN}" >&2; exit 2; }
+    [[ "${OVERLONG_PENALTY_FACTOR}" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk "BEGIN{exit !(${OVERLONG_PENALTY_FACTOR} > 0)}" || { echo "OVERLONG_PENALTY_FACTOR must be a positive number, got '${OVERLONG_PENALTY_FACTOR}'" >&2; exit 2; }
+    reward_args=(
+        reward.reward_manager.name=dapo
+        +reward.reward_kwargs.overlong_buffer_cfg.enable=True
+        +reward.reward_kwargs.overlong_buffer_cfg.len="${OVERLONG_BUFFER_LEN}"
+        +reward.reward_kwargs.overlong_buffer_cfg.penalty_factor="${OVERLONG_PENALTY_FACTOR}"
+        +reward.reward_kwargs.overlong_buffer_cfg.log=True
+        +reward.reward_kwargs.max_resp_len="${max_response_length}"
+    )
+    overlong_tag=" overlong-${OVERLONG_BUFFER_LEN}-pf${OVERLONG_PENALTY_FACTOR}"
+fi
+
 # ================= Trainer =================
 test_freq=${test_freq:-2}    # rollout steps (= 8 optimizer updates)
 save_freq=${save_freq:-2}    # rollout steps
@@ -427,7 +461,7 @@ NNODES=${NNODES:-1}
 n_gpus_per_node=${n_gpus_per_node:-8}
 
 # ================= Logging =================
-exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} mini-${train_prompt_mini_bsz} ppo-epochs-${ppo_epochs} DAPO17K-AIME24-25 ${model_tag} tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${clip_tag}${warmup_tag}${dynbsz_tag}${tis_tag}${quant_tag}${kv_tag}${attn_tag} seed-${SEED}${emu_tag}"}
+exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} mini-${train_prompt_mini_bsz} ppo-epochs-${ppo_epochs} DAPO17K-AIME24-25 ${model_tag} tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${clip_tag}${warmup_tag}${dynbsz_tag}${tis_tag}${quant_tag}${kv_tag}${attn_tag}${overlong_tag} seed-${SEED}${emu_tag}"}
 exp_name_safe=${exp_name//\//_}
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
@@ -529,4 +563,4 @@ python3 -m verl.trainer.main_ppo \
     trainer.nnodes="${NNODES}" \
     trainer.n_gpus_per_node="${n_gpus_per_node}" \
     trainer.total_training_steps=${total_training_steps} \
-    trainer.total_epochs=${total_epochs} "${engine_args[@]}" "${dynbsz_args[@]}" "$@"
+    trainer.total_epochs=${total_epochs} "${engine_args[@]}" "${dynbsz_args[@]}" "${reward_args[@]}" "$@"
