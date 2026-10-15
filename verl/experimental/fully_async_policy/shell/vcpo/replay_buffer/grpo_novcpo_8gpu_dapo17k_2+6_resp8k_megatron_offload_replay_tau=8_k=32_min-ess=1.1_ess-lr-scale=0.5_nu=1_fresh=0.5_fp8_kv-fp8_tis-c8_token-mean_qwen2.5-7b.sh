@@ -32,23 +32,22 @@
 # DERIVED FROM THE MINI-BATCH AND LAYOUT (the base arm computes them; no extra knobs):
 #   * first update (requires_mini_batches=0.5): 18 groups, 18 x 16 = 288 sequences over 6 ranks;
 #   * fresh-share gate: ceil(0.5 x 36) = 18 newly arrived groups per update;
-#   * in-flight cap: concurrent_samples_per_replica = 48 groups per engine (set below, decoupled from the
-#     mini-batch), 2 x 48 = 96 groups = 768 sequences per engine (4+4 arm: 4 x 32 = 128);
+#   * in-flight cap: concurrent_samples_per_replica = 32 groups per engine (set below, decoupled from the
+#     mini-batch), 2 x 32 = 64 groups = 512 sequences per engine (4+4 arm: 4 x 32 = 128);
 #   * concurrency ramp [5, 12, 20] per engine -> 10 / 24 / 40 groups in flight until the 1st / 2nd / 3rd
 #     mini-batch is delivered.
 # With 2 engines the run is generation-bound: expect trainer idle time behind the fresh-share gate
 # (replay/fresh_wait_s). Qwen2.5-7B's FP8 KV cache needs ~2.5x less memory per token than Qwen3-8B's, so each
-# engine has room for more than 36 groups in flight, hence concurrent_samples_per_replica=48: 768 sequences per
-# engine, inside the 512-1,024 range where a vLLM engine stays GPU-bound (at 1,536 the single-threaded EngineCore
-# loop became the bottleneck in scripts/group_outcome_stats.py runs). The FP8 KV budget at gmu 0.5 is roughly 2M
-# tokens per engine (estimate), so 768 x ~2.2k tokens late in training is tight: if vllm/* shows preemptions or
-# KV-cache usage near 100%, lower it to 36-42; if KV usage stays low and replay/fresh_wait_s is high, try 54-60.
-#   * actor_rollout_ref.rollout.max_num_seqs=768 (= 48 x 16; env ROLLOUT_MAX_NUM_SEQS, vLLM default 256): the
+# engine has room for more than 36 groups in flight, but at 48 groups / max_num_seqs=768 (run of 2026-10-15) a
+# rollout vLLM worker grew to 134 GiB of the H200 (budget ~70 GiB at gmu 0.5, ~+1 GB per weight sync) and the
+# step-72 weight sync died with CUDA OOM. Hence concurrent_samples_per_replica=32 with max_num_seqs=512: every
+# batch stays within the captured CUDA-graph sizes (<= min(2 x max_num_seqs, 512) = 512), so no step runs outside
+# the graphs on the caching allocator. Watch rollout-GPU memory in nvidia-smi across syncs.
+#   * actor_rollout_ref.rollout.max_num_seqs=512 (= 32 x 16; env ROLLOUT_MAX_NUM_SEQS, vLLM default 256): the
 #     per-engine running cap must match the in-flight groups, or the extra groups only queue in vLLM (measured with
-#     the default: "Running: 254 reqs, Waiting: 215 reqs" at ~5% KV-cache usage). max_num_batched_tokens stays
-#     10,240 (768 decode tokens + ~9.5k for prefill). CUDA graphs are captured up to min(2 x max_num_seqs, 512), so
-#     steps with 513-768 running sequences run without full graphs. If rollout GPU utilization drops while the
-#     EngineCore process sits near 100% CPU, use 512 together with concurrent_samples_per_replica=32.
+#     the default 256 at 48 groups: "Running: 254 reqs, Waiting: 215 reqs" at ~5% KV-cache usage).
+#     max_num_batched_tokens stays 10,240 (512 decode tokens + ~9.7k for prefill). Keep the two in step:
+#     max_num_seqs = 16 x concurrent_samples_per_replica.
 #
 # Kept from the 4+4 arm: KV_CACHE_DTYPE=fp8_e4m3, ATTN_BACKEND=default, ROLLOUT_MAX_MODEL_LEN=10240,
 # VLLM_LOG_STATS=True, lr_warmup_steps=0, AIME-2024 + AIME-2025 validation, and,
@@ -61,8 +60,8 @@ export MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen2.5-7B"}
 export model_tag=${model_tag:-"Qwen2.5-7B"}
 export n_gpus_rollout=${n_gpus_rollout:-2}
 export train_prompt_mini_bsz=${train_prompt_mini_bsz:-36}
-export concurrent_samples_per_replica=${concurrent_samples_per_replica:-48}
-ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-768}
+export concurrent_samples_per_replica=${concurrent_samples_per_replica:-32}
+ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-512}
 export KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-fp8_e4m3}
 export ATTN_BACKEND=${ATTN_BACKEND:-default}
 export ROLLOUT_MAX_MODEL_LEN=${ROLLOUT_MAX_MODEL_LEN:-10240}
