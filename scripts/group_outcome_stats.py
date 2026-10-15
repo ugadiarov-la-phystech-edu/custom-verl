@@ -54,9 +54,35 @@ OUTPUT (--output-dir, default outputs/group_outcome_stats/<precision>_seed<seed>
   * groups.jsonl  one line per prompt group (dataset row, number correct, truncated, response lengths), to pair
                   bf16 and FP8 runs prompt by prompt.
 Every --print-interval seconds (default 30) the current statistics are printed to stdout.
+
+OTHER DATASETS / PROMPT FORMATS (e.g. Open-Reasoner-Zero's orz-math-72k, as in
+examples/baselines/run_orz7b_orz72k_grpo_sync_B128xn16_mini32_megatron.sh):
+  * --tokenizer  tokenizer (and so chat template) other than --model's. Qwen2.5-7B weights with the
+                 Open-Reasoner-Zero-7B tokenizer see ORZ's prompt ("A conversation between User and Assistant ...
+                 User: ...\nAssistant: <think>"); the two tokenizers share vocabulary, special tokens and EOS and
+                 differ only in chat_template.
+  * --reward-fn  PATH:FUNCTION scorer instead of verl's default_compute_score (which picks math_dapo for
+                 data_source=math_dapo), called as fn(data_source=, solution_str=, ground_truth=, extra_info=) like
+                 reward.custom_reward_function.*; e.g. rewards/orz_tag_aware_math.py:compute_score for ORZ's
+                 <answer>...\boxed{}...</answer> format.
+  * --stop       stop strings, with ORZ's sampling semantics (orz_7b_ppo.py generate_vllm): the matched string is
+                 kept in the response (include_stop_str_in_output=True), special tokens are kept
+                 (skip_special_tokens=False), and the scorer reads vLLM's output text - the string ORZ scored. ORZ:
+                 --stop "User:" "Human:" "Assistant:" "</answer>". Without --stop generation ends only at EOS and
+                 the response is decoded from its token ids with skip_special_tokens=True, as verl does. Per-string
+                 stop counts land in groups.jsonl (stop_strings) and metrics.json (stopped_by_string_pct).
+  * --max-model-len  cap on prompt + response; ORZ ran generate_max_len=8000 inside max_len=8192, i.e.
+                 --max-response-length 8000 --max-model-len 8192 (a response ends at min(8000, 8192 - prompt)).
+  Full ORZ emulation for Qwen2.5-7B:
+      --model Qwen/Qwen2.5-7B --tokenizer Open-Reasoner-Zero/Open-Reasoner-Zero-7B
+      --data /data2/datasets/orz/orz-math-72k.parquet --reward-fn rewards/orz_tag_aware_math.py:compute_score
+      --stop "User:" "Human:" "Assistant:" "</answer>" --max-response-length 8000 --max-model-len 8192
+  Scoring runs in a thread pool next to the engine loop, so a slow scorer (ORZ's sympy tier, up to 1 s per
+  answer) does not stall generation.
 """
 
 import argparse
+import importlib.util
 import json
 import math
 import multiprocessing as mp
@@ -65,6 +91,7 @@ import queue
 import sys
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 DEFAULT_DATA = "/data2/datasets/math_datasets/dapo/dapo-math-17k.parquet"
@@ -148,6 +175,7 @@ def __getattr__(name):
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0], formatter_class=argparse.RawTextHelpFormatter)
     p.add_argument("--model", default="Qwen/Qwen2.5-7B", help="HF model id or local path (default: %(default)s)")
+    p.add_argument("--tokenizer", default=None, help="HF id or path of the tokenizer / chat template (default: --model)")
     p.add_argument("--data", default=DEFAULT_DATA, help="DAPO-Math-17k parquet (default: %(default)s)")
     p.add_argument("--seed", type=int, default=1, help="prompt sample and vLLM sampling seed (default: %(default)s)")
     p.add_argument("--num-gpus", type=int, default=None, help="GPUs to use, one TP1 engine each (default: all)")
@@ -158,9 +186,27 @@ def parse_args(argv=None):
         default="bf16",
         help="bf16: bf16 weights + KV; fp8: FP8 weights, bf16 KV; fp8+fp8kv: FP8 weights + fp8_e4m3 KV",
     )
+    p.add_argument(
+        "--reward-fn",
+        default=None,
+        help="PATH:FUNCTION scorer, e.g. rewards/orz_tag_aware_math.py:compute_score (default: verl default_compute_score)",
+    )
+    p.add_argument(
+        "--stop",
+        nargs="+",
+        default=None,
+        metavar="STR",
+        help='stop strings, kept in the response; ORZ: --stop "User:" "Human:" "Assistant:" "</answer>"',
+    )
     p.add_argument("--n", type=int, default=16, help="responses per prompt (default: %(default)s)")
     p.add_argument("--max-prompt-length", type=int, default=2048, help="longer prompts are filtered out")
     p.add_argument("--max-response-length", type=int, default=8192)
+    p.add_argument(
+        "--max-model-len",
+        type=int,
+        default=None,
+        help="vLLM max_model_len, a cap on prompt + response (default: max-prompt-length + max-response-length)",
+    )
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--top-p", type=float, default=1.0)
     p.add_argument("--top-k", type=int, default=-1)
@@ -175,7 +221,34 @@ def parse_args(argv=None):
         p.error("--num-prompts and --n must be positive")
     if args.print_interval <= 0:
         p.error("--print-interval must be positive")
+    if args.max_model_len is None:
+        args.max_model_len = args.max_prompt_length + args.max_response_length
+    if args.max_model_len <= args.max_prompt_length:
+        p.error("--max-model-len must exceed --max-prompt-length")
+    if args.reward_fn is not None:
+        path, sep, name = args.reward_fn.rpartition(":")
+        if not sep or not path or not name:
+            p.error(f"--reward-fn must be PATH:FUNCTION, got {args.reward_fn!r}")
+        if not os.path.isfile(path):
+            p.error(f"--reward-fn file not found: {path}")
+        args.reward_fn = f"{os.path.abspath(path)}:{name}"
+    if args.stop is not None and not all(args.stop):
+        p.error("--stop strings must be non-empty")
     return args
+
+
+def load_reward_fn(spec):
+    """verl's default_compute_score, or FUNCTION from the PATH:FUNCTION file (loaded as verl loads
+    reward.custom_reward_function.path)."""
+    if spec is None:
+        from verl.utils.reward_score import default_compute_score
+
+        return default_compute_score
+    path, _, name = spec.rpartition(":")
+    module_spec = importlib.util.spec_from_file_location("group_outcome_stats_reward", path)
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+    return getattr(module, name)
 
 
 def resolve_model_dir(model: str) -> str:
@@ -219,12 +292,13 @@ def load_prompts(args, tokenizer):
     return prompts, len(df), n_filtered
 
 
-def engine_kwargs(args, model_dir):
+def engine_kwargs(args, model_dir, tokenizer_dir):
     kwargs = dict(
         model=model_dir,
+        tokenizer=tokenizer_dir,
         dtype="bfloat16",
         load_format="dummy",
-        max_model_len=args.max_prompt_length + args.max_response_length,
+        max_model_len=args.max_model_len,
         max_num_seqs=args.max_num_seqs,
         max_num_batched_tokens=args.max_num_batched_tokens,
         enable_chunked_prefill=True,
@@ -252,7 +326,34 @@ def engine_kwargs(args, model_dir):
     return kwargs
 
 
-def worker(rank, args, model_dir, prompts, out_q, barrier):
+def score_group(pr, out, compute_score, use_vllm_text, tokenizer):
+    """One finished request -> the groups.jsonl record."""
+    correct, lengths, truncated, stop_strings = 0, [], 0, {}
+    for c in out.outputs:
+        if use_vllm_text:
+            # --stop: score the text vLLM returned (stop string kept, special tokens kept), as ORZ did.
+            text = c.text
+        else:
+            text = tokenizer.decode(c.token_ids, skip_special_tokens=True)
+        res = compute_score(data_source=pr["data_source"], solution_str=text, ground_truth=pr["ground_truth"])
+        acc = bool(res["acc"]) if isinstance(res, dict) else float(res) > 0
+        correct += acc
+        lengths.append(len(c.token_ids))
+        truncated += c.finish_reason == "length"
+        if isinstance(c.stop_reason, str):
+            stop_strings[c.stop_reason] = stop_strings.get(c.stop_reason, 0) + 1
+    return {
+        "pos": pr["pos"],
+        "row": pr["row"],
+        "n": len(out.outputs),
+        "correct": correct,
+        "truncated": truncated,
+        "stop_strings": stop_strings,
+        "lengths": lengths,
+    }
+
+
+def worker(rank, args, model_dir, tokenizer_dir, prompts, out_q, barrier):
     """One TP1 engine on the GPU in CUDA_VISIBLE_DEVICES (set by the parent before spawning)."""
     try:
         if args.fp8_weights:
@@ -264,11 +365,11 @@ def worker(rank, args, model_dir, prompts, out_q, barrier):
         from vllm import LLM, SamplingParams
         from vllm.sampling_params import RequestOutputKind
 
-        from verl.utils.reward_score import default_compute_score
+        compute_score = load_reward_fn(args.reward_fn)
 
         t_load = time.time()
-        tokenizer = AutoTokenizer.from_pretrained(model_dir)
-        llm = LLM(seed=args.seed + rank, **engine_kwargs(args, model_dir))
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
+        llm = LLM(seed=args.seed + rank, **engine_kwargs(args, model_dir, tokenizer_dir))
         info = llm.collective_rpc("load_hf_checkpoint", args=(model_dir,))[0]
         llm.collective_rpc("monkey_patch_model", kwargs={"vocab_size": len(tokenizer), "banned_token_ids": None})
         llm.reset_prefix_cache()
@@ -276,6 +377,12 @@ def worker(rank, args, model_dir, prompts, out_q, barrier):
 
         barrier.wait()
         engine = llm.llm_engine
+        use_vllm_text = args.stop is not None
+        if use_vllm_text:
+            # Stop strings are matched on the detokenized text, so detokenization must stay on.
+            stop_kwargs = dict(stop=list(args.stop), include_stop_str_in_output=True, skip_special_tokens=False)
+        else:
+            stop_kwargs = dict(detokenize=False)
         by_id = {}
         for pr in prompts:
             params = SamplingParams(
@@ -286,38 +393,37 @@ def worker(rank, args, model_dir, prompts, out_q, barrier):
                 repetition_penalty=1.0,
                 max_tokens=args.max_response_length,
                 seed=args.seed * SEED_STRIDE + pr["pos"] * args.n,
-                detokenize=False,
                 output_kind=RequestOutputKind.FINAL_ONLY,
+                **stop_kwargs,
             )
             rid = str(pr["pos"])
             by_id[rid] = pr
             engine.add_request(rid, {"prompt_token_ids": pr["prompt_ids"]}, params)
         out_q.put(("started", rank, time.time()))
 
-        while engine.has_unfinished_requests():
-            for out in engine.step():
-                if not out.finished:
-                    continue
-                pr = by_id.pop(out.request_id)
-                correct, lengths, truncated = 0, [], 0
-                for c in out.outputs:
-                    text = tokenizer.decode(c.token_ids, skip_special_tokens=True)
-                    res = default_compute_score(pr["data_source"], text, pr["ground_truth"])
-                    acc = bool(res["acc"]) if isinstance(res, dict) else float(res) > 0
-                    correct += acc
-                    lengths.append(len(c.token_ids))
-                    truncated += c.finish_reason == "length"
-                rec = {
-                    "pos": pr["pos"],
-                    "row": pr["row"],
-                    "n": len(out.outputs),
-                    "correct": correct,
-                    "truncated": truncated,
-                    "lengths": lengths,
-                    "gpu_rank": rank,
-                }
-                out_q.put(("group", rank, rec))
-        out_q.put(("done", rank, time.time()))
+        pending = []
+
+        def flush(wait=False):
+            nonlocal pending
+            still = []
+            for fut in pending:
+                if wait or fut.done():
+                    out_q.put(("group", rank, dict(fut.result(), gpu_rank=rank)))
+                else:
+                    still.append(fut)
+            pending = still
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            while engine.has_unfinished_requests():
+                for out in engine.step():
+                    if out.finished:
+                        pr = by_id.pop(out.request_id)
+                        pending.append(pool.submit(score_group, pr, out, compute_score, use_vllm_text, tokenizer))
+                flush()
+            # The generation clock stops when the engine is done; the last groups may still be scoring.
+            t_done = time.time()
+            flush(wait=True)
+        out_q.put(("done", rank, t_done))
     except BaseException:
         out_q.put(("error", rank, traceback.format_exc()))
         try:
@@ -336,6 +442,7 @@ class Stats:
         self.responses = 0
         self.correct = 0
         self.truncated = 0
+        self.stopped_by_string = 0
         self.tokens = 0
 
     def add(self, rec):
@@ -345,6 +452,7 @@ class Stats:
         self.responses += rec["n"]
         self.correct += rec["correct"]
         self.truncated += rec["truncated"]
+        self.stopped_by_string += sum(rec["stop_strings"].values())
         self.tokens += sum(rec["lengths"])
 
     def as_dict(self, gen_s):
@@ -360,6 +468,7 @@ class Stats:
             "all_wrong_groups": self.all_wrong,
             "response_acc_pct": round(100.0 * self.correct / r, 2),
             "truncated_pct": round(100.0 * self.truncated / r, 3),
+            "stopped_by_string_pct": round(100.0 * self.stopped_by_string / r, 3),
             "mean_response_len": round(self.tokens / r, 1),
             "generated_tokens": self.tokens,
         }
@@ -370,7 +479,7 @@ def fmt_line(m):
         f"[{datetime.now(timezone.utc):%H:%M:%S}] prompts {m['prompts_processed']}/{m['prompts_total']} | "
         f"gen {m['generation_time_s'] / 60:.1f} min | all-correct {m['all_correct_pct']:.2f}% | "
         f"all-wrong {m['all_wrong_pct']:.2f}% | mixed {m['mixed_pct']:.2f}% | acc {m['response_acc_pct']:.2f}% | "
-        f"trunc {m['truncated_pct']:.3f}% | len {m['mean_response_len']:.0f}"
+        f"trunc {m['truncated_pct']:.3f}% | stop-str {m['stopped_by_string_pct']:.1f}% | len {m['mean_response_len']:.0f}"
     )
 
 
@@ -387,7 +496,8 @@ def main(argv=None):
     gpu_ids = visible.split(",")[:num_gpus] if visible else [str(i) for i in range(num_gpus)]
 
     model_dir = resolve_model_dir(args.model)
-    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    tokenizer_dir = model_dir if args.tokenizer is None else resolve_model_dir(args.tokenizer)
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_dir)
     prompts, n_rows, n_filtered = load_prompts(args, tokenizer)
     out_dir = args.output_dir or os.path.join(
         "outputs", "group_outcome_stats", f"{args.precision}_seed{args.seed}_{datetime.now(timezone.utc):%Y%m%d_%H%M%S}"
@@ -397,6 +507,7 @@ def main(argv=None):
         **{k: v for k, v in vars(args).items() if k != "output_dir"},
         "num_gpus": num_gpus,
         "model_dir": model_dir,
+        "tokenizer_dir": tokenizer_dir,
         "dataset_rows": n_rows,
         "filtered_overlong_prompts": n_filtered,
     }
@@ -423,7 +534,7 @@ def main(argv=None):
     saved_cvd = visible
     for rank in range(num_gpus):
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids[rank]
-        proc = ctx.Process(target=worker, args=(rank, args, model_dir, shards[rank], out_q, barrier), daemon=False)
+        proc = ctx.Process(target=worker, args=(rank, args, model_dir, tokenizer_dir, shards[rank], out_q, barrier), daemon=False)
         proc.start()
         procs.append(proc)
     if saved_cvd is None:
