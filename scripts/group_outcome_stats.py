@@ -403,6 +403,13 @@ def main(argv=None):
     print(f"[group_outcome_stats] {json.dumps(config)}", flush=True)
     print(f"[group_outcome_stats] output: {out_dir}", flush=True)
 
+    # vLLM environment of the training launchers (run_qwen3-8b_dapo17k_grpo_sync_*.sh, the replay arms): V1
+    # engine and vLLM's native torch sampler - the FlashInfer sampler JIT-compiles at engine start-up and fails
+    # without a working nvcc. FP8 arms also keep FlashInfer's block-FP8 GEMM off (DeepGEMM runs them).
+    os.environ.setdefault("VLLM_USE_V1", "1")
+    os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
+    if args.fp8_weights:
+        os.environ.setdefault("VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER", "0")
     # vLLM's engine processes import EXTENSION_CLS (and verl) by name: put the repo root on their path.
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     os.environ["PYTHONPATH"] = os.pathsep.join(p for p in (repo_root, os.environ.get("PYTHONPATH")) if p)
