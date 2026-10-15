@@ -34,10 +34,12 @@
 #     FlashRL either, and not implemented in this fork.
 #
 # Any env knob or trailing Hydra override of the TIS script and the base launcher still applies, e.g.
-#   OVERLONG_BUFFER_LEN=1024 train_prompt_bsz=144 train_prompt_mini_bsz=36 lr_warmup_steps=0 \
-#   val_temperature=1.0 val_top_p=1.0 bash <this script>
+#   OVERLONG_BUFFER_LEN=1024 train_prompt_bsz=144 train_prompt_mini_bsz=36 lr_warmup_steps=0 bash <this script>
+# Validation sampling is temperature 1.0 / top_p 1.0 (set here and in the TIS script; base launcher 0.8 / 0.7).
 # OVERLONG_BUFFER_LEN=0 turns the penalty off (= the TIS script).
 set -euo pipefail
 export OVERLONG_BUFFER_LEN=${OVERLONG_BUFFER_LEN:-2048}
 export OVERLONG_PENALTY_FACTOR=${OVERLONG_PENALTY_FACTOR:-1.0}
+export val_temperature=${val_temperature:-1.0}
+export val_top_p=${val_top_p:-1.0}
 exec bash "$(dirname "${BASH_SOURCE[0]}")/run_qwen2.5-7b_dapo17k_grpo_sync_tis_B128xn16_mini32_megatron.sh" "$@"

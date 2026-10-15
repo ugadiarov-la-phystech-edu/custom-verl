@@ -39,6 +39,10 @@
 # CADENCE. Validation and checkpoints every 5 rollout steps (= 20 optimizer updates; baseline 2):
 # test_freq=5, save_freq=5, env-overridable (the Qwen3-8B TIS script: 3).
 #
+# VALIDATION SAMPLING. val_temperature=1.0, val_top_p=1.0 (base launcher: 0.8 / 0.7), env-overridable: plain
+# sampling, as in run_qwen2.5-7b_dapo17k_grpo_sync_B128xn16_mini32_megatron.sh and every Qwen2.5-7B run on
+# remote_h200, so AIME avg@32 curves stay comparable. Inherited by the _overlong_ wrapper.
+#
 # H100 EMULATION IS ON BY DEFAULT (for runs on remote_h200's 140.4 GiB H200s; see the baseline's
 # "H100 emulation" note and verl/utils/gpu_memory_cap.py):
 #   * VERL_GPU_MEM_CAP_GB=76      caps the trainer (actor-role worker) allocator at 76 GiB.
@@ -106,6 +110,8 @@ export clip_ratio_c=${clip_ratio_c:-10.0}
 export lr_warmup_steps=${lr_warmup_steps:-3}
 export test_freq=${test_freq:-5}
 export save_freq=${save_freq:-5}
+export val_temperature=${val_temperature:-1.0}
+export val_top_p=${val_top_p:-1.0}
 export weight_decay=${weight_decay:-0.1}
 export DYNAMIC_BSZ=${DYNAMIC_BSZ:-True}
 export VERL_GPU_MEM_CAP_GB=${VERL_GPU_MEM_CAP_GB-76}

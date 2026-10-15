@@ -950,7 +950,11 @@ QWEN25_OWN = {
     "train_prompt_mini_bsz": "35",
     "test_freq": "5",
     "save_freq": "5",
+    "val_temperature": "1.0",
+    "val_top_p": "1.0",
 }
+# Validation sampling keys the Qwen2.5-7B scripts set to 1.0 / 1.0 (the Qwen3-8B arms keep 0.8 / 0.7).
+VAL_SAMPLING_KEYS = {"actor_rollout_ref.rollout.val_kwargs.temperature", "actor_rollout_ref.rollout.val_kwargs.top_p"}
 
 
 class TestQwen25BaseTis:
@@ -964,7 +968,13 @@ class TestQwen25BaseTis:
     def test_is_the_qwen3_tis_arm_with_only_the_model_swapped(self):
         swapped = compose(QWEN_TIS, **QWEN25_OWN)
         assert _diff(swapped, compose(QWEN25_TIS)) == set()
-        changed = _diff(compose(QWEN_TIS), compose(QWEN25_TIS)) - NAME_DERIVED_KEYS - CADENCE_KEYS - BATCH_KEYS
+        changed = (
+            _diff(compose(QWEN_TIS), compose(QWEN25_TIS))
+            - NAME_DERIVED_KEYS
+            - CADENCE_KEYS
+            - BATCH_KEYS
+            - VAL_SAMPLING_KEYS
+        )
         assert "actor_rollout_ref.model.path" in changed
         for key in changed:  # everything else that changes is derived from the model path
             assert key.endswith(("path", "served_model_name")) or ".model." in key, key
@@ -990,6 +1000,13 @@ class TestQwen25BaseTis:
         assert compose(QWEN25_TIS, max_updates="200")["trainer"]["total_training_steps"] == 50  # 4 updates per step
         c = compose(QWEN25_TIS, train_prompt_bsz="128", train_prompt_mini_bsz="32")
         assert (c["data"]["train_batch_size"], c["actor_rollout_ref"]["actor"]["ppo_mini_batch_size"]) == (128, 32)
+
+    @pytest.mark.parametrize("script", [QWEN25_TIS, QWEN25_OVERLONG])
+    def test_validation_sampling_is_plain_t1_p1(self, script):
+        val = compose(script)["actor_rollout_ref"]["rollout"]["val_kwargs"]
+        assert (val["temperature"], val["top_p"]) == (1.0, 1.0)
+        val = compose(script, val_temperature="0.8", val_top_p="0.7")["actor_rollout_ref"]["rollout"]["val_kwargs"]
+        assert (val["temperature"], val["top_p"]) == (0.8, 0.7)
 
     def test_validates_and_saves_every_5_steps(self):
         c = compose(QWEN25_TIS)
