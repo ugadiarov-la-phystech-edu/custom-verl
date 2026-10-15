@@ -125,6 +125,7 @@ def get_ppo_ray_runtime_env(config=None):
         "FLASH_ATTENTION_DETERMINISTIC",
         "NCCL_DETERMINISTIC",
         "NCCL_ALGO",
+        "VERL_QWEN2_K_BIAS_CENTER",
     ):
         val = os.environ.get(key)
         if val is not None:

@@ -73,6 +73,11 @@ examples/baselines/run_orz7b_orz72k_grpo_sync_B128xn16_mini32_megatron.sh):
                  stop counts land in groups.jsonl (stop_strings) and metrics.json (stopped_by_string_pct).
   * --max-model-len  cap on prompt + response; ORZ ran generate_max_len=8000 inside max_len=8192, i.e.
                  --max-response-length 8000 --max-model-len 8192 (a response ends at min(8000, 8192 - prompt)).
+  * --qwen2-k-bias-center  fix A for Qwen2.5 + FP8 KV (verl/utils/vllm/qwen2_k_bias_center.py): keys are cached as
+                 RoPE(k) - b_k, which is exact (softmax-invariant) and keeps the FP8 cache usable. Sets
+                 VERL_QWEN2_K_BIAS_CENTER=1 (and VLLM_DISABLE_COMPILE_CACHE=1, so no stale unpatched compiled graph is
+                 reused) for the engine processes; without the flag VERL_QWEN2_K_BIAS_CENTER=0 is forced, so the run's
+                 config in metrics.json always says whether the patch was active.
   Full ORZ emulation for Qwen2.5-7B:
       --model Qwen/Qwen2.5-7B --tokenizer Open-Reasoner-Zero/Open-Reasoner-Zero-7B
       --data /data2/datasets/orz/orz-math-72k.parquet --reward-fn rewards/orz_tag_aware_math.py:compute_score
@@ -197,6 +202,11 @@ def parse_args(argv=None):
         default=None,
         metavar="STR",
         help='stop strings, kept in the response; ORZ: --stop "User:" "Human:" "Assistant:" "</answer>"',
+    )
+    p.add_argument(
+        "--qwen2-k-bias-center",
+        action="store_true",
+        help="cache Qwen2 keys as RoPE(k) - b_k (VERL_QWEN2_K_BIAS_CENTER=1): the exact fix for Qwen2.5 + FP8 KV cache",
     )
     p.add_argument("--n", type=int, default=16, help="responses per prompt (default: %(default)s)")
     p.add_argument("--max-prompt-length", type=int, default=2048, help="longer prompts are filtered out")
@@ -483,6 +493,23 @@ def fmt_line(m):
     )
 
 
+def configure_engine_env(args):
+    """Environment inherited by the spawned GPU workers and their vLLM engine processes."""
+    # vLLM environment of the training launchers (run_qwen3-8b_dapo17k_grpo_sync_*.sh, the replay arms): V1
+    # engine and vLLM's native torch sampler - the FlashInfer sampler JIT-compiles at engine start-up and fails
+    # without a working nvcc. FP8 arms also keep FlashInfer's block-FP8 GEMM off (DeepGEMM runs them).
+    os.environ.setdefault("VLLM_USE_V1", "1")
+    os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
+    if args.fp8_weights:
+        os.environ.setdefault("VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER", "0")
+    # Fix A for Qwen2.5 + FP8 KV, applied in every engine process by the worker extension. The flag is
+    # authoritative (a stray VERL_QWEN2_K_BIAS_CENTER in the shell cannot silently change a run); with the patch
+    # on, vLLM's compile cache is disabled so a graph compiled without it is never reused.
+    os.environ["VERL_QWEN2_K_BIAS_CENTER"] = "1" if args.qwen2_k_bias_center else "0"
+    if args.qwen2_k_bias_center:
+        os.environ["VLLM_DISABLE_COMPILE_CACHE"] = "1"
+
+
 def main(argv=None):
     args = parse_args(argv)
     import torch
@@ -514,13 +541,7 @@ def main(argv=None):
     print(f"[group_outcome_stats] {json.dumps(config)}", flush=True)
     print(f"[group_outcome_stats] output: {out_dir}", flush=True)
 
-    # vLLM environment of the training launchers (run_qwen3-8b_dapo17k_grpo_sync_*.sh, the replay arms): V1
-    # engine and vLLM's native torch sampler - the FlashInfer sampler JIT-compiles at engine start-up and fails
-    # without a working nvcc. FP8 arms also keep FlashInfer's block-FP8 GEMM off (DeepGEMM runs them).
-    os.environ.setdefault("VLLM_USE_V1", "1")
-    os.environ.setdefault("VLLM_USE_FLASHINFER_SAMPLER", "0")
-    if args.fp8_weights:
-        os.environ.setdefault("VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER", "0")
+    configure_engine_env(args)
     # vLLM's engine processes import EXTENSION_CLS (and verl) by name: put the repo root on their path.
     repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     os.environ["PYTHONPATH"] = os.pathsep.join(p for p in (repo_root, os.environ.get("PYTHONPATH")) if p)

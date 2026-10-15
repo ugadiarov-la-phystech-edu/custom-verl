@@ -28,6 +28,7 @@ from vllm.outputs import RequestOutput
 from verl.utils.device import get_device_name, is_npu_available
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack, resolve_weight_name
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+from verl.utils.vllm.qwen2_k_bias_center import maybe_apply_qwen2_k_bias_center
 from verl.utils.vllm.vllm_quant_utils import (
     INT8_QUANT_ENABLED_ENV,
     apply_vllm_quant_patches,
@@ -171,6 +172,8 @@ class vLLMColocateWorkerExtension:
             or is_refit_quant_model(vllm_config)
         ):
             apply_vllm_quant_patches()
+        # 2b. opt-in Qwen2 key-bias centring for FP8 KV caches (VERL_QWEN2_K_BIAS_CENTER=1); must precede model build.
+        maybe_apply_qwen2_k_bias_center()
         # 3. patch QAT (compressed-tensors NVFP4) for dynamic weight loading
         quant_config = getattr(vllm_config, "quant_config", None) if vllm_config else None
         _is_qat_model = getattr(quant_config, "quant_format", None) == "nvfp4-pack-quantized"
