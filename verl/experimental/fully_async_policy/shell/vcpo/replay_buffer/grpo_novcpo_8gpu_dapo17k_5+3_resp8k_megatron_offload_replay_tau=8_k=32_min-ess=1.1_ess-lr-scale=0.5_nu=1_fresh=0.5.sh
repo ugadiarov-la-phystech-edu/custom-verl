@@ -337,6 +337,13 @@ fi
 max_updates=${max_updates:-null}
 epochs=10000000
 # Model versions tick once per UPDATE: validate / checkpoint every 25 updates.
+# Validation sampling (actor_rollout_ref.rollout.val_kwargs): temperature / top_p, env-overridable. The default
+# 0.8 / 0.7 is what every replay arm has validated with; the Qwen2.5-7B wrappers set 1.0 / 1.0 to match the
+# Qwen2.5-7B sync baselines. A non-default pair is tagged in exp_name (" val-t<T>-p<P>").
+val_temperature=${val_temperature:-0.8}
+val_top_p=${val_top_p:-0.7}
+val_tag=""
+if [[ "${val_temperature}" != "0.8" || "${val_top_p}" != "0.7" ]]; then val_tag=" val-t${val_temperature}-p${val_top_p}"; fi
 test_freq=${test_freq:-25}
 save_freq=${save_freq:-25}
 max_actor_ckpt_to_keep=null
@@ -344,7 +351,7 @@ ckpt_save_contents="['hf_model']"
 resume_mode=disable
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 ${model_tag} ${n_gpus_rollout}-${n_gpus_training} tp${train_tp}dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${warmup_tag}${dynbsz_tag}${tis_tag}${quant_tag}${kv_tag}${attn_tag} seed-${SEED}"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 ${model_tag} ${n_gpus_rollout}-${n_gpus_training} tp${train_tp}dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${warmup_tag}${dynbsz_tag}${tis_tag}${quant_tag}${kv_tag}${attn_tag}${val_tag} seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
 # log_dir: TensorBoard (per-update rollout dumps are off: trainer.rollout_data_dir=null); CKPTS_DIR: global_step_N/ checkpoints.
 log_dir=${log_dir:-"logs/${exp_name_safe}"}
@@ -442,8 +449,8 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.top_p=1.0 \
     actor_rollout_ref.rollout.top_k=-1 \
-    actor_rollout_ref.rollout.val_kwargs.temperature=0.8 \
-    actor_rollout_ref.rollout.val_kwargs.top_p=0.7 \
+    actor_rollout_ref.rollout.val_kwargs.temperature=${val_temperature} \
+    actor_rollout_ref.rollout.val_kwargs.top_p=${val_top_p} \
     actor_rollout_ref.rollout.val_kwargs.top_k=-1 \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.n=${val_n:-1} \

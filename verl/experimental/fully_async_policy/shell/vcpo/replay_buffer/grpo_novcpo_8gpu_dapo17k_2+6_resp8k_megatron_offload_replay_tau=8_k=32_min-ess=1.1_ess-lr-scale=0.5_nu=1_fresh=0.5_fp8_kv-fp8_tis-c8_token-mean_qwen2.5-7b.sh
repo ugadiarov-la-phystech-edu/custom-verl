@@ -21,6 +21,8 @@
 #   * DYNAMIC_BSZ_MAX_TOKENS=10240 (4+4 arm: 16384): per-GPU token cap of the training micro-batches, back to the
 #     base launcher's default 2048 + 8192 (the minimum: one full-length sequence).
 #   * test_freq=40, save_freq=40 (4+4 arm: 12): validation and hf_model checkpoints every 40 updates.
+#   * val_temperature=1.0, val_top_p=1.0 (base default 0.8 / 0.7): validation sampling of the Qwen2.5-7B sync
+#     baselines (examples/baselines/run_qwen2.5-7b_*), so AIME avg@32 curves are directly comparable.
 #   * VERL_QWEN2_K_BIAS_CENTER=1: vLLM caches Qwen2 keys as RoPE(k) - b_k (verl/utils/vllm/qwen2_k_bias_center.py).
 #     Without it Qwen2.5-7B's large k_proj bias (up to 414, in the lowest-frequency RoPE pairs) is rounded away by
 #     the fp8_e4m3 KV cache and the rollout collapses (0% accuracy, ~30% truncation, every group all-wrong). The
@@ -70,6 +72,8 @@ export DYNAMIC_BSZ_MAX_TOKENS=${DYNAMIC_BSZ_MAX_TOKENS:-10240}
 export test_freq=${test_freq:-40}
 export save_freq=${save_freq:-40}
 export VERL_QWEN2_K_BIAS_CENTER=${VERL_QWEN2_K_BIAS_CENTER:-1}
+export val_temperature=${val_temperature:-1.0}
+export val_top_p=${val_top_p:-1.0}
 export TEST_FILE=${TEST_FILE:-"['/home/jovyan/datasets/math_datasets/dapo/aime-2024.parquet','/home/jovyan/datasets/math_datasets/dapo/aime-2025.parquet']"}
 
 # Default Hydra override first: a trailing actor_rollout_ref.rollout.max_num_seqs=... on the command line still wins.

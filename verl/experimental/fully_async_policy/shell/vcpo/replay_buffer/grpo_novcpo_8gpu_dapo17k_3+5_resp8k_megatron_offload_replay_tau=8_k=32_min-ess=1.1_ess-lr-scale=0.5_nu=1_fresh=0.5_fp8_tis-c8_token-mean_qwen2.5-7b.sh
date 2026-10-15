@@ -16,6 +16,7 @@
 #   * train_prompt_mini_bsz=35     35 x 16 = 560 sequences per update, 112 per trainer rank (must divide by dp=5;
 #                                  33 x 16 = 528 does not). " B-35 " in exp_name
 #   * test_freq=20, save_freq=20   validation and hf_model checkpoints every 20 updates (TIS-C8 arm: 12)
+#   * val_temperature=1.0, val_top_p=1.0  validation sampling of the Qwen2.5-7B sync baselines (base: 0.8 / 0.7)
 # All env-overridable. Everything else - ROLLOUT_QUANT=fp8, rollout_is_threshold=8, loss_agg_mode=token-mean,
 # DYNAMIC_BSZ=True, H100 emulation (VERL_GPU_MEM_CAP_GB=78, gpu_memory_utilization=0.5), lr_warmup_steps=12,
 # SEED=1, DeepGEMM - is the TIS-C8 arm's; read its header, ..._fp8.sh's and the base arm's.
@@ -56,6 +57,8 @@ export lr_warmup_steps=${lr_warmup_steps:-12}
 export SEED=${SEED:-1}
 export test_freq=${test_freq:-20}
 export save_freq=${save_freq:-20}
+export val_temperature=${val_temperature:-1.0}
+export val_top_p=${val_top_p:-1.0}
 DEEPGEMM_CUDA_HOME=${DEEPGEMM_CUDA_HOME:-/home/jovyan/ugadiarov/cuda-12.9}
 if [[ -z "${CUDA_HOME:-}" && -x "${DEEPGEMM_CUDA_HOME}/bin/nvcc" ]]; then
     export CUDA_HOME="${DEEPGEMM_CUDA_HOME}"
