@@ -50,6 +50,7 @@ QWEN25_2P6_DECOUPLED = (
     "_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.5_fp8_kv-fp8_ppo-decoupled-K4-clip-0.2-0.28-c10_tis-c8_token-mean"
     "_qwen2.5-7b.sh"
 )
+QWEN25_1P7_DECOUPLED = QWEN25_2P6_DECOUPLED.replace("dapo17k_2+6_", "dapo17k_1+7_")
 ALL = [QWEN, PANGU, QWEN_FP8]
 QWEN_ARMS = (QWEN, QWEN_FP8)
 DEEPGEMM_VARS = ("CUDA_HOME", "DG_JIT_CACHE_DIR", "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER")
@@ -1097,3 +1098,108 @@ def test_invalid_objective_knobs_are_rejected(env, message, tmp_path):
     proc = _run(QWEN, env, (), tmp_path)
     assert proc.returncode == 2, proc.stderr[-2000:]
     assert message in proc.stderr
+
+
+# --------------------------------------------------------------------------- decoupled objective, 1+7 layout
+
+LAYOUT_1P7_KEYS = {
+    "rollout.n_gpus_per_node",
+    "trainer.n_gpus_per_node",
+    "actor_rollout_ref.actor.ppo_mini_batch_size",
+    # interpolated from the two above and inert here: the critic's mini-batch follows the actor's (GRPO has no
+    # critic), and rollout.yaml defaults actor_rollout_ref.rollout.n_gpus_per_node to trainer.n_gpus_per_node (the
+    # fully-async rollout replicas are sized by the top-level rollout.n_gpus_per_node)
+    "critic.ppo_mini_batch_size",
+    "actor_rollout_ref.rollout.n_gpus_per_node",
+}
+
+
+class TestDecoupled1p7:
+    def test_layout_and_batches(self):
+        c = compose(QWEN25_1P7_DECOUPLED)
+        assert (c["rollout"]["n_gpus_per_node"], c["trainer"]["n_gpus_per_node"]) == (1, 7)
+        actor = c["actor_rollout_ref"]["actor"]
+        assert actor["ppo_mini_batch_size"] == 35 and actor["megatron"]["tensor_model_parallel_size"] == 1
+        assert c["async_training"]["require_batches"] == 4
+        assert c["async_training"]["concurrent_samples_per_replica"] == 32
+        assert c["actor_rollout_ref"]["rollout"]["max_num_seqs"] == 512
+
+    def test_objective_and_staleness_are_the_2p6_decoupled_arm_s(self):
+        c = compose(QWEN25_1P7_DECOUPLED)
+        corr = c["algorithm"]["rollout_correction"]
+        actor = c["actor_rollout_ref"]["actor"]
+        assert corr["bypass_mode"] is False and corr["rollout_is"] == "token"
+        assert float(corr["rollout_is_threshold"]) == 8.0
+        assert actor["policy_loss"]["loss_mode"] == "vanilla"
+        assert (actor["clip_ratio_low"], actor["clip_ratio_high"], float(actor["clip_ratio_c"])) == (0.2, 0.28, 10.0)
+        a = c["async_training"]
+        assert float(a["staleness_threshold"]) == 8.0
+        assert (a["replay_buffer"]["staleness_threshold"], a["replay_buffer"]["tau"]) == (8, 2)
+        assert (c["trainer"]["test_freq"], c["trainer"]["save_freq"]) == (10, 10)
+
+    def test_differs_from_the_2p6_decoupled_arm_only_in_the_layout(self):
+        assert _differing(compose(QWEN25_2P6_DECOUPLED), compose(QWEN25_1P7_DECOUPLED)) == LAYOUT_1P7_KEYS
+
+    def test_is_the_2p6_decoupled_arm_with_the_layout_knobs(self):
+        layout = {"n_gpus_rollout": "1", "train_prompt_mini_bsz": "35"}
+        assert compose(QWEN25_1P7_DECOUPLED) == compose(QWEN25_2P6_DECOUPLED, **layout)
+
+    def test_name(self):
+        name = compose(QWEN25_1P7_DECOUPLED)["trainer"]["experiment_name"]
+        base = compose(QWEN25_2P6_DECOUPLED)["trainer"]["experiment_name"]
+        assert " 1-7 tp1dp7 hdo B-35 " in name and "ppo-decoupled-K4 clip-0.2-0.28-c10" in name
+        assert name == base.replace(" 2-6 tp1dp6 hdo B-36 ", " 1-7 tp1dp7 hdo B-35 ")
+
+    def test_runs_the_2p6_decoupled_arm(self):
+        lines = (SCRIPTS / QWEN25_1P7_DECOUPLED).read_text().splitlines()
+        execs = [ln for ln in lines if ln.lstrip().startswith("exec ")]
+        assert len(execs) == 1 and QWEN25_2P6_DECOUPLED in execs[0] and execs[0].rstrip().endswith('"$@"')
+
+    def test_trainer_and_rollouter_accept_the_config(self, monkeypatch):
+        from verl.experimental.fully_async_policy import fully_async_rollouter as mod
+        from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
+
+        cfg = _cfg(QWEN25_1P7_DECOUPLED)
+        cfg.trainer.logger = ["console"]
+        trainer_cls = FullyAsyncTrainer.__ray_metadata__.modified_class
+        t = trainer_cls(config=cfg, tokenizer=None, role_worker_mapping={}, resource_pool_manager=None)
+        assert t.replay_objective == "decoupled" and t.replay_update_minibatches == 4
+        assert t.required_samples == 140  # 4 x 35 groups per update
+        assert t.replay_first_mini_size == 70  # 0.5 x 4 mini-batches -> 2 whole mini-batches
+        assert t._replay_min_fresh_groups(t.required_samples) == 70
+
+        rollouter_cls = mod.FullyAsyncRollouter.__ray_metadata__.modified_class
+        monkeypatch.setattr(mod, "create_rl_dataset", lambda *a, **k: [0] * 8)
+        monkeypatch.setattr(mod, "create_rl_sampler", lambda *a, **k: None)
+        monkeypatch.setattr(
+            rollouter_cls, "_create_dataloader", lambda self, *a, **k: setattr(self, "train_dataloader", [0] * 8)
+        )
+        monkeypatch.setattr(rollouter_cls, "_init_dump_executor", lambda self: None)
+        r = rollouter_cls(config=_cfg(QWEN25_1P7_DECOUPLED), tokenizer=None)
+        assert r.required_samples == 140 and r.ramp_first_size == t.replay_first_mini_size == 70
+
+    @pytest.mark.parametrize("mini", ["36", "33"])
+    def test_a_minibatch_that_does_not_split_over_7_ranks_is_rejected_at_launch(self, mini, tmp_path):
+        proc = _run(QWEN25_1P7_DECOUPLED, {"train_prompt_mini_bsz": mini}, (), tmp_path)
+        assert proc.returncode == 2, proc.stderr[-2000:]
+        assert "do not split over 7 trainer DP ranks" in proc.stderr
+
+
+@pytest.mark.parametrize(
+    "script, env",
+    [
+        (QWEN, {}),
+        (QWEN25_2P6_KV, {}),
+        (QWEN25_2P6_DECOUPLED, {}),
+        (QWEN25_1P7_DECOUPLED, {}),
+        (QWEN, {"n_gpus_rollout": "5", "train_prompt_mini_bsz": "33"}),
+    ],
+)
+def test_valid_layouts_pass_the_dp_split_check(script, env):
+    compose(script, **env)  # composes (returncode 0) = the check passed
+
+
+@pytest.mark.parametrize("env", [{"train_prompt_mini_bsz": "0"}, {"train_prompt_mini_bsz": "x"}])
+def test_invalid_minibatch_values_are_rejected(env, tmp_path):
+    proc = _run(QWEN, env, (), tmp_path)
+    assert proc.returncode == 2 and "train_prompt_mini_bsz must be a positive integer" in proc.stderr

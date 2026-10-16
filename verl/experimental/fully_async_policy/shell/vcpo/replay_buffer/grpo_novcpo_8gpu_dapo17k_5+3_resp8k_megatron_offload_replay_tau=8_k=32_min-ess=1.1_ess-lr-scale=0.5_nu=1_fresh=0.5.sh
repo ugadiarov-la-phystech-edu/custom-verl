@@ -128,6 +128,14 @@ precision_dtype="bfloat16"
 train_prompt_bsz=0
 gen_prompt_bsz=1
 train_prompt_mini_bsz=${train_prompt_mini_bsz:-33} # 33*16=528 seqs; mini*n must divide by trainer DP (3 here)
+[[ "${train_prompt_mini_bsz}" =~ ^[1-9][0-9]*$ ]] \
+    || { echo "train_prompt_mini_bsz must be a positive integer, got '${train_prompt_mini_bsz}'" >&2; exit 2; }
+# Fail at launch, not at the first optimizer step (engine_workers.train_mini_batch asserts the same): every optimizer
+# mini-batch of train_prompt_mini_bsz x n sequences must split evenly over the n_gpus_training / train_tp DP ranks.
+if (( (train_prompt_mini_bsz * n_resp_per_prompt) % (n_gpus_training / train_tp) != 0 )); then
+    echo "train_prompt_mini_bsz=${train_prompt_mini_bsz} x n=${n_resp_per_prompt} sequences do not split over $((n_gpus_training / train_tp)) trainer DP ranks" >&2
+    exit 2
+fi
 micro_bsz_per_gpu=1
 log_prob_micro_bsz_per_gpu=1
 # Per-engine in-flight group cap (the source's bsz_per_dp_rank): 5 engines x 33 = 165 groups
