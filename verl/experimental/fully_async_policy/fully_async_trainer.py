@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import asyncio
+import copy
+import dataclasses
 import json
 import logging
 import math
@@ -31,6 +33,7 @@ from verl import DataProto
 from verl.checkpoint_engine import CheckpointEngineManager
 from verl.experimental.fully_async_policy.detach_utils import (
     MetricsAggregator,
+    addition_process,
     assemble_batch_from_rollout_samples,
 )
 from verl.experimental.fully_async_policy.dynamic_schedule import DynamicScheduleContext
@@ -85,6 +88,36 @@ def parse_max_train_steps(value) -> int | None:
     if steps < 1:
         raise ValueError(f"trainer.total_training_steps must be >= 1 or null, got {value!r}")
     return steps
+
+
+
+# Temporary per-row non-tensor key carrying the fresh / replayed tag through batch assembly (concat + balancing).
+_FRESH_TAG_KEY = "_replay_is_fresh"
+
+
+def tag_fresh_rows(entries, n_fresh: int) -> list:
+    """Shallow copies of the entries' RolloutSamples whose rows carry ``_replay_is_fresh`` (True for the first
+    ``n_fresh`` entries, the fresh groups; False for the replayed rest).
+
+    The tag rides in the non-tensor batch, so it follows every row through DataProto.concat and the reordering of
+    batch balancing. The buffered samples are not modified beyond addition_process, which assembly runs on them
+    anyway (idempotent; it moves meta_info metrics into non-tensor fields in place)."""
+    if not 0 <= n_fresh <= len(entries):
+        raise ValueError(f"n_fresh={n_fresh} outside [0, {len(entries)}]")
+    tagged = []
+    for k, e in enumerate(entries):
+        full = addition_process(e.sample.full_batch)
+        # copy.copy, not DataProto(...): the processed group keeps processing_times as a list, which the
+        # constructor's consistency check rejects but DataProto.concat accepts
+        tagged_batch = copy.copy(full)
+        tagged_batch.non_tensor_batch = {**full.non_tensor_batch, _FRESH_TAG_KEY: np.full(len(full), k < n_fresh)}
+        tagged.append(dataclasses.replace(e.sample, full_batch=tagged_batch))
+    return tagged
+
+
+def pop_fresh_tag(batch: DataProto) -> torch.Tensor:
+    """Remove the ``_replay_is_fresh`` rows of an assembled batch and return them as a float (B,) tensor."""
+    return torch.from_numpy(np.asarray(batch.non_tensor_batch.pop(_FRESH_TAG_KEY), dtype=np.float32))
 
 
 class TrainingStopException(Exception):
@@ -307,9 +340,15 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             "(algorithm.rollout_correction.bypass_mode alone never reaches the workers)"
         )
         worker_corr = policy_loss.get("rollout_correction", None)
-        assert worker_corr is not None and worker_corr.get("loss_type", None) == "reinforce", (
+        # Replayed (stale) sequences must train with REINFORCE + truncated IS: either loss_type=reinforce for every
+        # sequence, or loss_type=ppo_clip for the fresh ones with replay_loss_type=reinforce for the replayed ones.
+        replay_objective = None
+        if worker_corr is not None:
+            replay_objective = worker_corr.get("replay_loss_type", None) or worker_corr.get("loss_type", None)
+        assert replay_objective == "reinforce" and worker_corr.get("loss_type", None) in ("reinforce", "ppo_clip"), (
             "replay_buffer mode: pass +actor_rollout_ref.actor.policy_loss.rollout_correction="
-            "'${algorithm.rollout_correction}' with algorithm.rollout_correction.loss_type=reinforce"
+            "'${algorithm.rollout_correction}' with algorithm.rollout_correction.loss_type=reinforce, or with "
+            "loss_type=ppo_clip and replay_loss_type=reinforce (PPO-clip on fresh sequences only)"
         )
 
         self.replay_requires_mini_batches = float(replay_cfg.get("requires_mini_batches", 1.0))
@@ -784,12 +823,18 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.replay_buffer.evict(new_version)
         self.replay_buffer.recompute_scores(new_version)
 
-    def _build_replay_batch(self, entries) -> DataProto:
+    def _build_replay_batch(self, entries, n_fresh: int) -> DataProto:
         """Training batch from buffered groups with the insertion-time statistics frozen by the rollouter:
         advantages broadcast from advantage_scalar, sparse token-level rewards from reward_scalar, and the
-        cached rollout log-probs as the behavior policy (bypass mode) -- nothing is recomputed."""
+        cached rollout log-probs as the behavior policy (bypass mode) -- nothing is recomputed.
+
+        ``entries`` come fresh-first (ReplayBuffer.compose_minibatch); the first ``n_fresh`` are the newly
+        arrived groups. Every row is tagged ``is_fresh`` (1.0 fresh / 0.0 replayed) for the mixed bypass loss
+        (rollout_correction.replay_loss_type)."""
         balance = self._balance_batch if self.config.trainer.balance_batch else None
-        batch = assemble_batch_from_rollout_samples([e.sample for e in entries], self.tokenizer, self.config, balance)
+        samples = tag_fresh_rows(entries, n_fresh)
+        batch = assemble_batch_from_rollout_samples(samples, self.tokenizer, self.config, balance)
+        batch.batch["is_fresh"] = pop_fresh_tag(batch)
         response_mask = batch.batch["response_mask"]
         adv = torch.from_numpy(np.asarray(batch.non_tensor_batch["advantage_scalar"], dtype=np.float32))
         advantages = adv.unsqueeze(-1) * response_mask.float()
@@ -870,7 +915,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 entries, info = await self._acquire_replay_minibatch()
                 if entries is None:
                     raise TrainingStopException("Training terminated: rollout finished and replay buffer drained")
-                batch = self._build_replay_batch(entries)
+                batch = self._build_replay_batch(entries, int(info["n_new"]))
+                self.metrics["replay/minibatch_fresh_seqs"] = int(batch.batch["is_fresh"].sum().item())
                 self._collect_metrics_from_samples(batch, self.metrics)
             _allocated_start = time.time()
             batch = self._fit_compute_log_prob(batch)  # bypass mode: old_log_probs = rollout_log_probs

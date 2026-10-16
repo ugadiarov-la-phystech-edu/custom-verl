@@ -137,6 +137,17 @@ class RolloutCorrectionConfig(BaseConfig):
               L = -E[min(r*A, clip(r)*A)] where r = π_current / π_rollout
             Default: "ppo_clip"
 
+        replay_loss_type (Optional[str]): Loss for the sequences a replay-buffer trainer drew from its
+            buffer (bypass mode only). The trainer tags each sequence of a replay mini-batch as fresh
+            (newly arrived, never trained on) or replayed (batch key ``is_fresh``); fresh sequences use
+            ``loss_type`` and replayed ones this loss, aggregated together in one ``loss_agg_mode`` pass.
+            E.g. ``loss_type="ppo_clip"`` + ``replay_loss_type="reinforce"``: PPO-clip on
+            r = π_current / π_rollout for fresh sequences, REINFORCE with the truncated IS weights for
+            replayed ones (whose ratio would mostly sit outside the clip range).
+            - None: every sequence uses ``loss_type``
+            - "reinforce" / "ppo_clip": as for ``loss_type``
+            Default: None
+
     Example:
         # Create with defaults
         config = RolloutCorrectionConfig()
@@ -182,9 +193,21 @@ class RolloutCorrectionConfig(BaseConfig):
     rollout_rs_threshold: Optional[str | float] = None
     bypass_mode: bool = False
     loss_type: str = "ppo_clip"
+    # Loss of the replayed sequences of a replay-buffer mini-batch (None = loss_type for all); bypass mode only.
+    replay_loss_type: Optional[str] = None
     # Log training/rollout_actor_probs_pearson_corr (Pearson of exp(policy) vs exp(rollout) log-probs over
     # response tokens) from the actor loss, i.e. against the log-probs of the policy being updated.
     log_probs_pearson_corr: bool = False
+
+    def __post_init__(self):
+        if self.replay_loss_type is not None:
+            if self.replay_loss_type not in ("reinforce", "ppo_clip"):
+                raise ValueError(
+                    f"rollout_correction.replay_loss_type must be None, 'reinforce' or 'ppo_clip', "
+                    f"got {self.replay_loss_type!r}"
+                )
+            if not self.bypass_mode:
+                raise ValueError("rollout_correction.replay_loss_type needs bypass_mode=True")
 
     @classmethod
     def decoupled_token_is(cls, threshold: float = 2.0) -> "RolloutCorrectionConfig":

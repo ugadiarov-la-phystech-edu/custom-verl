@@ -264,3 +264,101 @@ class TestEssInputs:
             loss, _ = ppo_loss(_engine_config(ess=ess), model_output, data)
             losses.append(loss.item())
         assert losses[0] == losses[1]
+
+
+# ------------------------------------------------------------------ mixed fresh / replay bypass loss
+FRESH_ROWS = torch.tensor([1, 0, 1, 1, 0, 0, 1, 0], dtype=torch.float32)
+
+
+def _mixed_config(replay_loss_type="reinforce", ess=False, loss_mode="bypass_mode"):
+    return ActorConfig(
+        strategy="megatron",
+        rollout_n=1,
+        ppo_micro_batch_size_per_gpu=1,
+        loss_agg_mode="token-mean",
+        clip_ratio=0.2,
+        clip_ratio_low=0.2,
+        clip_ratio_high=0.28,
+        clip_ratio_c=3.0,
+        ess_scaling=ESSScalingConfig(enable=ess),
+        policy_loss=PolicyLossConfig(
+            loss_mode=loss_mode,
+            rollout_correction=_rollout_correction(loss_type="ppo_clip", replay_loss_type=replay_loss_type),
+        ),
+    )
+
+
+def _mixed_ppo_loss(cfg, rows, *, tag=True, seed=0):
+    policy, rollout, adv, mask = _make_episode(seed=seed)
+    leaf = policy.clone().requires_grad_(True)
+    model_output, data = _batch(rows, leaf, rollout, adv, mask, dp_size=1, global_bsz=len(LENGTHS))
+    if tag:
+        data["is_fresh"] = FRESH_ROWS[list(rows)]
+    loss, metrics = ppo_loss(cfg, model_output, data)
+    loss.backward()
+    return loss.detach(), leaf.grad, metrics, (policy, rollout, adv, mask)
+
+
+class TestMixedFreshReplayLoss:
+    def test_forwards_is_fresh_to_the_bypass_loss(self):
+        from verl.trainer.ppo.core_algos import compute_policy_loss_bypass_mode
+
+        rows = range(len(LENGTHS))
+        cfg = _mixed_config()
+        loss, grad, metrics, (policy, rollout, adv, mask) = _mixed_ppo_loss(cfg, rows)
+        leaf = policy.clone().requires_grad_(True)
+        direct, _ = compute_policy_loss_bypass_mode(
+            old_log_prob=rollout,
+            log_prob=leaf,
+            advantages=adv[:, None] * mask,
+            response_mask=mask.bool(),
+            loss_agg_mode="token-mean",
+            config=cfg,
+            is_fresh=FRESH_ROWS,
+        )
+        direct.backward()
+        torch.testing.assert_close(loss, direct.detach(), rtol=1e-12, atol=1e-12)
+        torch.testing.assert_close(grad, leaf.grad, rtol=1e-12, atol=1e-12)
+        assert metrics["actor/mixed/fresh_token_frac"].values == pytest.approx([
+            float((mask * FRESH_ROWS.double()[:, None]).sum() / mask.sum())
+        ])
+
+    def test_tag_changes_the_loss_only_with_replay_loss_type(self):
+        rows = range(len(LENGTHS))
+        tagged = _mixed_ppo_loss(_mixed_config(), rows)
+        untagged = _mixed_ppo_loss(_mixed_config(), rows, tag=False)
+        assert not torch.allclose(tagged[1], untagged[1])  # fixture: the mix differs from all-ppo_clip
+        off_tagged = _mixed_ppo_loss(_mixed_config(replay_loss_type=None), rows)
+        off_untagged = _mixed_ppo_loss(_mixed_config(replay_loss_type=None), rows, tag=False)
+        torch.testing.assert_close(off_tagged[0], off_untagged[0], rtol=0, atol=0)
+        torch.testing.assert_close(off_tagged[1], off_untagged[1], rtol=0, atol=0)
+        torch.testing.assert_close(untagged[1], off_untagged[1], rtol=0, atol=0)
+
+    @pytest.mark.parametrize("chunks", [[4, 4], [2, 3, 3], [1] * 8])
+    def test_micro_batches_sum_to_the_full_batch(self, chunks):
+        full_loss, full_grad, _, (policy, rollout, adv, mask) = _mixed_ppo_loss(_mixed_config(), range(len(LENGTHS)))
+        leaf = policy.clone().requires_grad_(True)
+        total, start = 0.0, 0
+        for n in chunks:
+            rows = list(range(start, start + n))
+            start += n
+            model_output, data = _batch(rows, leaf, rollout, adv, mask, dp_size=1, global_bsz=len(LENGTHS))
+            data["is_fresh"] = FRESH_ROWS[rows]
+            loss, _ = ppo_loss(_mixed_config(), model_output, data)
+            loss.backward()
+            total = total + loss.detach()
+        torch.testing.assert_close(total, full_loss, rtol=1e-12, atol=1e-12)
+        torch.testing.assert_close(leaf.grad, full_grad, rtol=1e-12, atol=1e-12)
+
+    def test_ess_inputs_unaffected(self):
+        rows = range(len(LENGTHS))
+        tagged = _mixed_ppo_loss(_mixed_config(ess=True), rows)[2]
+        untagged = _mixed_ppo_loss(_mixed_config(ess=True), rows, tag=False)[2]
+        assert tagged[ESS_SEQ_LOG_IS_KEY] == untagged[ESS_SEQ_LOG_IS_KEY]
+
+    def test_other_loss_modes_ignore_the_tag(self):
+        # vanilla has no is_fresh parameter: the tag must not be forwarded
+        rows = range(len(LENGTHS))
+        tagged = _mixed_ppo_loss(_mixed_config(loss_mode="vanilla"), rows)
+        untagged = _mixed_ppo_loss(_mixed_config(loss_mode="vanilla"), rows, tag=False)
+        torch.testing.assert_close(tagged[0], untagged[0], rtol=0, atol=0)

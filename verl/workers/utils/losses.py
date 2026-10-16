@@ -102,6 +102,9 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         fields.append("rollout_is_weights")
     if "ref_log_prob" in data:
         fields.append("ref_log_prob")
+    if "is_fresh" in data:
+        # replay-buffer mini-batches: per-sequence fresh (1) / replayed (0) tag for the mixed bypass loss
+        fields.append("is_fresh")
     if need_rollout_log_probs:
         if "rollout_log_probs" not in data:
             raise ValueError(
@@ -128,6 +131,11 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     loss_mode = config.policy_loss.get("loss_mode", "vanilla")
 
     policy_loss_fn = get_policy_loss_fn(loss_mode)
+    # Only the bypass loss takes the fresh / replayed tag (rollout_correction.replay_loss_type); the other
+    # registered policy losses keep their fixed signature.
+    extra_kwargs = {}
+    if loss_mode == "bypass_mode" and "is_fresh" in data:
+        extra_kwargs["is_fresh"] = data["is_fresh"]
     pg_loss, pg_metrics = policy_loss_fn(
         old_log_prob=old_log_prob,
         log_prob=log_prob,
@@ -136,6 +144,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
         loss_agg_mode=loss_agg_mode,
         config=config,
         rollout_is_weights=rollout_is_weights,
+        **extra_kwargs,
     )
 
     # AggregationType.MEAN for pg metrics: assumes policy_loss_fn normalizes by local_bsz/local_tokens

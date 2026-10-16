@@ -24,6 +24,10 @@ bypass_mode: false
 # - "reinforce": REINFORCE with explicit IS weights (no PPO clipping)
 loss_type: ppo_clip
 
+# Loss of the replayed sequences in a replay-buffer mini-batch (bypass mode only): null = loss_type for every
+# sequence; "reinforce" / "ppo_clip" = that loss for replayed sequences, loss_type for fresh ones
+replay_loss_type: null
+
 # Batch normalize IS weights: false = raw weights, true = normalize to mean=1.0
 rollout_is_batch_normalize: false
 

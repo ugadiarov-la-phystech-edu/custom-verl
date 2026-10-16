@@ -1282,6 +1282,60 @@ def compute_policy_loss(
     return pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower
 
 
+def _ppo_clip_token_losses(
+    old_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    config: ActorConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-token dual-clip PPO losses of compute_policy_loss_vanilla, before IS weights and aggregation.
+
+    Returns (pg_losses, clipped_high, clipped_lower, negative_approx_kl): the loss matrix, the 0/1 indicators
+    behind actor/pg_clipfrac and actor/pg_clipfrac_lower, and the clamped log-ratio log_prob - old_log_prob.
+    """
+    assert not isinstance(config, AlgoConfig)
+    clip_ratio = config.clip_ratio  # Clipping parameter ε for standard PPO. See https://arxiv.org/abs/1707.06347.
+    clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
+    clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
+    clip_ratio_c = config.get(  # Lower bound of the ratio for dual-clip PPO. See https://arxiv.org/pdf/1912.09729.
+        "clip_ratio_c", 3.0
+    )
+
+    cliprange = clip_ratio
+    cliprange_low = clip_ratio_low
+    cliprange_high = clip_ratio_high
+
+    assert clip_ratio_c > 1.0, (
+        "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0,"
+        + f" but get the value: {clip_ratio_c}."
+    )
+
+    negative_approx_kl = log_prob - old_log_prob
+    # Clamp negative_approx_kl for stability
+    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+    ratio = torch.exp(negative_approx_kl)
+
+    pg_losses1 = -advantages * ratio
+    if cliprange_low is None:
+        cliprange_low = cliprange
+    if cliprange_high is None:
+        cliprange_high = cliprange
+    pg_losses2 = -advantages * torch.clamp(
+        ratio, 1 - cliprange_low, 1 + cliprange_high
+    )  # - clip(ratio, 1-cliprange, 1+cliprange) * A
+    clip_pg_losses1 = torch.maximum(
+        pg_losses1, pg_losses2
+    )  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
+    clipped_high = torch.gt(pg_losses2, pg_losses1).float()
+
+    pg_losses3 = -advantages * clip_ratio_c
+    clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
+    clipped_lower = torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float()
+
+    pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+    return pg_losses, clipped_high, clipped_lower, negative_approx_kl
+
+
 @register_policy_loss("vanilla")  # type: ignore[arg-type]
 def compute_policy_loss_vanilla(
     old_log_prob: torch.Tensor,
@@ -1316,49 +1370,12 @@ def compute_policy_loss_vanilla(
     """
 
     assert config is not None
-    assert not isinstance(config, AlgoConfig)
-    clip_ratio = config.clip_ratio  # Clipping parameter ε for standard PPO. See https://arxiv.org/abs/1707.06347.
-    clip_ratio_low = config.clip_ratio_low if config.clip_ratio_low is not None else clip_ratio
-    clip_ratio_high = config.clip_ratio_high if config.clip_ratio_high is not None else clip_ratio
-    clip_ratio_c = config.get(  # Lower bound of the ratio for dual-clip PPO. See https://arxiv.org/pdf/1912.09729.
-        "clip_ratio_c", 3.0
+    pg_losses, clipped_high, clipped_lower, negative_approx_kl = _ppo_clip_token_losses(
+        old_log_prob, log_prob, advantages, config
     )
-
-    cliprange = clip_ratio
-    cliprange_low = clip_ratio_low
-    cliprange_high = clip_ratio_high
-
-    assert clip_ratio_c > 1.0, (
-        "The lower bound of the clip_ratio_c for dual-clip PPO should be greater than 1.0,"
-        + f" but get the value: {clip_ratio_c}."
-    )
-
-    negative_approx_kl = log_prob - old_log_prob
-    # Clamp negative_approx_kl for stability
-    negative_approx_kl = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
-    ratio = torch.exp(negative_approx_kl)
     ppo_kl = verl_F.masked_mean(-negative_approx_kl, response_mask)
-
-    pg_losses1 = -advantages * ratio
-    if cliprange_low is None:
-        cliprange_low = cliprange
-    if cliprange_high is None:
-        cliprange_high = cliprange
-    pg_losses2 = -advantages * torch.clamp(
-        ratio, 1 - cliprange_low, 1 + cliprange_high
-    )  # - clip(ratio, 1-cliprange, 1+cliprange) * A
-    clip_pg_losses1 = torch.maximum(
-        pg_losses1, pg_losses2
-    )  # max(-ratio * A, -clip(ratio, 1-cliprange, 1+cliprange) * A)
-    pg_clipfrac = verl_F.masked_mean(torch.gt(pg_losses2, pg_losses1).float(), response_mask)
-
-    pg_losses3 = -advantages * clip_ratio_c
-    clip_pg_losses2 = torch.min(pg_losses3, clip_pg_losses1)
-    pg_clipfrac_lower = verl_F.masked_mean(
-        torch.gt(clip_pg_losses1, pg_losses3) * (advantages < 0).float(), response_mask
-    )
-
-    pg_losses = torch.where(advantages < 0, clip_pg_losses2, clip_pg_losses1)
+    pg_clipfrac = verl_F.masked_mean(clipped_high, response_mask)
+    pg_clipfrac_lower = verl_F.masked_mean(clipped_lower, response_mask)
 
     # Apply rollout correction weights if provided
     if rollout_is_weights is not None:
@@ -2409,6 +2426,98 @@ def compute_policy_loss_reinforce(
     return pg_loss, pg_metrics
 
 
+_BYPASS_LOSS_TYPES = ("reinforce", "ppo_clip")
+
+
+def _bypass_token_losses(
+    loss_type: str,
+    rollout_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    config: ActorConfig,
+    rollout_is_weights: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-token bypass-mode losses of one loss_type: (pg_losses, clipped_high, clipped_lower).
+
+    "reinforce" = compute_policy_loss_reinforce's -A * log_prob * w (w = the truncated IS weights, none = 1), with
+    zero clip indicators; "ppo_clip" = compute_policy_loss_vanilla's dual-clip losses on r = π_θ / π_rollout,
+    without IS weights (the ratio carries the correction)."""
+    if loss_type == "reinforce":
+        pg_losses = -advantages * log_prob
+        if rollout_is_weights is not None:
+            pg_losses = pg_losses * rollout_is_weights
+        zeros = torch.zeros_like(pg_losses)
+        return pg_losses, zeros, zeros
+    if loss_type == "ppo_clip":
+        pg_losses, clipped_high, clipped_lower, _ = _ppo_clip_token_losses(
+            rollout_log_prob, log_prob, advantages, config
+        )
+        return pg_losses, clipped_high, clipped_lower
+    raise ValueError(f"Invalid loss_type: {loss_type}. Must be 'reinforce' or 'ppo_clip'.")
+
+
+def _bypass_mixed_loss(
+    loss_type: str,
+    replay_loss_type: str,
+    rollout_log_prob: torch.Tensor,
+    log_prob: torch.Tensor,
+    advantages: torch.Tensor,
+    response_mask: torch.Tensor,
+    is_fresh: torch.Tensor,
+    loss_agg_mode: str,
+    config: ActorConfig,
+    rollout_is_weights: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Bypass loss of a replay-buffer mini-batch: loss_type on fresh rows, replay_loss_type on replayed rows.
+
+    The two per-token loss matrices are merged row-wise and aggregated in one agg_loss call with the shared
+    global denominators, so the result equals the single-loss objective on an all-fresh or all-replayed batch and
+    stays exact under micro-batching / data parallelism for every loss_agg_mode.
+
+    Metrics: actor/pg_clipfrac(_lower) over the tokens of PPO-clip rows only (0 when a micro-batch has none),
+    actor/ppo_kl over all tokens, actor/mixed/{fresh,replay}_token_frac (shares of the micro-batch's tokens)."""
+    for name, value in (("loss_type", loss_type), ("replay_loss_type", replay_loss_type)):
+        if value not in _BYPASS_LOSS_TYPES:
+            raise ValueError(f"Invalid {name}: {value}. Must be 'reinforce' or 'ppo_clip'.")
+    fresh = is_fresh.reshape(-1).to(device=log_prob.device, dtype=torch.bool)
+    if fresh.shape[0] != log_prob.shape[0]:
+        raise ValueError(f"is_fresh has {fresh.shape[0]} rows, the batch {log_prob.shape[0]}")
+    fresh_rows = fresh.unsqueeze(-1)
+
+    fresh_losses, fresh_hi, fresh_lo = _bypass_token_losses(
+        loss_type, rollout_log_prob, log_prob, advantages, config, rollout_is_weights
+    )
+    replay_losses, replay_hi, replay_lo = _bypass_token_losses(
+        replay_loss_type, rollout_log_prob, log_prob, advantages, config, rollout_is_weights
+    )
+    pg_losses = torch.where(fresh_rows, fresh_losses, replay_losses)
+    pg_loss = agg_loss(
+        loss_mat=pg_losses, loss_mask=response_mask, loss_agg_mode=loss_agg_mode, **config.global_batch_info
+    )
+
+    with torch.no_grad():
+        mask = response_mask.to(log_prob.dtype)
+        fresh_mask = mask * fresh_rows.to(mask.dtype)
+        replay_mask = mask - fresh_mask
+        clip_mask = fresh_mask * float(loss_type == "ppo_clip") + replay_mask * float(replay_loss_type == "ppo_clip")
+        clipped_high = torch.where(fresh_rows, fresh_hi, replay_hi)
+        clipped_lower = torch.where(fresh_rows, fresh_lo, replay_lo)
+        n_tokens = mask.sum().item()
+        n_clip = clip_mask.sum().item()
+
+        def frac(num: torch.Tensor, den: float) -> float:
+            return num.sum().item() / den if den > 0 else 0.0
+
+        pg_metrics = {
+            "actor/pg_clipfrac": frac(clipped_high * clip_mask, n_clip),
+            "actor/pg_clipfrac_lower": frac(clipped_lower * clip_mask, n_clip),
+            "actor/ppo_kl": frac((rollout_log_prob - log_prob) * mask, n_tokens),
+            "actor/mixed/fresh_token_frac": frac(fresh_mask, n_tokens),
+            "actor/mixed/replay_token_frac": frac(replay_mask, n_tokens),
+        }
+    return pg_loss, pg_metrics
+
+
 @register_policy_loss("bypass_mode")
 def compute_policy_loss_bypass_mode(
     old_log_prob: torch.Tensor,
@@ -2418,6 +2527,7 @@ def compute_policy_loss_bypass_mode(
     loss_agg_mode: str = "token-mean",
     config: Optional[ActorConfig] = None,
     rollout_is_weights: torch.Tensor | None = None,
+    is_fresh: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     """Bypass mode policy loss supporting both REINFORCE and PPO-clip.
 
@@ -2452,9 +2562,14 @@ def compute_policy_loss_bypass_mode(
         loss_agg_mode: Loss aggregation mode (passed to underlying loss function).
         config: Actor config containing rollout_correction settings in policy_loss.
         rollout_is_weights: Pre-computed IS weights (ignored, computed internally).
+        is_fresh: Per-sequence fresh (1) / replayed (0) tag of a replay-buffer mini-batch, shape (batch_size,).
+            Used only with ``replay_loss_type`` set; None = every sequence uses ``loss_type``.
 
     Config options (in config.policy_loss.rollout_correction):
-        loss_type: "ppo_clip" (default) or "reinforce"
+        loss_type: "ppo_clip" (default) or "reinforce"; with replay_loss_type set, the loss of fresh sequences
+        replay_loss_type: None (default) or "ppo_clip" / "reinforce": the loss of replayed sequences
+            (is_fresh == 0). Both parts are aggregated in ONE agg_loss pass, so the batch is weighted exactly as
+            a single-loss batch would be (each sequence is wholly fresh or wholly replayed).
         rollout_is: IS aggregation level ("token", "sequence", or None)
         rollout_is_threshold: Upper threshold for truncating IS weights (default: 2.0)
         rollout_rs: Rejection sampling level (see rollout_corr_helper for supported modes)
@@ -2481,6 +2596,7 @@ def compute_policy_loss_bypass_mode(
 
     # Extract parameters
     loss_type = rollout_corr_config.get("loss_type", "ppo_clip")
+    replay_loss_type = rollout_corr_config.get("replay_loss_type", None)
     rollout_is = rollout_corr_config.get("rollout_is", None)
     rollout_is_threshold = rollout_corr_config.get("rollout_is_threshold", 2.0)
     rollout_is_batch_normalize = rollout_corr_config.get("rollout_is_batch_normalize", False)
@@ -2511,6 +2627,23 @@ def compute_policy_loss_bypass_mode(
 
     # Apply rejection mask (RS + veto)
     effective_mask = modified_response_mask
+
+    if replay_loss_type is not None and is_fresh is not None:
+        # Replay-buffer mini-batch: loss_type for fresh sequences, replay_loss_type for replayed ones.
+        pg_loss, pg_metrics = _bypass_mixed_loss(
+            loss_type=loss_type,
+            replay_loss_type=replay_loss_type,
+            rollout_log_prob=rollout_log_prob,
+            log_prob=log_prob,
+            advantages=advantages,
+            response_mask=effective_mask,
+            is_fresh=is_fresh,
+            loss_agg_mode=loss_agg_mode,
+            config=config,
+            rollout_is_weights=computed_is_weights,
+        )
+        pg_metrics.update(rollout_metrics)
+        return pg_loss, pg_metrics
 
     # Dispatch to appropriate loss function based on loss_type
     if loss_type == "reinforce":

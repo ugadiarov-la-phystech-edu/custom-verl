@@ -119,12 +119,25 @@ class TestInit:
             ("algorithm.rollout_correction.bypass_mode=False", "bypass_mode=True"),
             ("actor_rollout_ref.actor.policy_loss.loss_mode=vanilla", "loss_mode=bypass_mode"),
             ("algorithm.rollout_correction.loss_type=ppo_clip", "reinforce"),
+            (
+                "algorithm.rollout_correction.replay_loss_type=ppo_clip",
+                "replay_loss_type=reinforce",
+            ),
             ("async_training.use_dynamic_resource_scheduling=True", "dynamic_resource"),
         ],
     )
     def test_rejects_settings_the_replay_loop_does_not_support(self, override, match):
         with pytest.raises(AssertionError, match=match):
             _init_trainer([override])
+
+    def test_accepts_ppo_clip_on_fresh_with_reinforce_on_replayed(self):
+        t = _init_trainer(
+            [
+                "algorithm.rollout_correction.loss_type=ppo_clip",
+                "algorithm.rollout_correction.replay_loss_type=reinforce",
+            ]
+        )
+        assert t.replay_enable
 
     def test_rejects_missing_worker_side_rollout_correction(self):
         base = [o for o in REPLAY_ARM if not o.startswith("+actor_rollout_ref.actor.policy_loss.rollout_correction")]
@@ -386,7 +399,7 @@ class TestBatchAndMaintenance:
     def test_batch_uses_frozen_statistics(self):
         t = _bare_trainer()
         entries = [SimpleNamespace(sample=ray.cloudpickle.loads(_sample(0, scores=(1.0, 0.0, 0.0, 1.0))))]
-        batch = t._build_replay_batch(entries)
+        batch = t._build_replay_batch(entries, 1)
         mask = batch.batch["response_mask"].float()
         adv = torch.as_tensor(batch.non_tensor_batch["advantage_scalar"])
         torch.testing.assert_close(batch.batch["advantages"], adv[:, None] * mask)
@@ -402,9 +415,56 @@ class TestBatchAndMaintenance:
     def test_a_group_can_be_assembled_again(self):
         t = _bare_trainer()
         entry = SimpleNamespace(sample=ray.cloudpickle.loads(_sample(0)))
-        first = t._build_replay_batch([entry])
-        second = t._build_replay_batch([entry])
+        first = t._build_replay_batch([entry], 1)
+        second = t._build_replay_batch([entry], 0)
         torch.testing.assert_close(first.batch["advantages"], second.batch["advantages"])
+        # fresh in one mini-batch, replayed in the next: the tag follows the call, not the stored sample
+        assert first.batch["is_fresh"].tolist() == [1.0] * N and second.batch["is_fresh"].tolist() == [0.0] * N
+
+    @pytest.mark.parametrize("n_fresh", [0, 1, 2, 3])
+    def test_rows_are_tagged_fresh_or_replayed(self, n_fresh):
+        t = _bare_trainer()
+        entries = [SimpleNamespace(sample=ray.cloudpickle.loads(_sample(v))) for v in range(3)]
+        batch = t._build_replay_batch(entries, n_fresh)
+        fresh_uids = {f"u{v}" for v in range(n_fresh)}
+        want = [float(u in fresh_uids) for u in batch.non_tensor_batch["uid"]]
+        assert batch.batch["is_fresh"].dtype == torch.float32 and batch.batch["is_fresh"].tolist() == want
+        assert "_replay_is_fresh" not in batch.non_tensor_batch
+
+    def test_tag_survives_batch_balancing(self):
+        t = _bare_trainer()
+        t.config.trainer.balance_batch = True
+        perm = torch.randperm(3 * N, generator=torch.Generator().manual_seed(0))
+
+        def shuffle(batch, metrics):  # what _balance_batch does: reorder all rows in place
+            batch.reorder(perm)
+
+        t._balance_batch = shuffle
+        entries = [SimpleNamespace(sample=ray.cloudpickle.loads(_sample(v))) for v in range(3)]
+        batch = t._build_replay_batch(entries, 2)
+        assert batch.non_tensor_batch["uid"].tolist() != sorted(batch.non_tensor_batch["uid"].tolist())
+        want = [float(u in {"u0", "u1"}) for u in batch.non_tensor_batch["uid"]]
+        assert batch.batch["is_fresh"].tolist() == want
+
+    def test_same_uid_groups_are_tagged_by_position(self):
+        # two buffered groups of one prompt (same uid): fresh / replayed follows the entry, not the uid
+        t = _bare_trainer()
+        entries = [SimpleNamespace(sample=ray.cloudpickle.loads(_sample(0))) for _ in range(2)]
+        batch = t._build_replay_batch(entries, 1)
+        assert batch.batch["is_fresh"].tolist() == [1.0] * N + [0.0] * N
+
+    def test_stored_samples_are_not_tagged(self):
+        t = _bare_trainer()
+        sample = ray.cloudpickle.loads(_sample(0))
+        t._build_replay_batch([SimpleNamespace(sample=sample)], 1)
+        assert "_replay_is_fresh" not in sample.full_batch.non_tensor_batch
+        assert "is_fresh" not in sample.full_batch.batch.keys()
+
+    @pytest.mark.parametrize("n_fresh", [-1, 2])
+    def test_n_fresh_out_of_range(self, n_fresh):
+        t = _bare_trainer()
+        with pytest.raises(ValueError, match="n_fresh"):
+            t._build_replay_batch([SimpleNamespace(sample=ray.cloudpickle.loads(_sample(0)))], n_fresh)
 
     def test_maintenance_marks_before_evicting(self):
         t = _bare_trainer()
@@ -478,6 +538,7 @@ class TestReplayStep:
 
         def update_actor(batch, mini_batch_size=None):
             calls.append(("update_actor", len(batch), mini_batch_size))
+            t.seen_is_fresh = batch.batch["is_fresh"].tolist()
             return DataProto(meta_info={"metrics": {"actor/pg_loss": [0.1]}})
 
         t._update_actor = update_actor
@@ -514,6 +575,8 @@ class TestReplayStep:
         metrics = t.calls[5][1]
         assert metrics["actor/pg_loss"] == pytest.approx(0.1)
         assert metrics["replay/minibatch_size"] == 2
+        assert metrics["replay/minibatch_fresh_seqs"] == 2 * N  # both groups are fresh (n_new=2)
+        assert t.seen_is_fresh == [1.0] * (2 * N)
 
     def test_end_signal_stops_training(self):
         t = self._trainer(entries=False)

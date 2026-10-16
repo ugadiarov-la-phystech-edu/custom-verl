@@ -23,7 +23,9 @@
 #     18 x 16 sequences split over the 3 trainer ranks), full 33-group mini-batches afterwards;
 #   * rollouter insertion gate: groups whose 16 rewards are all equal are dropped (their generation
 #     quota slot is released); kept groups carry frozen GRPO advantages; one update per weight sync;
-#   * objective: REINFORCE with token-level truncated IS (C=2) against the cached rollout log-probs;
+#   * objective: REINFORCE with token-level truncated IS (C=2) against the cached rollout log-probs
+#     (loss_type=ppo_clip + replay_loss_type=reinforce + clip_ratio_low / clip_ratio_high switch the fresh
+#     sequences to PPO-clip on pi_theta / pi_rollout; see the "IS / Rollout Correction" block);
 #   * min-ESS brake: the sequence-level Kish ESS of the mini-batch's IS weights (unclipped) is measured
 #     before each optimizer step; ESS <= min_ess (1.1 effective samples, i.e. near the structural floor of
 #     1) steps at lr * 0.5, every other step at the full lr. Logged: staleness/ess, actor/ess_lr_mult,
@@ -174,8 +176,14 @@ esac
 adv_estimator=grpo
 loss_agg_mode=${loss_agg_mode:-"seq-mean-token-mean"}
 clip_ratio=0.2
-clip_ratio_low=0.2
-clip_ratio_high=0.2
+# PPO-clip range on r = pi_theta / pi_rollout; used only where loss_type / replay_loss_type is ppo_clip (the
+# default REINFORCE objective has no ratio clip). DAPO's clip-higher: clip_ratio_high=0.28.
+clip_ratio_low=${clip_ratio_low:-0.2}
+clip_ratio_high=${clip_ratio_high:-0.2}
+for _v in "${clip_ratio_low}" "${clip_ratio_high}"; do
+    [[ "${_v}" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk "BEGIN{exit !(${_v} > 0 && ${_v} < 1)}" \
+        || { echo "clip_ratio_low / clip_ratio_high must be numbers in (0, 1), got '${_v}'" >&2; exit 2; }
+done
 clip_ratio_c=3.0
 use_kl_loss=False
 kl_loss_coef=0.0
@@ -206,7 +214,23 @@ ess_tag="min-ess-${min_ess}-lrscale-${ess_lr_scale}"
 # ================= IS / Rollout Correction =================
 # REINFORCE with token-level truncated IS against the cached behavior (rollout) log-probs.
 bypass_mode=True
-loss_type=reinforce
+# loss_type: objective of every sequence (default reinforce), or, with replay_loss_type set, of the FRESH
+# sequences of each mini-batch only (newly arrived groups, tagged is_fresh by the trainer). replay_loss_type:
+# objective of the REPLAYED sequences (null = loss_type for all). E.g. loss_type=ppo_clip replay_loss_type=reinforce
+# clip_ratio_high=0.28: PPO-clip with clip-higher on fresh sequences, REINFORCE + token TIS on replayed ones.
+# Tagged in exp_name when not the default (" fresh-ppoclip-0.2-0.28 replay-reinforce", " ppoclip-0.2-0.28"). The
+# replay trainer requires REINFORCE on replayed sequences (loss_type=reinforce, or replay_loss_type=reinforce).
+loss_type=${loss_type:-reinforce}
+replay_loss_type=${replay_loss_type:-null}
+case "${loss_type}" in reinforce|ppo_clip) ;; *) echo "loss_type must be reinforce or ppo_clip, got '${loss_type}'" >&2; exit 2 ;; esac
+case "${replay_loss_type}" in null|reinforce|ppo_clip) ;; *) echo "replay_loss_type must be null, reinforce or ppo_clip, got '${replay_loss_type}'" >&2; exit 2 ;; esac
+_loss_short() { if [[ "$1" == ppo_clip ]]; then echo "ppoclip-${clip_ratio_low}-${clip_ratio_high}"; else echo "$1"; fi; }
+loss_tag=""
+if [[ "${replay_loss_type}" != null ]]; then
+    loss_tag=" fresh-$(_loss_short "${loss_type}") replay-$(_loss_short "${replay_loss_type}")"
+elif [[ "${loss_type}" != reinforce ]]; then
+    loss_tag=" $(_loss_short "${loss_type}")"
+fi
 rollout_is="token"
 # TIS cap C (the source arm's 2.0). It bounds the FULL ratio pi_theta / pi_rollout, i.e. staleness (groups up to
 # k versions old) as well as any rollout/trainer numerical mismatch. Tagged " tis-C<value>" in exp_name when not 2.0.
@@ -351,7 +375,7 @@ ckpt_save_contents="['hf_model']"
 resume_mode=disable
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 ${model_tag} ${n_gpus_rollout}-${n_gpus_training} tp${train_tp}dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${warmup_tag}${dynbsz_tag}${tis_tag}${quant_tag}${kv_tag}${attn_tag}${val_tag} seed-${SEED}"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 ${model_tag} ${n_gpus_rollout}-${n_gpus_training} tp${train_tp}dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${warmup_tag}${dynbsz_tag}${tis_tag}${loss_tag}${quant_tag}${kv_tag}${attn_tag}${val_tag} seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
 # log_dir: TensorBoard (per-update rollout dumps are off: trainer.rollout_data_dir=null); CKPTS_DIR: global_step_N/ checkpoints.
 log_dir=${log_dir:-"logs/${exp_name_safe}"}
@@ -384,6 +408,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     algorithm.kl_ctrl.kl_coef=${kl_coef} \
     algorithm.rollout_correction.bypass_mode=${bypass_mode} \
     algorithm.rollout_correction.loss_type=${loss_type} \
+    algorithm.rollout_correction.replay_loss_type=${replay_loss_type} \
     algorithm.rollout_correction.rollout_is=${rollout_is} \
     algorithm.rollout_correction.rollout_is_threshold=${rollout_is_threshold} \
     algorithm.rollout_correction.rollout_rs=${rollout_rs} \

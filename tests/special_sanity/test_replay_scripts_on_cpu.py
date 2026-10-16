@@ -41,6 +41,15 @@ QWEN25_FP8_C8 = (
     "grpo_novcpo_8gpu_dapo17k_3+5_resp8k_megatron_offload_replay_tau=8_k=32"
     "_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.5_fp8_tis-c8_token-mean_qwen2.5-7b.sh"
 )
+QWEN25_2P6 = (
+    "grpo_novcpo_8gpu_dapo17k_2+6_resp8k_megatron_offload_replay_tau=8_k=32"
+    "_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.5_fp8_kv-fp8_tis-c8_token-mean_qwen2.5-7b.sh"
+)
+QWEN25_2P6_MIXED = (
+    "grpo_novcpo_8gpu_dapo17k_2+6_resp8k_megatron_offload_replay_tau=8_k=32"
+    "_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.5_fp8_kv-fp8_fresh-ppoclip-0.2-0.28_replay-tis-c8_token-mean"
+    "_qwen2.5-7b.sh"
+)
 ALL = [QWEN, PANGU, QWEN_FP8]
 QWEN_ARMS = (QWEN, QWEN_FP8)
 DEEPGEMM_VARS = ("CUDA_HOME", "DG_JIT_CACHE_DIR", "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER")
@@ -80,6 +89,14 @@ SCRIPT_ENV_KNOBS = {
     "ATTN_BACKEND",
     "VLLM_LOG_STATS",
     "ROLLOUT_MAX_MODEL_LEN",
+    "ROLLOUT_MAX_NUM_SEQS",
+    "VERL_QWEN2_K_BIAS_CENTER",
+    "val_temperature",
+    "val_top_p",
+    "loss_type",
+    "replay_loss_type",
+    "clip_ratio_low",
+    "clip_ratio_high",
     *DEEPGEMM_VARS,
 }
 
@@ -929,3 +946,110 @@ def test_invalid_engine_knobs_are_rejected(script, env, message, tmp_path):
     proc = _run(script, env, (), tmp_path)
     assert proc.returncode == 2
     assert message in proc.stderr
+
+
+# --------------------------------------------------------------------------- mixed fresh / replay objective
+
+
+MIXED_KNOBS = {"loss_type": "ppo_clip", "replay_loss_type": "reinforce", "clip_ratio_low": "0.2", "clip_ratio_high": "0.28"}
+MIXED_KEYS = {
+    "algorithm.rollout_correction.loss_type",
+    "algorithm.rollout_correction.replay_loss_type",
+    "actor_rollout_ref.actor.policy_loss.rollout_correction.loss_type",
+    "actor_rollout_ref.actor.policy_loss.rollout_correction.replay_loss_type",
+    "actor_rollout_ref.actor.clip_ratio_high",
+}
+
+
+class TestMixedFreshReplayObjective:
+    def test_objective(self):
+        c = compose(QWEN25_2P6_MIXED)
+        for corr in (c["algorithm"]["rollout_correction"], c["actor_rollout_ref"]["actor"]["policy_loss"]["rollout_correction"]):
+            assert (corr["loss_type"], corr["replay_loss_type"], corr["bypass_mode"]) == ("ppo_clip", "reinforce", True)
+            assert corr["rollout_is"] == "token" and float(corr["rollout_is_threshold"]) == 8.0
+        actor = c["actor_rollout_ref"]["actor"]
+        assert (actor["clip_ratio_low"], actor["clip_ratio_high"], actor["clip_ratio_c"]) == (0.2, 0.28, 3.0)
+        assert actor["policy_loss"]["loss_mode"] == "bypass_mode" and actor["loss_agg_mode"] == "token-mean"
+
+    def test_name(self):
+        name = compose(QWEN25_2P6_MIXED)["trainer"]["experiment_name"]
+        assert " tis-C8 fresh-ppoclip-0.2-0.28 replay-reinforce rollout-fp8 kv-fp8_e4m3 " in name
+        assert " Qwen2.5-7B 2-6 tp1dp6 " in name
+
+    def test_differs_from_the_2p6_arm_only_in_the_objective(self):
+        assert _differing(compose(QWEN25_2P6), compose(QWEN25_2P6_MIXED)) == MIXED_KEYS
+
+    def test_equals_the_2p6_arm_with_the_knobs(self):
+        assert compose(QWEN25_2P6_MIXED) == compose(QWEN25_2P6, **MIXED_KNOBS)
+
+    def test_exports_only_the_objective_and_runs_the_2p6_arm(self):
+        lines = (SCRIPTS / QWEN25_2P6_MIXED).read_text().splitlines()
+        exports = {ln.split("=", 1)[0].removeprefix("export ") for ln in lines if ln.startswith("export ")}
+        assert exports == set(MIXED_KNOBS)
+        execs = [ln for ln in lines if ln.lstrip().startswith("exec ")]
+        assert len(execs) == 1 and QWEN25_2P6 in execs[0] and execs[0].rstrip().endswith('"$@"')
+
+    def test_knobs_and_trailing_overrides_still_apply(self):
+        c = compose(QWEN25_2P6_MIXED, replay_loss_type="null")
+        assert c["algorithm"]["rollout_correction"]["replay_loss_type"] is None
+        assert " ppoclip-0.2-0.28 " in c["trainer"]["experiment_name"]
+        assert "replay-reinforce" not in c["trainer"]["experiment_name"]
+        c = compose(QWEN25_2P6_MIXED, clip_ratio_high="0.3")
+        assert c["actor_rollout_ref"]["actor"]["clip_ratio_high"] == 0.3
+        assert " fresh-ppoclip-0.2-0.3 replay-reinforce " in c["trainer"]["experiment_name"]
+        c = compose(QWEN25_2P6_MIXED, args=("actor_rollout_ref.actor.clip_ratio_high=0.25",))
+        assert c["actor_rollout_ref"]["actor"]["clip_ratio_high"] == 0.25
+
+    def test_trainer_and_worker_accept_the_config(self):
+        from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
+        from verl.trainer.config.algorithm import RolloutCorrectionConfig
+        from verl.utils.config import omega_conf_to_dataclass
+
+        cfg = _cfg(QWEN25_2P6_MIXED)
+        actor = omega_conf_to_dataclass(cfg.actor_rollout_ref.actor)
+        assert actor.clip_ratio_high == 0.28
+        assert actor.policy_loss.rollout_correction["replay_loss_type"] == "reinforce"
+        # the composed values pass the config's own validation (replay_loss_type needs bypass_mode=True)
+        fields = {k: v for k, v in OmegaConf.to_container(cfg.algorithm.rollout_correction).items() if k != "_target_"}
+        corr = RolloutCorrectionConfig(**fields)
+        assert corr.replay_loss_type == "reinforce" and corr.loss_type == "ppo_clip" and corr.bypass_mode
+        cfg.trainer.logger = ["console"]
+        trainer_cls = FullyAsyncTrainer.__ray_metadata__.modified_class
+        t = trainer_cls(config=cfg, tokenizer=None, role_worker_mapping={}, resource_pool_manager=None)
+        assert t.replay_enable
+
+
+class TestObjectiveKnobsOnTheBase:
+    @pytest.mark.parametrize("script", [QWEN, QWEN_FP8_C8, QWEN25_FP8_C8, QWEN25_2P6])
+    def test_defaults_unchanged(self, script):
+        c = compose(script)
+        corr = c["algorithm"]["rollout_correction"]
+        assert (corr["loss_type"], corr["replay_loss_type"]) == ("reinforce", None)
+        actor = c["actor_rollout_ref"]["actor"]
+        assert (actor["clip_ratio_low"], actor["clip_ratio_high"]) == (0.2, 0.2)
+        name = c["trainer"]["experiment_name"]
+        assert "ppoclip" not in name and "replay-reinforce" not in name and "fresh-reinforce" not in name
+
+    def test_plain_ppo_clip_is_tagged(self):
+        c = compose(QWEN, loss_type="ppo_clip")
+        assert c["algorithm"]["rollout_correction"]["loss_type"] == "ppo_clip"
+        assert c["algorithm"]["rollout_correction"]["replay_loss_type"] is None
+        assert " ppoclip-0.2-0.2 " in c["trainer"]["experiment_name"]
+
+    def test_reinforce_on_fresh_ppo_clip_on_replay(self):
+        c = compose(QWEN, replay_loss_type="ppo_clip", clip_ratio_high="0.28")
+        assert " fresh-reinforce replay-ppoclip-0.2-0.28 " in c["trainer"]["experiment_name"]
+
+    @pytest.mark.parametrize(
+        "env, message",
+        [
+            ({"loss_type": "vanilla"}, "loss_type must be reinforce or ppo_clip"),
+            ({"replay_loss_type": "none"}, "replay_loss_type must be null, reinforce or ppo_clip"),
+            ({"clip_ratio_high": "1.5"}, "clip_ratio_low / clip_ratio_high must be numbers in (0, 1)"),
+            ({"clip_ratio_low": "abc"}, "clip_ratio_low / clip_ratio_high must be numbers in (0, 1)"),
+            ({"clip_ratio_high": "0"}, "clip_ratio_low / clip_ratio_high must be numbers in (0, 1)"),
+        ],
+    )
+    def test_invalid_values_are_rejected(self, env, message, tmp_path):
+        proc = _run(QWEN, env, (), tmp_path)
+        assert proc.returncode == 2 and message in proc.stderr

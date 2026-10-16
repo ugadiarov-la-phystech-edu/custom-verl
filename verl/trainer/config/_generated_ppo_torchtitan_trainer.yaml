@@ -785,6 +785,7 @@ algorithm:
     rollout_rs_threshold: null
     bypass_mode: false
     loss_type: ppo_clip
+    replay_loss_type: null
     rollout_is_batch_normalize: false
     log_probs_pearson_corr: false
   _target_: verl.trainer.config.AlgoConfig
