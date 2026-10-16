@@ -173,10 +173,18 @@ esac
 # ================= Algorithm =================
 adv_estimator=grpo
 loss_agg_mode=${loss_agg_mode:-"seq-mean-token-mean"}
-clip_ratio=0.2
-clip_ratio_low=0.2
-clip_ratio_high=0.2
-clip_ratio_c=3.0
+# PPO clip band and dual-clip bound: inert under the bypass REINFORCE objective (no ratio clip), the clip of the
+# decoupled objective (OBJECTIVE=decoupled, see "IS / Rollout Correction"). Tagged with it.
+clip_ratio_low=${clip_ratio_low:-0.2}
+clip_ratio_high=${clip_ratio_high:-0.2}
+clip_ratio_c=${clip_ratio_c:-3.0}
+for _v in "${clip_ratio_low}" "${clip_ratio_high}"; do
+    [[ "${_v}" =~ ^0?\.[0-9]+$ ]] && awk "BEGIN{exit !(${_v} > 0 && ${_v} < 1)}" \
+        || { echo "clip_ratio_low / clip_ratio_high must be in (0, 1), got '${_v}'" >&2; exit 2; }
+done
+[[ "${clip_ratio_c}" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk "BEGIN{exit !(${clip_ratio_c} > 1)}" \
+    || { echo "clip_ratio_c must be a number > 1, got '${clip_ratio_c}'" >&2; exit 2; }
+clip_ratio=${clip_ratio_low}
 use_kl_loss=False
 kl_loss_coef=0.0
 use_kl_in_reward=False
@@ -204,9 +212,32 @@ ess_use_clipped=False # ESS of unclipped ratios: the brake must see what truncat
 ess_tag="min-ess-${min_ess}-lrscale-${ess_lr_scale}"
 
 # ================= IS / Rollout Correction =================
-# REINFORCE with token-level truncated IS against the cached behavior (rollout) log-probs.
-bypass_mode=True
+# OBJECTIVE=bypass (default): REINFORCE with token-level truncated IS against the cached behavior (rollout)
+#   log-probs, min(pi_theta / pi_rollout, C), one optimizer mini-batch per update (bypass_mode=True,
+#   policy_loss.loss_mode=bypass_mode, loss_type=reinforce).
+# OBJECTIVE=decoupled: the sync PPO recipe (examples/baselines/run_qwen2.5-7b_*_sync_tis_*). The trainer recomputes
+#   pi_old once per update (its weights at the start of the update, an extra forward pass), the update is split into
+#   UPDATE_MINIBATCHES optimizer mini-batches of train_prompt_mini_bsz groups each, PPO-clipped on pi_theta / pi_old
+#   (clip_ratio_low / clip_ratio_high / clip_ratio_c, policy_loss.loss_mode=vanilla) and weighted by the token TIS
+#   min(pi_old / pi_rollout, C) (bypass_mode=False). Weights sync once per update, so an update consumes
+#   UPDATE_MINIBATCHES x train_prompt_mini_bsz groups and the fresh-share gate is that many times larger. With
+#   UPDATE_MINIBATCHES=1 pi_theta == pi_old at the gradient and the clip never acts. The ESS brake still measures the
+#   mini-batch's pi_theta / pi_rollout per optimizer step. Tagged " ppo-decoupled-K<K> clip-<low>-<high>-c<c>".
+OBJECTIVE=${OBJECTIVE:-bypass}
+UPDATE_MINIBATCHES=${UPDATE_MINIBATCHES:-1}
+[[ "${UPDATE_MINIBATCHES}" =~ ^[1-9][0-9]*$ ]] \
+    || { echo "UPDATE_MINIBATCHES must be a positive integer, got '${UPDATE_MINIBATCHES}'" >&2; exit 2; }
 loss_type=reinforce
+case "${OBJECTIVE}" in
+    bypass)
+        (( UPDATE_MINIBATCHES == 1 )) \
+            || { echo "UPDATE_MINIBATCHES > 1 needs OBJECTIVE=decoupled (got ${UPDATE_MINIBATCHES} with bypass)" >&2; exit 2; }
+        bypass_mode=True; policy_loss_mode=bypass_mode; objective_tag="" ;;
+    decoupled)
+        bypass_mode=False; policy_loss_mode=vanilla
+        objective_tag=" ppo-decoupled-K${UPDATE_MINIBATCHES} clip-${clip_ratio_low}-${clip_ratio_high}-c${clip_ratio_c}" ;;
+    *) echo "OBJECTIVE must be bypass or decoupled, got '${OBJECTIVE}'" >&2; exit 2 ;;
+esac
 rollout_is="token"
 # TIS cap C (the source arm's 2.0). It bounds the FULL ratio pi_theta / pi_rollout, i.e. staleness (groups up to
 # k versions old) as well as any rollout/trainer numerical mismatch. Tagged " tis-C<value>" in exp_name when not 2.0.
@@ -287,7 +318,7 @@ fi
 # Generation quota aligned with the eviction horizon: groups older than k updates are evicted anyway.
 staleness_threshold=${staleness_threshold:-32.0}
 updates_per_param_sync=1     # REQUIRED by replay mode: sync after every update
-num_minibatches_per_update=1 # REQUIRED by replay mode: one mini-batch per update
+num_minibatches_per_update=${UPDATE_MINIBATCHES} # optimizer mini-batches per update (> 1: OBJECTIVE=decoupled)
 partial_rollout=True         # REQUIRED by the stop-the-world pauses
 use_rollout_log_probs=True
 
@@ -351,7 +382,7 @@ ckpt_save_contents="['hf_model']"
 resume_mode=disable
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 ${model_tag} ${n_gpus_rollout}-${n_gpus_training} tp${train_tp}dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${warmup_tag}${dynbsz_tag}${tis_tag}${quant_tag}${kv_tag}${attn_tag}${val_tag} seed-${SEED}"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 ${model_tag} ${n_gpus_rollout}-${n_gpus_training} tp${train_tp}dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${warmup_tag}${dynbsz_tag}${tis_tag}${objective_tag}${quant_tag}${kv_tag}${attn_tag}${val_tag} seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
 # log_dir: TensorBoard (per-update rollout dumps are off: trainer.rollout_data_dir=null); CKPTS_DIR: global_step_N/ checkpoints.
 log_dir=${log_dir:-"logs/${exp_name_safe}"}
@@ -389,7 +420,7 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     algorithm.rollout_correction.rollout_rs=${rollout_rs} \
     algorithm.rollout_correction.rollout_rs_threshold=${rollout_rs_threshold} \
     algorithm.rollout_correction.log_probs_pearson_corr=${log_probs_pearson_corr} \
-    actor_rollout_ref.actor.policy_loss.loss_mode=bypass_mode \
+    actor_rollout_ref.actor.policy_loss.loss_mode=${policy_loss_mode} \
     '+actor_rollout_ref.actor.policy_loss.rollout_correction=${algorithm.rollout_correction}' \
     actor_rollout_ref.actor.strategy=megatron \
     actor_rollout_ref.actor.use_kl_loss=${use_kl_loss} \

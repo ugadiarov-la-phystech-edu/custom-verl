@@ -43,8 +43,10 @@ from verl.experimental.fully_async_policy.fully_async_trainer import (
     TrainingStopException,
     check_unsupported_async_keys,
     parse_max_train_steps,
+    replay_objective,
 )
 from verl.experimental.fully_async_policy.replay_buffer import ReplayBuffer
+from verl.experimental.fully_async_policy.replay_sizing import first_minibatch_groups, first_update_groups
 from verl.protocol import DataProto
 from verl.trainer.ppo import ray_trainer as ray_trainer_mod
 
@@ -77,6 +79,15 @@ REPLAY_ARM = [
     "algorithm.rollout_correction.rollout_is=token",
     "actor_rollout_ref.actor.policy_loss.loss_mode=bypass_mode",
     "+actor_rollout_ref.actor.policy_loss.rollout_correction=${algorithm.rollout_correction}",
+]
+
+
+# The decoupled objective (the sync PPO recipe): pi_old recomputed per update, 4 optimizer mini-batches per update,
+# PPO-clip on pi_theta / pi_old, token TIS min(pi_old / pi_rollout, C).
+DECOUPLED = [
+    "algorithm.rollout_correction.bypass_mode=False",
+    "actor_rollout_ref.actor.policy_loss.loss_mode=vanilla",
+    "async_training.require_batches=4",
 ]
 
 
@@ -214,6 +225,68 @@ class _Queue:
         return self.arrivals.pop(0), len(self.arrivals)
 
 
+class TestDecoupledObjective:
+    def test_bypass_arm_reports_bypass(self):
+        t = _init_trainer()
+        assert t.replay_objective == "bypass" and t.replay_update_minibatches == 1
+        assert t.required_samples == 33
+
+    def test_decoupled_arm(self):
+        t = _init_trainer(DECOUPLED)
+        assert t.replay_objective == "decoupled" and t.replay_update_minibatches == 4
+        assert t.required_samples == 4 * 33  # one update = 4 optimizer mini-batches
+        assert t.replay_first_mini_size == 2 * 33  # 0.5 x 4 mini-batches -> 2 whole mini-batches
+        assert t._replay_min_fresh_groups(t.required_samples) == 66  # the fresh floor covers the whole update
+
+    def test_decoupled_with_one_minibatch_keeps_the_bypass_first_size(self):
+        t = _init_trainer([*DECOUPLED, "async_training.require_batches=1"])
+        assert t.replay_objective == "decoupled" and t.replay_update_minibatches == 1
+        assert t.replay_first_mini_size == 18
+
+    @pytest.mark.parametrize(
+        "overrides, match",
+        [
+            (["async_training.require_batches=4"], "require_batches=1"),  # several mini-batches need decoupled
+            ([*DECOUPLED, "actor_rollout_ref.actor.policy_loss.loss_mode=bypass_mode"], "loss_mode=vanilla"),
+            ([*DECOUPLED, "algorithm.rollout_correction.rollout_is=null"], "rollout_is=token"),
+            ([*DECOUPLED, "actor_rollout_ref.actor.ppo_epochs=2"], "ppo_epochs"),
+            ([*DECOUPLED, "async_training.trigger_parameter_sync_step=2"], "trigger_parameter_sync_step"),
+        ],
+    )
+    def test_rejected_combinations(self, overrides, match):
+        with pytest.raises(AssertionError, match=match):
+            _init_trainer(overrides)
+
+    def test_replay_objective_function(self):
+        assert replay_objective(_compose(REPLAY_ARM)) == "bypass"
+        assert replay_objective(_compose([*REPLAY_ARM, *DECOUPLED])) == "decoupled"
+        with pytest.raises(AssertionError, match="bypass_mode=True with loss_mode=bypass_mode"):
+            replay_objective(_compose([*REPLAY_ARM, "algorithm.rollout_correction.bypass_mode=False"]))
+
+
+class TestFirstUpdateGroups:
+    @pytest.mark.parametrize(
+        "rmb, mini, n, dp", [(0.5, 33, 16, 3), (0.5, 36, 16, 6), (0.3, 35, 16, 5), (2.0, 33, 16, 3)]
+    )
+    def test_one_minibatch_is_first_minibatch_groups(self, rmb, mini, n, dp):
+        assert first_update_groups(rmb, mini, 1, n, dp) == first_minibatch_groups(rmb, mini, n, dp)
+
+    @pytest.mark.parametrize(
+        "rmb, k, expected",
+        [(0.5, 4, 72), (0.25, 4, 36), (0.3, 4, 72), (0.75, 4, 108), (0.99, 4, 144), (0.1, 2, 36), (0.5, 3, 72)],
+    )
+    def test_whole_minibatches(self, rmb, k, expected):
+        assert first_update_groups(rmb, 36, k, 16, 6) == expected
+
+    def test_off_at_or_above_one(self):
+        assert first_update_groups(1.0, 36, 4, 16, 6) is None and first_update_groups(3, 36, 4, 16, 6) is None
+
+    @pytest.mark.parametrize("args", [(0.5, 36, 0, 16, 6), (0.0, 36, 4, 16, 6), (-1, 36, 4, 16, 6)])
+    def test_invalid(self, args):
+        with pytest.raises(ValueError):
+            first_update_groups(*args)
+
+
 def _sample(version=0, scores=(1.0, 0.0, 0.0, 1.0)):
     """A pickled RolloutSample as the rollouter enqueues it (after the insertion gate)."""
     n = len(scores)
@@ -255,6 +328,8 @@ def _bare_trainer(mini=4, first=None, rmb=1.0, fresh=0.0, timeout=3600.0, queue=
     t.replay_fresh_poll_interval_s = 0.0
     t.replay_buffer = ReplayBuffer(tau=8.0, staleness_threshold=32, seed=0)
     t.replay_updates_done = 0
+    t.replay_objective = "bypass"
+    t.replay_update_minibatches = 1
     t.rollout_done = False
     t.current_param_version = 0
     t._replay_fresh_wait_s = 0.0
@@ -520,6 +595,110 @@ class TestReplayStep:
         with pytest.raises(TrainingStopException):
             _run(t._fit_replay_step())
         assert t.calls == []
+
+    def test_bypass_metrics(self):
+        t = self._trainer()
+        _run(t._fit_replay_step())
+        metrics = t.calls[5][1]
+        assert metrics["replay/update_minibatches"] == 1.0 and metrics["replay/objective_decoupled"] == 0.0
+        assert not any(k.startswith("rollout_corr/") for k in metrics)  # bypass: no trainer-side correction
+
+    def _decoupled(self, cap=8.0):
+        """Two groups per update in two optimizer mini-batches of one group; pi_old = rollout + a known shift."""
+        t = self._trainer()
+        t.replay_objective = "decoupled"
+        t.replay_update_minibatches = 2
+        t.config = OmegaConf.merge(
+            t.config,
+            {
+                "trainer": {"nnodes": 1, "n_gpus_per_node": 1},
+                "actor_rollout_ref": {"actor": {"ppo_mini_batch_size": 1, "strategy": "fsdp"}},
+                "algorithm": {
+                    "rollout_correction": {
+                        "bypass_mode": False,
+                        "rollout_is": "token",
+                        "rollout_is_threshold": cap,
+                        "rollout_rs": None,
+                        "rollout_rs_threshold": None,
+                        "rollout_is_batch_normalize": False,
+                    }
+                },
+            },
+        )
+        shift = torch.linspace(-3.0, 3.0, RESP_LEN)  # log(pi_old / pi_rollout) per token position
+
+        def compute_log_prob(batch):
+            t.calls.append("log_prob")
+            batch.batch["old_log_probs"] = batch.batch["rollout_log_probs"] + shift
+            return batch
+
+        t._fit_compute_log_prob = compute_log_prob
+        seen = {}
+
+        def update_actor(batch, mini_batch_size=None):
+            t.calls.append(("update_actor", len(batch), mini_batch_size))
+            seen["batch"] = batch
+            return DataProto(meta_info={"metrics": {"actor/pg_loss": [0.1]}})
+
+        t._update_actor = update_actor
+        return t, shift, seen
+
+    def test_decoupled_update(self):
+        t, shift, seen = self._decoupled(cap=8.0)
+        _run(t._fit_replay_step())
+        names = [c if isinstance(c, str) else c[0] for c in t.calls]
+        assert names == ["log_prob", "update_actor", "update_weights", "validate", "save", "postprocess", "log"]
+        assert t.calls[1] == ("update_actor", 2 * N, N)  # two optimizer steps of one group each
+        assert t.calls[2] == ("update_weights", 1)  # ONE weight sync per update
+        batch = seen["batch"]
+        mask = batch.batch["response_mask"].bool()
+        expected = shift.exp().clamp(max=8.0).expand_as(mask)
+        weights = batch.batch["rollout_is_weights"]
+        assert torch.allclose(weights[mask], expected[mask].to(weights.dtype), atol=1e-5)
+        metrics = t.calls[5][1]
+        assert metrics["replay/update_minibatches"] == 2.0 and metrics["replay/objective_decoupled"] == 1.0
+        assert any(k.startswith("rollout_corr/") for k in metrics)
+
+    def test_decoupled_cap_follows_the_config(self):
+        t, shift, seen = self._decoupled(cap=2.0)
+        _run(t._fit_replay_step())
+        weights = seen["batch"].batch["rollout_is_weights"]
+        assert weights.max().item() <= 2.0 + 1e-6
+
+    def test_decoupled_update_must_be_whole_minibatches(self):
+        t, _, _ = self._decoupled()
+        t.config = OmegaConf.merge(t.config, {"actor_rollout_ref": {"actor": {"ppo_mini_batch_size": 3}}})
+        with pytest.raises(AssertionError, match="whole number"):
+            _run(t._fit_replay_step())
+
+
+class TestOldLogProbInReplayMode:
+    def _trainer(self, replay, monkeypatch):
+        t = FullyAsyncTrainer.__new__(FullyAsyncTrainer)
+        t.replay_enable = replay
+        t.local_trigger_step = 1
+        events = []
+        t.actor_rollout_wg = SimpleNamespace(
+            save_model_to_cpu=lambda v: events.append(("save", v)),
+            restore_model_from_cpu=lambda v: events.append(("restore", v)),
+            clear_cpu_model=lambda v: events.append(("clear", v)),
+        )
+        monkeypatch.setattr(
+            ray_trainer_mod.RayPPOTrainer,
+            "_compute_old_log_prob",
+            lambda self, batch: (events.append("recompute") or ("old", 0.5)),
+        )
+        return t, events
+
+    def test_replay_recomputes_without_a_cpu_snapshot(self, monkeypatch):
+        t, events = self._trainer(True, monkeypatch)
+        assert t._compute_old_log_prob(None) == ("old", 0.5)
+        assert events == ["recompute"]
+
+    def test_non_replay_keeps_the_snapshot_logic(self, monkeypatch):
+        t, events = self._trainer(False, monkeypatch)
+        t._compute_old_log_prob(None)
+        assert events == [("save", 1), "recompute"]
 
 
 class TestFitLoop:

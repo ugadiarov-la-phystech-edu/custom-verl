@@ -33,7 +33,7 @@ from verl.experimental.fully_async_policy.detach_utils import (
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
 from verl.experimental.fully_async_policy.replay_sizing import (
     concurrency_cap,
-    first_minibatch_groups,
+    first_update_groups,
     parse_concurrency_ramp,
     trainer_dp_size,
 )
@@ -446,9 +446,15 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         replay_cfg = config.async_training.get("replay_buffer", None)
         self.replay_mode = bool(replay_cfg.get("enable", False)) if replay_cfg else False
         rmb = float(replay_cfg.get("requires_mini_batches", 1.0)) if replay_cfg else 1.0
+        # The first UPDATE's size (one mini-batch per update in the bypass objective, require_batches
+        # mini-batches in the decoupled one), as the trainer computes it.
         self.ramp_first_size = (
-            first_minibatch_groups(
-                rmb, self.required_samples, int(config.actor_rollout_ref.rollout.n), trainer_dp_size(config)
+            first_update_groups(
+                rmb,
+                int(config.actor_rollout_ref.actor.ppo_mini_batch_size),
+                int(self.require_batches),
+                int(config.actor_rollout_ref.rollout.n),
+                trainer_dp_size(config),
             )
             or self.required_samples
         )

@@ -36,11 +36,16 @@ from verl.experimental.fully_async_policy.detach_utils import (
 from verl.experimental.fully_async_policy.dynamic_schedule import DynamicScheduleContext
 from verl.experimental.fully_async_policy.message_queue import MessageQueueClient
 from verl.experimental.fully_async_policy.replay_buffer import ReplayBuffer
-from verl.experimental.fully_async_policy.replay_sizing import first_minibatch_groups, trainer_dp_size
+from verl.experimental.fully_async_policy.replay_sizing import (
+    first_update_groups,
+    order_rows_for_minibatches,
+    stratified_minibatch_buckets,
+    trainer_dp_size,
+)
 from verl.experimental.separation.ray_trainer import SeparateRayPPOTrainer
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup
 from verl.trainer.ppo import core_algos
-from verl.trainer.ppo.ray_trainer import ResourcePoolManager
+from verl.trainer.ppo.ray_trainer import RayPPOTrainer, ResourcePoolManager
 from verl.trainer.ppo.utils import Role, WorkerType, need_critic, need_reference_policy, need_reward_model
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path, should_save_ckpt_esi
 from verl.utils.config import omega_conf_to_dataclass
@@ -85,6 +90,53 @@ def parse_max_train_steps(value) -> int | None:
     if steps < 1:
         raise ValueError(f"trainer.total_training_steps must be >= 1 or null, got {value!r}")
     return steps
+
+
+REPLAY_OBJECTIVES = ("bypass", "decoupled")
+
+
+def replay_objective(config) -> str:
+    """The replay trainer's objective, from the config; raises on any other combination.
+
+    * "bypass" (algorithm.rollout_correction.bypass_mode=True): one optimizer mini-batch per update, trained
+      against the cached rollout log-probs with REINFORCE + token TIS min(pi_theta/pi_rollout, C)
+      (policy_loss.loss_mode=bypass_mode, rollout_correction.loss_type=reinforce).
+    * "decoupled" (bypass_mode=False): the sync PPO recipe. pi_old is recomputed by the trainer once per update
+      (its weights at the start of the update), the update is split into async_training.require_batches optimizer
+      mini-batches, each PPO-clipped on pi_theta/pi_old (policy_loss.loss_mode=vanilla, clip_ratio_low/high/c) and
+      weighted by the token TIS min(pi_old/pi_rollout, C) (rollout_correction.rollout_is=token).
+    """
+    rollout_corr = config.algorithm.get("rollout_correction", None)
+    assert rollout_corr is not None, (
+        "replay_buffer mode needs algorithm.rollout_correction (bypass_mode=True with loss_type=reinforce, or "
+        "bypass_mode=False with policy_loss.loss_mode=vanilla and rollout_is=token)"
+    )
+    policy_loss = config.actor_rollout_ref.actor.policy_loss
+    loss_mode = policy_loss.get("loss_mode", None)
+    if rollout_corr.get("bypass_mode", False):
+        # The update trains against the cached behavior log-probs. losses.py reads only actor.policy_loss, so
+        # the worker-side keys must be set explicitly, not just algorithm.*.
+        assert loss_mode == "bypass_mode", (
+            "replay_buffer mode: set actor_rollout_ref.actor.policy_loss.loss_mode=bypass_mode "
+            "(algorithm.rollout_correction.bypass_mode alone never reaches the workers)"
+        )
+        worker_corr = policy_loss.get("rollout_correction", None)
+        assert worker_corr is not None and worker_corr.get("loss_type", None) == "reinforce", (
+            "replay_buffer mode: pass +actor_rollout_ref.actor.policy_loss.rollout_correction="
+            "'${algorithm.rollout_correction}' with algorithm.rollout_correction.loss_type=reinforce"
+        )
+        return "bypass"
+    assert loss_mode == "vanilla", (
+        "replay_buffer mode with algorithm.rollout_correction.bypass_mode=False (the decoupled objective: pi_old "
+        "recomputed per update) needs actor_rollout_ref.actor.policy_loss.loss_mode=vanilla, got "
+        f"{loss_mode!r}; the bypass objective needs bypass_mode=True with loss_mode=bypass_mode"
+    )
+    assert rollout_corr.get("rollout_is", None) == "token", (
+        "replay_buffer mode with the decoupled objective needs algorithm.rollout_correction.rollout_is=token "
+        "(token TIS min(pi_old/pi_rollout, C) corrects the stale and the FP8 rollouts), got "
+        f"{rollout_corr.get('rollout_is', None)!r}"
+    )
+    return "decoupled"
 
 
 class TrainingStopException(Exception):
@@ -283,9 +335,6 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         assert self.trigger_parameter_sync_step == 1, (
             "replay_buffer mode syncs weights after every update: set async_training.trigger_parameter_sync_step=1"
         )
-        assert self.require_batches == 1, (
-            "replay_buffer mode composes one mini-batch per update: set async_training.require_batches=1"
-        )
         assert int(config.actor_rollout_ref.actor.ppo_epochs) == 1, "replay_buffer mode needs actor.ppo_epochs=1"
         assert str(config.algorithm.adv_estimator) == "grpo", (
             f"replay_buffer mode freezes GRPO group advantages at insertion; got {config.algorithm.adv_estimator}"
@@ -295,31 +344,31 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         assert not config.async_training.get("use_dynamic_resource_scheduling", False), (
             "replay_buffer mode does not support use_dynamic_resource_scheduling"
         )
-        # The update trains against the cached behavior log-probs (bypass mode). losses.py reads only
-        # actor.policy_loss, so the worker-side keys must be set explicitly, not just algorithm.*.
-        rollout_corr = config.algorithm.get("rollout_correction", None)
-        assert rollout_corr is not None and rollout_corr.get("bypass_mode", False), (
-            "replay_buffer mode trains against rollout log-probs: set algorithm.rollout_correction.bypass_mode=True"
-        )
-        policy_loss = config.actor_rollout_ref.actor.policy_loss
-        assert policy_loss.get("loss_mode", None) == "bypass_mode", (
-            "replay_buffer mode: set actor_rollout_ref.actor.policy_loss.loss_mode=bypass_mode "
-            "(algorithm.rollout_correction.bypass_mode alone never reaches the workers)"
-        )
-        worker_corr = policy_loss.get("rollout_correction", None)
-        assert worker_corr is not None and worker_corr.get("loss_type", None) == "reinforce", (
-            "replay_buffer mode: pass +actor_rollout_ref.actor.policy_loss.rollout_correction="
-            "'${algorithm.rollout_correction}' with algorithm.rollout_correction.loss_type=reinforce"
-        )
+        self.replay_objective = replay_objective(config)
+        self.replay_update_minibatches = int(self.require_batches)
+        if self.replay_objective == "bypass":
+            assert self.replay_update_minibatches == 1, (
+                "replay_buffer mode with the bypass objective composes one mini-batch per update: set "
+                "async_training.require_batches=1 (several mini-batches per update need the decoupled objective)"
+            )
+        else:
+            assert self.replay_update_minibatches >= 1, (
+                f"async_training.require_batches must be >= 1, got {self.require_batches}"
+            )
 
         self.replay_requires_mini_batches = float(replay_cfg.get("requires_mini_batches", 1.0))
         assert self.replay_requires_mini_batches > 0, "replay_buffer.requires_mini_batches must be > 0"
         n = int(config.actor_rollout_ref.rollout.n)
-        # requires_mini_batches in (0, 1) sizes only the FIRST mini-batch (rounded up so its sequences split
-        # evenly over the trainer DP ranks); later mini-batches are full-size with the watermark at one
-        # mini-batch. Values >= 1 are the pause watermark in mini-batches.
-        self.replay_first_mini_size = first_minibatch_groups(
-            self.replay_requires_mini_batches, self.required_samples, n, trainer_dp_size(config)
+        # requires_mini_batches in (0, 1) sizes only the FIRST update (rounded up so its sequences split
+        # evenly over the trainer DP ranks, and to whole mini-batches with several mini-batches per update);
+        # later updates are full-size with the watermark at one update. Values >= 1 are the pause watermark in
+        # updates. The rollouter's ramp_first_size computes the same value.
+        self.replay_first_mini_size = first_update_groups(
+            self.replay_requires_mini_batches,
+            int(config.actor_rollout_ref.actor.ppo_mini_batch_size),
+            self.replay_update_minibatches,
+            n,
+            trainer_dp_size(config),
         )
         self.replay_min_fresh_ratio = float(replay_cfg.get("min_fresh_ratio", 0.0))
         assert 0.0 <= self.replay_min_fresh_ratio <= 1.0, (
@@ -335,12 +384,17 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             reuse_halflife=float(reuse_halflife) if reuse_halflife is not None else None,
         )
         self.replay_updates_done = 0
+        # seeds the per-update split of a decoupled update into its optimizer mini-batches (_build_replay_batch);
+        # its own RNG, so the buffer's replay draw is unaffected
+        self.replay_split_seed = int(replay_cfg.get("sampling_seed", 1234))
+        self._replay_split_metrics = {}
         self.rollout_done = False
         self._replay_fresh_wait_s = 0.0
         self._replay_fresh_floor_waived = 0
         print(
             f"[FullyAsyncTrainer][Replay] tau={self.replay_buffer.tau} k={self.replay_buffer.staleness_threshold} "
-            f"reuse_halflife={self.replay_buffer.reuse_halflife} mini-batch={self.required_samples} groups, "
+            f"reuse_halflife={self.replay_buffer.reuse_halflife} objective={self.replay_objective} "
+            f"update={self.required_samples} groups in {self.replay_update_minibatches} mini-batch(es), "
             f"first={self.replay_first_mini_size or self.required_samples}, "
             f"min_fresh_ratio={self.replay_min_fresh_ratio}"
         )
@@ -784,12 +838,24 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self.replay_buffer.evict(new_version)
         self.replay_buffer.recompute_scores(new_version)
 
-    def _build_replay_batch(self, entries) -> DataProto:
+    def _build_replay_batch(self, entries, info: dict | None = None) -> DataProto:
         """Training batch from buffered groups with the insertion-time statistics frozen by the rollouter:
         advantages broadcast from advantage_scalar, sparse token-level rewards from reward_scalar, and the
-        cached rollout log-probs as the behavior policy (bypass mode) -- nothing is recomputed."""
-        balance = self._balance_batch if self.config.trainer.balance_batch else None
-        batch = assemble_batch_from_rollout_samples([e.sample for e in entries], self.tokenizer, self.config, balance)
+        cached rollout log-probs as the behavior policy -- nothing is recomputed here.
+
+        Row order. One optimizer mini-batch per update: the trainer's usual _balance_batch (token-balanced DP
+        partitions). Decoupled objective with several mini-batches in the update (``info`` given): the groups are
+        first dealt into the mini-batches (_order_replay_minibatches: whole groups, fresh / replayed evenly spread,
+        replayed ones stratified by staleness), then each mini-batch is token-balanced over the DP ranks."""
+        samples = [e.sample for e in entries]
+        k_eff = self._replay_minibatches_in(len(entries))
+        self._replay_split_metrics = {}
+        if info is not None and getattr(self, "replay_objective", "bypass") == "decoupled" and k_eff > 1:
+            batch = assemble_batch_from_rollout_samples(samples, self.tokenizer, self.config, None)
+            batch = self._order_replay_minibatches(batch, samples, info, k_eff)
+        else:
+            balance = self._balance_batch if self.config.trainer.balance_batch else None
+            batch = assemble_batch_from_rollout_samples(samples, self.tokenizer, self.config, balance)
         response_mask = batch.batch["response_mask"]
         adv = torch.from_numpy(np.asarray(batch.non_tensor_batch["advantage_scalar"], dtype=np.float32))
         advantages = adv.unsqueeze(-1) * response_mask.float()
@@ -803,6 +869,62 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         batch.batch["token_level_scores"] = scores
         batch.batch["token_level_rewards"] = scores
         batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+        return batch
+
+    def _replay_minibatches_in(self, n_groups: int) -> int:
+        """Optimizer mini-batches in an update of n_groups groups (1 unless the decoupled objective splits it)."""
+        if getattr(self, "replay_update_minibatches", 1) <= 1:
+            return 1
+        mini = int(self.config.actor_rollout_ref.actor.ppo_mini_batch_size)
+        return max(1, n_groups // mini)
+
+    def _order_replay_minibatches(self, batch: DataProto, samples, info: dict, k: int) -> DataProto:
+        """Reorder an assembled (unbalanced) update so its k optimizer mini-batches are stratified samples.
+
+        Groups are dealt with replay_sizing.stratified_minibatch_buckets (seeded per update), then laid out
+        rank-major with order_rows_for_minibatches, so DP rank r's contiguous chunk is [mini-batch 1 | ... | k] and
+        each mini-batch is token-balanced over the ranks when trainer.balance_batch is on."""
+        n_fresh = int(info["n_new"])
+        staleness = list(info.get("staleness", []))
+        replay_staleness = staleness[n_fresh:]
+        assert n_fresh + len(replay_staleness) == len(samples), (
+            f"composition info covers {n_fresh + len(replay_staleness)} groups, the update has {len(samples)}"
+        )
+        rng = np.random.default_rng([int(getattr(self, "replay_split_seed", 0)), int(self.replay_updates_done)])
+        buckets = stratified_minibatch_buckets(n_fresh, replay_staleness, k, rng)
+        group_rows, start = [], 0
+        for sample in samples:
+            n_rows = len(sample.full_batch)
+            group_rows.append(list(range(start, start + n_rows)))
+            start += n_rows
+        assert start == len(batch), f"assembled batch has {len(batch)} rows, the groups {start}"
+        seqlens = batch.batch["attention_mask"].sum(dim=-1).tolist()
+        order = order_rows_for_minibatches(
+            buckets,
+            group_rows,
+            seqlens,
+            dp=trainer_dp_size(self.config),
+            balance=bool(self.config.trainer.balance_batch),
+        )
+        batch.reorder(torch.tensor(order, dtype=torch.long))
+
+        fresh_counts = [sum(1 for g in b if g < n_fresh) for b in buckets]
+        replay_counts = [len(b) - f for b, f in zip(buckets, fresh_counts, strict=True)]
+        replay_means = []
+        for b in buckets:
+            bucket_staleness = [replay_staleness[g - n_fresh] for g in b if g >= n_fresh]
+            if bucket_staleness:
+                replay_means.append(float(np.mean(bucket_staleness)))
+        self._replay_split_metrics = {
+            "replay/minibatches_in_update": float(k),
+            "replay/step_fresh_groups_min": float(min(fresh_counts)),
+            "replay/step_fresh_groups_max": float(max(fresh_counts)),
+            "replay/step_replayed_groups_min": float(min(replay_counts)),
+            "replay/step_replayed_groups_max": float(max(replay_counts)),
+        }
+        if replay_means:
+            self._replay_split_metrics["replay/step_replay_staleness_mean_min"] = min(replay_means)
+            self._replay_split_metrics["replay/step_replay_staleness_mean_max"] = max(replay_means)
         return batch
 
     def _add_replay_metrics(self, metrics: dict, info: dict, new_version: int) -> None:
@@ -834,8 +956,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 "replay/fresh_floor": float(self._replay_min_fresh_groups(size)),
                 "replay/fresh_wait_s": float(self._replay_fresh_wait_s),
                 "replay/fresh_floor_waived": float(self._replay_fresh_floor_waived),
+                "replay/update_minibatches": float(self.replay_update_minibatches),
+                "replay/objective_decoupled": float(self.replay_objective == "decoupled"),
             }
         )
+        metrics.update(getattr(self, "_replay_split_metrics", {}) or {})
         if buffer_staleness:
             metrics["replay/buffer_staleness_mean"] = float(np.mean(buffer_staleness))
             metrics["replay/buffer_staleness_p50"] = float(np.percentile(buffer_staleness, 50))
@@ -870,13 +995,16 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 entries, info = await self._acquire_replay_minibatch()
                 if entries is None:
                     raise TrainingStopException("Training terminated: rollout finished and replay buffer drained")
-                batch = self._build_replay_batch(entries)
+                batch = self._build_replay_batch(entries, info)
                 self._collect_metrics_from_samples(batch, self.metrics)
             _allocated_start = time.time()
-            batch = self._fit_compute_log_prob(batch)  # bypass mode: old_log_probs = rollout_log_probs
+            # bypass: old_log_probs = rollout_log_probs; decoupled: pi_old recomputed (_compute_old_log_prob)
+            batch = self._fit_compute_log_prob(batch)
+            mini_batch_size = self._replay_optimizer_minibatch_size(batch)
+            if self.replay_objective == "decoupled":
+                batch = self._replay_apply_rollout_correction(batch)
             with marked_timer("update_actor", self.timing_raw, color="red"):
-                # the batch is exactly one optimizer mini-batch, also when it is the smaller first one
-                actor_output = self._update_actor(batch, mini_batch_size=len(batch))
+                actor_output = self._update_actor(batch, mini_batch_size=mini_batch_size)
             self.metrics.update(reduce_metrics(actor_output.meta_info["metrics"]))
             self._fit_update_local_step()
             self.replay_updates_done += 1
@@ -895,6 +1023,31 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         self._fit_postprocess_step()
         if rollout_reset_timing_raw is not None:
             self._fit_log_aggregated_training_metrics(rollout_reset_timing_raw)
+
+    def _replay_optimizer_minibatch_size(self, batch: DataProto) -> int:
+        """Sequences per optimizer step for this replay update.
+
+        One mini-batch per update (bypass, or decoupled with require_batches=1): the whole batch, also when it is
+        the smaller first one. require_batches=K > 1 (decoupled): ppo_mini_batch_size groups x n, i.e. K optimizer
+        steps against the same pi_old (the first update: fewer, it is a whole number of mini-batches)."""
+        if self.replay_update_minibatches == 1:
+            return len(batch)
+        actor_rollout_ref = self.config.actor_rollout_ref
+        mini = int(actor_rollout_ref.actor.ppo_mini_batch_size) * int(actor_rollout_ref.rollout.n)
+        assert len(batch) % mini == 0, (
+            f"replay update of {len(batch)} sequences is not a whole number of {mini}-sequence mini-batches"
+        )
+        return mini
+
+    def _replay_apply_rollout_correction(self, batch: DataProto) -> DataProto:
+        """Decoupled objective: token TIS weights min(pi_old / pi_rollout, C) (and any rejection mask) from the
+        recomputed old_log_probs, computed once per update as the sync trainer does (_fit_compute_advantage);
+        IS / off-policy metrics land under rollout_corr/*."""
+        from verl.trainer.ppo.rollout_corr_helper import compute_rollout_correction_and_add_to_batch
+
+        batch, is_metrics = compute_rollout_correction_and_add_to_batch(batch, self.config.algorithm.rollout_correction)
+        self.metrics.update(is_metrics)
+        return batch
 
     async def fit_step(self, batch_dict: dict = None):
         """
@@ -1028,6 +1181,10 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         If local_trigger_step == 2, 3, ..., restore the parameters of version 1 to calculate the old_log_prob,
         then restore the parameters of the current version.
         """
+        if self.replay_enable:
+            # Replay mode syncs after every update (trigger_parameter_sync_step=1): the trainer's weights ARE
+            # pi_old here, so no CPU snapshot / restore of version 1 is needed.
+            return RayPPOTrainer._compute_old_log_prob(self, batch)
         if self.local_trigger_step == 1:
             self.actor_rollout_wg.save_model_to_cpu(1)
             old_log_prob, old_log_prob_mfu = super()._compute_old_log_prob(batch)

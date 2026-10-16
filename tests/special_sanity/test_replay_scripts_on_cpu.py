@@ -41,6 +41,15 @@ QWEN25_FP8_C8 = (
     "grpo_novcpo_8gpu_dapo17k_3+5_resp8k_megatron_offload_replay_tau=8_k=32"
     "_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.5_fp8_tis-c8_token-mean_qwen2.5-7b.sh"
 )
+QWEN25_2P6_KV = (
+    "grpo_novcpo_8gpu_dapo17k_2+6_resp8k_megatron_offload_replay_tau=8_k=32"
+    "_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.5_fp8_kv-fp8_tis-c8_token-mean_qwen2.5-7b.sh"
+)
+QWEN25_2P6_DECOUPLED = (
+    "grpo_novcpo_8gpu_dapo17k_2+6_resp8k_megatron_offload_replay_tau=8_k=32"
+    "_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.5_fp8_kv-fp8_ppo-decoupled-K4-clip-0.2-0.28-c10_tis-c8_token-mean"
+    "_qwen2.5-7b.sh"
+)
 ALL = [QWEN, PANGU, QWEN_FP8]
 QWEN_ARMS = (QWEN, QWEN_FP8)
 DEEPGEMM_VARS = ("CUDA_HOME", "DG_JIT_CACHE_DIR", "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER")
@@ -80,6 +89,15 @@ SCRIPT_ENV_KNOBS = {
     "ATTN_BACKEND",
     "VLLM_LOG_STATS",
     "ROLLOUT_MAX_MODEL_LEN",
+    "ROLLOUT_MAX_NUM_SEQS",
+    "VERL_QWEN2_K_BIAS_CENTER",
+    "val_temperature",
+    "val_top_p",
+    "OBJECTIVE",
+    "UPDATE_MINIBATCHES",
+    "clip_ratio_low",
+    "clip_ratio_high",
+    "clip_ratio_c",
     *DEEPGEMM_VARS,
 }
 
@@ -928,4 +946,135 @@ class TestRolloutEngineKnobs:
 def test_invalid_engine_knobs_are_rejected(script, env, message, tmp_path):
     proc = _run(script, env, (), tmp_path)
     assert proc.returncode == 2
+    assert message in proc.stderr
+
+
+# --------------------------------------------------------------------------- decoupled objective (sync PPO recipe)
+
+DECOUPLED_OWN = {
+    "OBJECTIVE": "decoupled",
+    "UPDATE_MINIBATCHES": "4",
+    "clip_ratio_low": "0.2",
+    "clip_ratio_high": "0.28",
+    "clip_ratio_c": "10",
+}
+DECOUPLED_KEYS = {
+    "algorithm.rollout_correction.bypass_mode",
+    "actor_rollout_ref.actor.policy_loss.rollout_correction.bypass_mode",
+    "actor_rollout_ref.actor.policy_loss.loss_mode",
+    "actor_rollout_ref.actor.clip_ratio_high",
+    "actor_rollout_ref.actor.clip_ratio_c",
+    "async_training.require_batches",
+}
+
+
+class TestDecoupledObjective:
+    def test_objective(self):
+        c = compose(QWEN25_2P6_DECOUPLED)
+        corr = c["algorithm"]["rollout_correction"]
+        actor = c["actor_rollout_ref"]["actor"]
+        assert corr["bypass_mode"] is False and corr["rollout_is"] == "token"
+        assert float(corr["rollout_is_threshold"]) == 8.0
+        assert actor["policy_loss"]["loss_mode"] == "vanilla"
+        assert actor["policy_loss"]["rollout_correction"] == corr
+        assert (actor["clip_ratio_low"], actor["clip_ratio_high"], float(actor["clip_ratio_c"])) == (0.2, 0.28, 10.0)
+        assert actor["ppo_mini_batch_size"] == 36 and actor["ppo_epochs"] == 1
+        assert c["async_training"]["require_batches"] == 4
+        assert c["async_training"]["trigger_parameter_sync_step"] == 1
+
+    def test_name(self):
+        name = compose(QWEN25_2P6_DECOUPLED)["trainer"]["experiment_name"]
+        base = compose(QWEN25_2P6_KV)["trainer"]["experiment_name"]
+        assert name == base.replace(" tis-C8 ", " tis-C8 ppo-decoupled-K4 clip-0.2-0.28-c10 ")
+
+    def test_differs_from_the_2p6_arm_only_in_the_objective(self):
+        assert _differing(compose(QWEN25_2P6_KV), compose(QWEN25_2P6_DECOUPLED)) == DECOUPLED_KEYS
+
+    def test_is_the_2p6_arm_with_the_objective_knobs(self):
+        assert compose(QWEN25_2P6_DECOUPLED) == compose(QWEN25_2P6_KV, **DECOUPLED_OWN)
+
+    def test_runs_the_2p6_arm(self):
+        lines = (SCRIPTS / QWEN25_2P6_DECOUPLED).read_text().splitlines()
+        execs = [ln for ln in lines if ln.lstrip().startswith("exec ")]
+        assert len(execs) == 1 and QWEN25_2P6_KV in execs[0] and execs[0].rstrip().endswith('"$@"')
+
+    def test_knobs_still_apply(self):
+        c = compose(QWEN25_2P6_DECOUPLED, UPDATE_MINIBATCHES="2", clip_ratio_high="0.2")
+        assert c["async_training"]["require_batches"] == 2
+        assert c["actor_rollout_ref"]["actor"]["clip_ratio_high"] == 0.2
+        assert " ppo-decoupled-K2 clip-0.2-0.2-c10 " in c["trainer"]["experiment_name"]
+
+    def test_trainer_rollouter_and_worker_accept_the_config(self, monkeypatch):
+        from verl.experimental.fully_async_policy import fully_async_rollouter as mod
+        from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
+        from verl.utils.config import omega_conf_to_dataclass
+
+        cfg = _cfg(QWEN25_2P6_DECOUPLED)
+        actor = omega_conf_to_dataclass(cfg.actor_rollout_ref.actor)
+        assert actor.policy_loss.loss_mode == "vanilla"
+        assert (actor.clip_ratio_low, actor.clip_ratio_high, actor.clip_ratio_c) == (0.2, 0.28, 10.0)
+        cfg.trainer.logger = ["console"]
+        trainer_cls = FullyAsyncTrainer.__ray_metadata__.modified_class
+        t = trainer_cls(config=cfg, tokenizer=None, role_worker_mapping={}, resource_pool_manager=None)
+        assert t.replay_objective == "decoupled" and t.replay_update_minibatches == 4
+        assert t.required_samples == 144  # 4 x 36 groups per update
+        assert t.replay_first_mini_size == 72  # 0.5 x 4 mini-batches -> 2 whole mini-batches
+        assert t._replay_min_fresh_groups(t.required_samples) == 72
+
+        rollouter_cls = mod.FullyAsyncRollouter.__ray_metadata__.modified_class
+        monkeypatch.setattr(mod, "create_rl_dataset", lambda *a, **k: [0] * 8)
+        monkeypatch.setattr(mod, "create_rl_sampler", lambda *a, **k: None)
+        monkeypatch.setattr(
+            rollouter_cls, "_create_dataloader", lambda self, *a, **k: setattr(self, "train_dataloader", [0] * 8)
+        )
+        monkeypatch.setattr(rollouter_cls, "_init_dump_executor", lambda self: None)
+        r = rollouter_cls(config=_cfg(QWEN25_2P6_DECOUPLED), tokenizer=None)
+        assert r.replay_mode and r.required_samples == 144
+        assert r.ramp_first_size == t.replay_first_mini_size == 72  # both sides agree on the first update
+
+
+class TestObjectiveKnobsOnTheBase:
+    @pytest.mark.parametrize("script", [QWEN, QWEN_FP8_C8, PANGU, QWEN25_2P6_KV])
+    def test_defaults_are_the_bypass_objective(self, script):
+        c = compose(script)
+        assert c["algorithm"]["rollout_correction"]["bypass_mode"] is True
+        assert c["actor_rollout_ref"]["actor"]["policy_loss"]["loss_mode"] == "bypass_mode"
+        assert c["async_training"]["require_batches"] == 1
+        a = c["actor_rollout_ref"]["actor"]
+        assert (a["clip_ratio_low"], a["clip_ratio_high"], float(a["clip_ratio_c"])) == (0.2, 0.2, 3.0)
+        assert "ppo-decoupled" not in c["trainer"]["experiment_name"]
+
+    def test_explicit_defaults_change_nothing(self):
+        explicit = dict(
+            OBJECTIVE="bypass", UPDATE_MINIBATCHES="1", clip_ratio_low="0.2", clip_ratio_high="0.2", clip_ratio_c="3.0"
+        )
+        assert compose(QWEN, **explicit) == compose(QWEN)
+
+    def test_clip_knobs_alone_are_inert_but_composed(self):
+        c = compose(QWEN, clip_ratio_high="0.28")
+        assert _differing(compose(QWEN), c) == {"actor_rollout_ref.actor.clip_ratio_high"}
+        assert c["trainer"]["experiment_name"] == compose(QWEN)["trainer"]["experiment_name"]
+
+    def test_decoupled_with_one_minibatch_composes(self):
+        c = compose(QWEN, OBJECTIVE="decoupled")
+        assert c["async_training"]["require_batches"] == 1
+        assert " ppo-decoupled-K1 clip-0.2-0.2-c3.0 " in c["trainer"]["experiment_name"]
+
+
+@pytest.mark.parametrize(
+    "env, message",
+    [
+        ({"OBJECTIVE": "ppo"}, "OBJECTIVE must be bypass or decoupled"),
+        ({"UPDATE_MINIBATCHES": "0"}, "UPDATE_MINIBATCHES must be a positive integer"),
+        ({"UPDATE_MINIBATCHES": "two"}, "UPDATE_MINIBATCHES must be a positive integer"),
+        ({"UPDATE_MINIBATCHES": "4"}, "UPDATE_MINIBATCHES > 1 needs OBJECTIVE=decoupled"),
+        ({"clip_ratio_high": "1.5"}, "clip_ratio_low / clip_ratio_high must be in (0, 1)"),
+        ({"clip_ratio_low": "0"}, "clip_ratio_low / clip_ratio_high must be in (0, 1)"),
+        ({"clip_ratio_c": "1"}, "clip_ratio_c must be a number > 1"),
+        ({"clip_ratio_c": "ten"}, "clip_ratio_c must be a number > 1"),
+    ],
+)
+def test_invalid_objective_knobs_are_rejected(env, message, tmp_path):
+    proc = _run(QWEN, env, (), tmp_path)
+    assert proc.returncode == 2, proc.stderr[-2000:]
     assert message in proc.stderr
