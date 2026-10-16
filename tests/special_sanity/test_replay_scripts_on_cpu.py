@@ -957,6 +957,8 @@ DECOUPLED_OWN = {
     "clip_ratio_low": "0.2",
     "clip_ratio_high": "0.28",
     "clip_ratio_c": "10",
+    "test_freq": "10",
+    "save_freq": "10",
 }
 DECOUPLED_KEYS = {
     "algorithm.rollout_correction.bypass_mode",
@@ -965,6 +967,8 @@ DECOUPLED_KEYS = {
     "actor_rollout_ref.actor.clip_ratio_high",
     "actor_rollout_ref.actor.clip_ratio_c",
     "async_training.require_batches",
+    "trainer.test_freq",
+    "trainer.save_freq",
 }
 
 
@@ -981,6 +985,7 @@ class TestDecoupledObjective:
         assert actor["ppo_mini_batch_size"] == 36 and actor["ppo_epochs"] == 1
         assert c["async_training"]["require_batches"] == 4
         assert c["async_training"]["trigger_parameter_sync_step"] == 1
+        assert (c["trainer"]["test_freq"], c["trainer"]["save_freq"]) == (10, 10)
 
     def test_name(self):
         name = compose(QWEN25_2P6_DECOUPLED)["trainer"]["experiment_name"]

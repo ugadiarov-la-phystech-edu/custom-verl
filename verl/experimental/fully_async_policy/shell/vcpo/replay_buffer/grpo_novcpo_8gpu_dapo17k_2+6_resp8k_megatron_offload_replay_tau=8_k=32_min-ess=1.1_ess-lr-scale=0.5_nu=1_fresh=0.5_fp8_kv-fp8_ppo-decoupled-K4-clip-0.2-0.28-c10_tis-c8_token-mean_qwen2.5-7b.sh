@@ -38,6 +38,8 @@
 # min(pi_old / pi_rollout, 8) like the fresh ones.
 # Knobs (base launcher, "IS / Rollout Correction"): OBJECTIVE, UPDATE_MINIBATCHES, clip_ratio_low / clip_ratio_high /
 # clip_ratio_c. exp_name gains " ppo-decoupled-K4 clip-0.2-0.28-c10".
+# test_freq=10, save_freq=10 (2+6 arm: 40): validation and hf_model checkpoints every 10 UPDATES. One update is 4
+# optimizer steps over 144 groups here, so this is every 40 optimizer steps / 1,440 groups.
 set -euo pipefail
 
 export OBJECTIVE=${OBJECTIVE:-decoupled}
@@ -45,5 +47,7 @@ export UPDATE_MINIBATCHES=${UPDATE_MINIBATCHES:-4}
 export clip_ratio_low=${clip_ratio_low:-0.2}
 export clip_ratio_high=${clip_ratio_high:-0.28}
 export clip_ratio_c=${clip_ratio_c:-10}
+export test_freq=${test_freq:-10}
+export save_freq=${save_freq:-10}
 
 exec bash "$(dirname "${BASH_SOURCE[0]}")/grpo_novcpo_8gpu_dapo17k_2+6_resp8k_megatron_offload_replay_tau=8_k=32_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.5_fp8_kv-fp8_tis-c8_token-mean_qwen2.5-7b.sh" "$@"
