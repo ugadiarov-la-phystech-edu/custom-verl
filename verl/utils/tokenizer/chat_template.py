@@ -10,6 +10,29 @@ logger = logging.getLogger(__name__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+CHAT_TEMPLATE_FILE_SUFFIX = ".jinja"
+
+
+def resolve_chat_template(value: str | None) -> str | None:
+    """Resolve ``actor_rollout_ref.model.custom_chat_template``: a path to a ``*.jinja`` file -> the file's text.
+
+    A Jinja template (braces, quotes, newlines) cannot be passed cleanly as a Hydra command-line value, so launchers
+    pass a file path instead (e.g. verl/utils/tokenizer/chat_templates/orz.jinja). Any other value - None or an
+    inline template - is returned unchanged. A ``.jinja`` path that does not exist raises FileNotFoundError rather
+    than silently becoming the template text.
+    """
+    if value is None:
+        return None
+    value = str(value)
+    if value.strip().endswith(CHAT_TEMPLATE_FILE_SUFFIX) and "\n" not in value:
+        path = os.path.expanduser(value.strip())
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f"custom_chat_template file not found: {path}")
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    return value
+
+
 def initialize_system_prompt(tokenizer, **apply_chat_template_kwargs) -> list[int]:
     """
     Initialize system prompt tokens for chat templates that support them.

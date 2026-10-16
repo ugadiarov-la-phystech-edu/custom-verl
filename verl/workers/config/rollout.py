@@ -15,7 +15,7 @@ import warnings
 from dataclasses import dataclass, field
 from typing import Optional
 
-from omegaconf import MISSING, DictConfig, OmegaConf
+from omegaconf import MISSING, DictConfig, ListConfig, OmegaConf
 
 from verl.base_config import BaseConfig
 from verl.utils.profiler import ProfilerConfig
@@ -185,6 +185,9 @@ class RolloutConfig(BaseConfig):
     gpu_memory_utilization: float = 0.5
     standalone_gpu_memory_utilization: Optional[float] = None
     ignore_eos: bool = False
+    # Stop strings for vLLM sampling (train and validation); the matched string is kept in the response.
+    # None = stop only at EOS.
+    stop: Optional[list[str]] = None
     enforce_eager: bool = False
     cudagraph_capture_sizes: Optional[list] = None
     free_cache_engine: bool = True
@@ -275,6 +278,12 @@ class RolloutConfig(BaseConfig):
 
     def __post_init__(self):
         """Validate the rollout config"""
+        if self.stop is not None:
+            if isinstance(self.stop, str) or not isinstance(self.stop, list | tuple | ListConfig):
+                raise ValueError(f"rollout.stop must be a list of strings or null, got {self.stop!r}")
+            if not all(isinstance(s, str) and s for s in self.stop):
+                raise ValueError(f"rollout.stop entries must be non-empty strings, got {list(self.stop)!r}")
+
         # Deprecation warning for mode field - only async mode is supported
         if self.mode == "sync":
             raise ValueError(

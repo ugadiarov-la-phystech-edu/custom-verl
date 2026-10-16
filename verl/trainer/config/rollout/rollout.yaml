@@ -48,6 +48,11 @@ gpu_memory_utilization: 0.5
 # Whether to ignore EOS and continue generating after EOS is hit.
 ignore_eos: False
 
+# Stop strings passed to the inference engine (vLLM SamplingParams.stop), for training and validation
+# sampling alike; the matched string is kept in the response (include_stop_str_in_output=True).
+# null = stop only at EOS. E.g. Open-Reasoner-Zero: ["User:", "Human:", "Assistant:", "</answer>"].
+stop: null
+
 # Whether to disable CUDA graph. Default False to best performance.
 enforce_eager: False
 

@@ -61,6 +61,13 @@ class FullyAsyncTaskRunner:
 
         trust_remote_code = config.data.get("trust_remote_code", False)
         tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        custom_chat_template = config.actor_rollout_ref.model.get("custom_chat_template", None)
+        if custom_chat_template is not None:
+            from verl.utils.tokenizer.chat_template import resolve_chat_template
+
+            # Same template as the agent loop renders prompts with, so the dataset's over-long-prompt filter
+            # counts the tokens the rollout actually sees.
+            tokenizer.chat_template = resolve_chat_template(custom_chat_template)
 
         # Used for multimodal LLM, could be None
         processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)

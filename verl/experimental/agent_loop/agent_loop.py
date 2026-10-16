@@ -498,6 +498,32 @@ used by hydra.utils.instantiate to initialize agent loop instance.
 
 https://hydra.cc/docs/advanced/instantiate_objects/overview/
 """
+def build_sampling_params(config, validate: bool) -> dict[str, Any]:
+    """Per-request sampling params for one generate_sequences call (the vLLM SamplingParams fields).
+
+    Training uses the rollout temperature / top_p / top_k, validation the val_kwargs ones. With rollout.stop set,
+    generation also ends at any of those strings (training and validation alike); the matched string is kept in the
+    output, as Open-Reasoner-Zero sampled. The response token ids include it either way, since generation stops on
+    the token that completes it.
+    """
+    sampling_params = dict(
+        temperature=config.temperature,
+        top_p=config.top_p,
+        top_k=config.top_k,
+        repetition_penalty=1.0,
+        logprobs=config.calculate_log_probs,
+    )
+    if validate:
+        sampling_params["top_p"] = config.val_kwargs.top_p
+        sampling_params["top_k"] = config.val_kwargs.top_k
+        sampling_params["temperature"] = config.val_kwargs.temperature
+    stop = config.get("stop", None) if hasattr(config, "get") else getattr(config, "stop", None)
+    if stop:
+        sampling_params["stop"] = list(stop)
+        sampling_params["include_stop_str_in_output"] = True
+    return sampling_params
+
+
 _agent_loop_registry: dict[str, dict] = {}
 
 
@@ -619,24 +645,12 @@ class AgentLoopWorker:
         """
         config = self.rollout_config
         validate = batch.meta_info.get("validate", False)
-        sampling_params = dict(
-            temperature=config.temperature,
-            top_p=config.top_p,
-            top_k=config.top_k,
-            repetition_penalty=1.0,
-            logprobs=config.calculate_log_probs,
-        )
+        sampling_params = build_sampling_params(config, validate)
 
         def apply_greedy_sampling_params(params: dict[str, Any]) -> None:
             params["top_p"] = 1.0
             params["top_k"] = -1
             params["temperature"] = 0
-
-        # override sampling params for validation
-        if validate:
-            sampling_params["top_p"] = config.val_kwargs.top_p
-            sampling_params["top_k"] = config.val_kwargs.top_k
-            sampling_params["temperature"] = config.val_kwargs.temperature
 
         # by default, we assume it's a single turn agent
         if "agent_name" not in batch.non_tensor_batch:

@@ -309,5 +309,54 @@ class TestOrzEqualityEdgeCases(unittest.TestCase):
         self.assertTrue(score(f"<answer> {gt} </answer>", ground_truth=gt)["acc"])
 
 
+class TestOrzStopStringsAndQwen25Rollouts(unittest.TestCase):
+    """What the Qwen2.5-7B ORZ arm's rollouts look like after decoding: the agent loop renders ORZ's template
+    ("... User: <message>\nAssistant: <think>"), so the response starts inside <think>, and vLLM stops at
+    ["User:", "Human:", "Assistant:", "</answer>"] with the matched string kept in the response."""
+
+    STOPS = ("User:", "Human:", "Assistant:", "</answer>")
+
+    def test_a_response_cut_at_the_closing_tag_scores(self):
+        self.assertTrue(score(" reasoning </think> <answer> \\boxed{42} </answer>")["acc"])
+
+    def test_a_response_cut_at_an_invented_turn_scores_the_real_answer(self):
+        for stop in self.STOPS[:3]:
+            with self.subTest(stop=stop):
+                # the model skipped </answer> and started a new turn: the unterminated block still has its \boxed{}
+                self.assertTrue(score(f" r </think> <answer> \\boxed{{42}}\n{stop}")["acc"])
+
+    def test_without_stops_an_invented_later_turn_decides_the_score(self):
+        """Why the arm stops at "User:" / "Assistant:": the last <answer> block wins, so a hallucinated follow-up
+        exchange after the real answer would overwrite it."""
+        tail = "\nUser: and 2+2?\nAssistant: <think> easy </think> <answer> \\boxed{4} </answer>"
+        self.assertFalse(score(" r </think> <answer> \\boxed{42} </answer>" + tail)["acc"])
+        # with the stop strings vLLM ends at the first "</answer>", so the tail never exists
+        self.assertTrue(score(" r </think> <answer> \\boxed{42} </answer>")["acc"])
+
+    def test_aime_integer_answers(self):
+        for gt in ("0", "7", "540", "999"):
+            with self.subTest(gt=gt):
+                self.assertTrue(score(f" w </think> <answer> \\boxed{{{gt}}} </answer>", ground_truth=gt)["acc"])
+        self.assertFalse(score(" w </think> <answer> \\boxed{541} </answer>", ground_truth="540")["acc"])
+
+    def test_the_validation_data_sources_are_scored_the_same(self):
+        response = " w </think> <answer> \\boxed{510} </answer>"
+        for data_source in ("math_dapo", "aime2024_orz", "aime2025_orz", "math500_orz"):
+            with self.subTest(data_source=data_source):
+                got = orz.compute_score(data_source=data_source, solution_str=response, ground_truth="510")
+                self.assertEqual(got, {"score": 1.0, "acc": True, "pred": "510"})
+
+    def test_loads_through_verl_s_custom_reward_function_loader(self):
+        from omegaconf import OmegaConf
+
+        from verl.trainer.ppo.reward import get_custom_reward_fn
+
+        cfg = OmegaConf.create({"reward": {"custom_reward_function": {"path": str(_ORZ_PATH), "name": "compute_score"}}})
+        fn = get_custom_reward_fn(cfg)
+        got = fn(data_source="aime2025_orz", solution_str="<answer> \\boxed{42} </answer>", ground_truth="42",
+                 extra_info={})
+        self.assertTrue(got["acc"])
+
+
 if __name__ == "__main__":
     unittest.main()

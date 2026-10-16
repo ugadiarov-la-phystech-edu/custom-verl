@@ -83,6 +83,42 @@ MODEL_PATH=${MODEL_PATH:-"Qwen/Qwen3-8B"}
 model_tag=${model_tag:-"Qwen3-8B"}
 TRAIN_FILE=${TRAIN_FILE:-"/home/jovyan/datasets/math_datasets/dapo/dapo-math-17k.parquet"}
 TEST_FILE=${TEST_FILE:-"['/home/jovyan/datasets/math_datasets/dapo/aime-2024.parquet','/home/jovyan/datasets/math_datasets/dapo/aime-2025.parquet']"}
+# Dataset name in exp_name; set by wrappers that swap the data (..._orz72k_..._qwen2.5-7b.sh: ORZ72K-AIME24ORZ).
+data_tag=${data_tag:-"DAPO17K-AIME24"}
+[[ "${data_tag}" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "data_tag must match [A-Za-z0-9._-]+, got '${data_tag}'" >&2; exit 2; }
+
+# ================= Prompt format / reward (optional; all off by default) =================
+# Each knob, when set, adds Hydra overrides (before any trailing "$@", so those still win); unset, the arm
+# composes exactly as before. Used together by the Open-Reasoner-Zero wrappers:
+#   REWARD_FILE / REWARD_FN  -> reward.custom_reward_function.path / .name (default fn compute_score), e.g.
+#       rewards/orz_tag_aware_math.py. Unset = verl's default_compute_score by data_source (math_dapo for DAPO).
+#   CHAT_TEMPLATE_FILE       -> actor_rollout_ref.model.custom_chat_template=<absolute path to a *.jinja file>;
+#       the model config reads the file (verl/utils/tokenizer/chat_template.py:resolve_chat_template), and the
+#       driver tokenizer gets the same template, so the over-long-prompt filter counts the rendered prompt.
+#   ROLLOUT_STOP             -> actor_rollout_ref.rollout.stop, a Hydra list literal, e.g.
+#       '["User:","Human:","Assistant:","</answer>"]'; vLLM stops at any of them (training and validation),
+#       keeping the matched string in the response.
+# Relative paths are taken from the current directory (launch from the repo root) and passed on absolute.
+REWARD_FILE=${REWARD_FILE:-}
+REWARD_FN=${REWARD_FN:-compute_score}
+CHAT_TEMPLATE_FILE=${CHAT_TEMPLATE_FILE:-}
+ROLLOUT_STOP=${ROLLOUT_STOP:-}
+format_args=()
+if [[ -n "${REWARD_FILE}" ]]; then
+    [[ -f "${REWARD_FILE}" ]] || { echo "REWARD_FILE not found: '${REWARD_FILE}'" >&2; exit 2; }
+    [[ "${REWARD_FN}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || { echo "REWARD_FN must be a Python identifier, got '${REWARD_FN}'" >&2; exit 2; }
+    format_args+=("reward.custom_reward_function.path=$(realpath "${REWARD_FILE}")" "reward.custom_reward_function.name=${REWARD_FN}")
+fi
+if [[ -n "${CHAT_TEMPLATE_FILE}" ]]; then
+    [[ "${CHAT_TEMPLATE_FILE}" == *.jinja && -f "${CHAT_TEMPLATE_FILE}" ]] \
+        || { echo "CHAT_TEMPLATE_FILE must be an existing *.jinja file, got '${CHAT_TEMPLATE_FILE}'" >&2; exit 2; }
+    format_args+=("actor_rollout_ref.model.custom_chat_template=$(realpath "${CHAT_TEMPLATE_FILE}")")
+fi
+if [[ -n "${ROLLOUT_STOP}" ]]; then
+    [[ "${ROLLOUT_STOP}" =~ ^\[.*[^[:space:]].*\]$ ]] \
+        || { echo "ROLLOUT_STOP must be a non-empty Hydra list literal like '[\"</answer>\"]', got '${ROLLOUT_STOP}'" >&2; exit 2; }
+    format_args+=("actor_rollout_ref.rollout.stop=${ROLLOUT_STOP}")
+fi
 project_name='vcpo'
 
 # ================= Seeds =================
@@ -351,7 +387,7 @@ ckpt_save_contents="['hf_model']"
 resume_mode=disable
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 ${model_tag} ${n_gpus_rollout}-${n_gpus_training} tp${train_tp}dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${warmup_tag}${dynbsz_tag}${tis_tag}${quant_tag}${kv_tag}${attn_tag}${val_tag} seed-${SEED}"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} ${data_tag} ${model_tag} ${n_gpus_rollout}-${n_gpus_training} tp${train_tp}dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${warmup_tag}${dynbsz_tag}${tis_tag}${quant_tag}${kv_tag}${attn_tag}${val_tag} seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
 # log_dir: TensorBoard (per-update rollout dumps are off: trainer.rollout_data_dir=null); CKPTS_DIR: global_step_N/ checkpoints.
 log_dir=${log_dir:-"logs/${exp_name_safe}"}
@@ -490,4 +526,4 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     async_training.replay_buffer.requires_mini_batches="${replay_requires_mini_batches}" \
     async_training.replay_buffer.sampling_seed="${replay_sampling_seed}" \
     async_training.replay_buffer.reuse_halflife="${replay_reuse_halflife}" \
-    async_training.replay_buffer.min_fresh_ratio="${replay_min_fresh_ratio}" "${engine_args[@]}" "${dynbsz_args[@]}" "$@"
+    async_training.replay_buffer.min_fresh_ratio="${replay_min_fresh_ratio}" "${engine_args[@]}" "${dynbsz_args[@]}" "${format_args[@]}" "$@"

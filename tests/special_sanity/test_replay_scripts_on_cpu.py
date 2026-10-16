@@ -41,6 +41,14 @@ QWEN25_FP8_C8 = (
     "grpo_novcpo_8gpu_dapo17k_3+5_resp8k_megatron_offload_replay_tau=8_k=32"
     "_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.5_fp8_tis-c8_token-mean_qwen2.5-7b.sh"
 )
+QWEN25_2P6_KV = (
+    "grpo_novcpo_8gpu_dapo17k_2+6_resp8k_megatron_offload_replay_tau=8_k=32"
+    "_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.5_fp8_kv-fp8_tis-c8_token-mean_qwen2.5-7b.sh"
+)
+ORZ_2P6 = (
+    "grpo_novcpo_8gpu_orz72k_2+6_resp8k_megatron_offload_replay_tau=8_k=32"
+    "_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.5_fp8_kv-fp8_tis-c8_token-mean_qwen2.5-7b.sh"
+)
 ALL = [QWEN, PANGU, QWEN_FP8]
 QWEN_ARMS = (QWEN, QWEN_FP8)
 DEEPGEMM_VARS = ("CUDA_HOME", "DG_JIT_CACHE_DIR", "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER")
@@ -80,6 +88,17 @@ SCRIPT_ENV_KNOBS = {
     "ATTN_BACKEND",
     "VLLM_LOG_STATS",
     "ROLLOUT_MAX_MODEL_LEN",
+    "ROLLOUT_MAX_NUM_SEQS",
+    "VERL_QWEN2_K_BIAS_CENTER",
+    "val_temperature",
+    "val_top_p",
+    "TRAIN_FILE",
+    "TEST_FILE",
+    "data_tag",
+    "REWARD_FILE",
+    "REWARD_FN",
+    "CHAT_TEMPLATE_FILE",
+    "ROLLOUT_STOP",
     *DEEPGEMM_VARS,
 }
 
@@ -929,3 +948,201 @@ def test_invalid_engine_knobs_are_rejected(script, env, message, tmp_path):
     proc = _run(script, env, (), tmp_path)
     assert proc.returncode == 2
     assert message in proc.stderr
+
+
+# --------------------------------------------------------------------------- Open-Reasoner-Zero format (ORZ_2P6)
+
+ORZ_DIR = "/home/jovyan/datasets/math_datasets/orz"
+ORZ_STOP = ["User:", "Human:", "Assistant:", "</answer>"]
+ORZ_TEMPLATE = REPO / "verl" / "utils" / "tokenizer" / "chat_templates" / "orz.jinja"
+ORZ_REWARD = REPO / "rewards" / "orz_tag_aware_math.py"
+# The env the ORZ wrapper sets on top of the DAPO 2+6 FP8-KV arm.
+ORZ_OWN = {
+    "TRAIN_FILE": f"{ORZ_DIR}/orz-math-72k.parquet",
+    "TEST_FILE": f"['{ORZ_DIR}/aime-2024-orz.parquet','{ORZ_DIR}/aime-2025-orz.parquet']",
+    "CHAT_TEMPLATE_FILE": str(ORZ_TEMPLATE),
+    "ROLLOUT_STOP": '["User:","Human:","Assistant:","</answer>"]',
+    "REWARD_FILE": str(ORZ_REWARD),
+    "REWARD_FN": "compute_score",
+    "data_tag": "ORZ72K-AIME24ORZ",
+    "total_rollout_steps": "96000",
+}
+ORZ_KEYS = {
+    "data.train_files",
+    "data.val_files",
+    "actor_rollout_ref.model.custom_chat_template",
+    "actor_rollout_ref.rollout.stop",
+    "reward.custom_reward_function.path",
+    "rollout.total_rollout_steps",
+    "actor_rollout_ref.actor.optim.lr_decay_steps",
+}
+
+
+class TestOrz72k:
+    def test_data(self):
+        c = compose(ORZ_2P6)
+        assert c["data"]["train_files"] == f"{ORZ_DIR}/orz-math-72k.parquet"
+        assert c["data"]["val_files"] == [f"{ORZ_DIR}/aime-2024-orz.parquet", f"{ORZ_DIR}/aime-2025-orz.parquet"]
+        assert c["data"]["prompt_key"] == "prompt"
+
+    def test_prompt_format(self):
+        c = compose(ORZ_2P6)
+        template = c["actor_rollout_ref"]["model"]["custom_chat_template"]
+        assert template == str(ORZ_TEMPLATE) and Path(template).is_absolute() and Path(template).is_file()
+        assert c["actor_rollout_ref"]["rollout"]["stop"] == ORZ_STOP
+
+    def test_reward(self):
+        fn = compose(ORZ_2P6)["reward"]["custom_reward_function"]
+        assert (fn["path"], fn["name"]) == (str(ORZ_REWARD), "compute_score")
+
+    def test_budget(self):
+        c = compose(ORZ_2P6)
+        assert c["rollout"]["total_rollout_steps"] == 96000
+        assert c["actor_rollout_ref"]["actor"]["optim"]["lr_decay_steps"] == 96000
+
+    def test_name(self):
+        orz, dapo = (compose(s)["trainer"]["experiment_name"] for s in (ORZ_2P6, QWEN25_2P6_KV))
+        assert " ORZ72K-AIME24ORZ Qwen2.5-7B 2-6 tp1dp6 hdo B-36 token-mean " in orz and "DAPO17K" not in orz
+        assert orz == dapo.replace(" DAPO17K-AIME24 ", " ORZ72K-AIME24ORZ ")
+
+    def test_differs_from_the_dapo_2p6_arm_only_in_the_orz_keys(self):
+        assert _differing(compose(QWEN25_2P6_KV), compose(ORZ_2P6)) == ORZ_KEYS
+
+    def test_is_the_dapo_2p6_arm_with_the_orz_knobs(self):
+        assert compose(ORZ_2P6) == compose(QWEN25_2P6_KV, **ORZ_OWN)
+
+    def test_runs_the_dapo_2p6_arm(self):
+        execs = [ln for ln in (SCRIPTS / ORZ_2P6).read_text().splitlines() if ln.lstrip().startswith("exec ")]
+        assert len(execs) == 1 and QWEN25_2P6_KV in execs[0] and execs[0].rstrip().endswith('"$@"')
+
+    def test_inherits_the_dapo_arm_s_model_side(self):
+        c = compose(ORZ_2P6)
+        r = c["actor_rollout_ref"]["rollout"]
+        assert c["actor_rollout_ref"]["model"]["path"] == "Qwen/Qwen2.5-7B"
+        assert r["quantization"] == "fp8" and r["engine_kwargs"]["vllm"]["kv_cache_dtype"] == "fp8_e4m3"
+        assert (c["rollout"]["n_gpus_per_node"], c["trainer"]["n_gpus_per_node"]) == (2, 6)
+        assert float(c["algorithm"]["rollout_correction"]["rollout_is_threshold"]) == 8.0
+        assert (r["val_kwargs"]["temperature"], r["val_kwargs"]["top_p"]) == (1.0, 1.0)
+
+    def test_env_knobs_and_trailing_overrides_still_win(self):
+        c = compose(ORZ_2P6, TRAIN_FILE="/data2/datasets/orz/orz-math-72k.parquet", ROLLOUT_STOP='["</answer>"]')
+        assert c["data"]["train_files"] == "/data2/datasets/orz/orz-math-72k.parquet"
+        assert c["actor_rollout_ref"]["rollout"]["stop"] == ["</answer>"]
+        c = compose(ORZ_2P6, args=('actor_rollout_ref.rollout.stop=["User:"]', "reward.custom_reward_function.name=f"))
+        assert c["actor_rollout_ref"]["rollout"]["stop"] == ["User:"]
+        assert c["reward"]["custom_reward_function"]["name"] == "f"
+
+    def test_trainer_rollouter_and_workers_accept_the_config(self, monkeypatch):
+        from verl.experimental.fully_async_policy import fully_async_rollouter as mod
+        from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
+        from verl.utils.config import omega_conf_to_dataclass
+        from verl.workers.config import RolloutConfig
+
+        cfg = _cfg(ORZ_2P6)
+        rollout = omega_conf_to_dataclass(cfg.actor_rollout_ref.rollout, dataclass_type=RolloutConfig)
+        assert list(rollout.stop) == ORZ_STOP
+        from verl.experimental.agent_loop.agent_loop import build_sampling_params
+
+        params = build_sampling_params(rollout, validate=True)
+        assert params["stop"] == ORZ_STOP and params["include_stop_str_in_output"] is True
+        actor = omega_conf_to_dataclass(cfg.actor_rollout_ref.actor)
+        assert actor.loss_agg_mode == "token-mean"
+        cfg.trainer.logger = ["console"]
+        trainer_cls = FullyAsyncTrainer.__ray_metadata__.modified_class
+        t = trainer_cls(config=cfg, tokenizer=None, role_worker_mapping={}, resource_pool_manager=None)
+        assert t.replay_enable
+
+        rollouter_cls = mod.FullyAsyncRollouter.__ray_metadata__.modified_class
+        monkeypatch.setattr(mod, "create_rl_dataset", lambda *a, **k: [0] * 8)
+        monkeypatch.setattr(mod, "create_rl_sampler", lambda *a, **k: None)
+        monkeypatch.setattr(
+            rollouter_cls, "_create_dataloader", lambda self, *a, **k: setattr(self, "train_dataloader", [0] * 8)
+        )
+        monkeypatch.setattr(rollouter_cls, "_init_dump_executor", lambda self: None)
+        r = rollouter_cls(config=_cfg(ORZ_2P6), tokenizer=None)
+        assert r.replay_mode
+
+    def test_the_composed_reward_function_loads_and_scores(self):
+        from verl.trainer.ppo.reward import get_custom_reward_fn
+
+        fn = get_custom_reward_fn(_cfg(ORZ_2P6))
+        got = fn(data_source="aime2025_orz", solution_str=" r </think> <answer> \\boxed{510} </answer>",
+                 ground_truth="510", extra_info={})
+        assert got["score"] == 1.0
+
+    def test_the_composed_template_resolves_to_orz_s(self):
+        from verl.utils.tokenizer.chat_template import resolve_chat_template
+
+        text = resolve_chat_template(compose(ORZ_2P6)["actor_rollout_ref"]["model"]["custom_chat_template"])
+        assert text == ORZ_TEMPLATE.read_text(encoding="utf-8")
+        assert text.startswith("{%- if messages[0]['role'] == 'system' %}") and "Assistant: <think>" in text
+
+
+class TestFormatKnobsOnTheBase:
+    @pytest.mark.parametrize("script", [QWEN, QWEN_FP8_C8, PANGU, QWEN25_2P6_KV])
+    def test_off_by_default(self, script):
+        c = compose(script)
+        assert c["actor_rollout_ref"]["model"]["custom_chat_template"] is None
+        assert c["actor_rollout_ref"]["rollout"]["stop"] is None
+        assert c["reward"]["custom_reward_function"]["path"] is None
+        assert " DAPO17K-AIME24 " in c["trainer"]["experiment_name"]
+
+    def test_explicit_default_data_tag_changes_nothing(self):
+        assert compose(QWEN, data_tag="DAPO17K-AIME24") == compose(QWEN)
+
+    def test_data_tag_changes_only_the_name(self):
+        c = compose(QWEN, data_tag="X-1")
+        assert _differing(compose(QWEN), c) == set()
+        assert " X-1 Qwen3-8B " in c["trainer"]["experiment_name"]
+
+    def test_reward_file_alone(self):
+        c = compose(QWEN, REWARD_FILE="rewards/orz_tag_aware_math.py")  # relative to the repo root
+        assert _differing(compose(QWEN), c) == {"reward.custom_reward_function.path"}
+        fn = c["reward"]["custom_reward_function"]
+        assert (fn["path"], fn["name"]) == (str(ORZ_REWARD), "compute_score")  # made absolute
+        c = compose(QWEN, REWARD_FILE=str(ORZ_REWARD), REWARD_FN="extract_answer")
+        assert c["reward"]["custom_reward_function"]["name"] == "extract_answer"
+
+    def test_chat_template_alone(self):
+        rel = "verl/utils/tokenizer/chat_templates/orz.jinja"
+        c = compose(QWEN, CHAT_TEMPLATE_FILE=rel)
+        assert _differing(compose(QWEN), c) == {"actor_rollout_ref.model.custom_chat_template"}
+        assert c["actor_rollout_ref"]["model"]["custom_chat_template"] == str(ORZ_TEMPLATE)
+
+    def test_stop_alone(self):
+        c = compose(QWEN, ROLLOUT_STOP='["</answer>"]')
+        assert _differing(compose(QWEN), c) == {"actor_rollout_ref.rollout.stop"}
+        assert c["actor_rollout_ref"]["rollout"]["stop"] == ["</answer>"]
+
+    def test_knobs_do_not_change_the_name(self):
+        c = compose(QWEN, ROLLOUT_STOP='["</answer>"]', CHAT_TEMPLATE_FILE=str(ORZ_TEMPLATE), REWARD_FILE=str(ORZ_REWARD))
+        assert c["trainer"]["experiment_name"] == compose(QWEN)["trainer"]["experiment_name"]
+
+
+@pytest.mark.parametrize(
+    "env, message",
+    [
+        ({"REWARD_FILE": "rewards/missing.py"}, "REWARD_FILE not found"),
+        ({"REWARD_FILE": "rewards/orz_tag_aware_math.py", "REWARD_FN": "1bad"}, "REWARD_FN must be a Python identifier"),
+        ({"CHAT_TEMPLATE_FILE": "missing.jinja"}, "CHAT_TEMPLATE_FILE must be an existing *.jinja file"),
+        ({"CHAT_TEMPLATE_FILE": "rewards/orz_tag_aware_math.py"}, "CHAT_TEMPLATE_FILE must be an existing *.jinja file"),
+        ({"ROLLOUT_STOP": "</answer>"}, "ROLLOUT_STOP must be a non-empty Hydra list literal"),
+        ({"ROLLOUT_STOP": "[]"}, "ROLLOUT_STOP must be a non-empty Hydra list literal"),
+        ({"ROLLOUT_STOP": "[ ]"}, "ROLLOUT_STOP must be a non-empty Hydra list literal"),
+        ({"data_tag": "has space"}, "data_tag must match"),
+    ],
+)
+@pytest.mark.parametrize("script", [QWEN, ORZ_2P6])
+def test_invalid_format_knobs_are_rejected(script, env, message, tmp_path):
+    proc = _run(script, env, (), tmp_path)
+    assert proc.returncode == 2, proc.stderr[-2000:]
+    assert message in proc.stderr
+
+
+def test_a_non_string_stop_entry_fails_at_config_validation():
+    from verl.utils.config import omega_conf_to_dataclass
+    from verl.workers.config import RolloutConfig
+
+    cfg = _cfg(QWEN, ROLLOUT_STOP='["</answer>",""]')
+    with pytest.raises(ValueError, match="non-empty strings"):
+        omega_conf_to_dataclass(cfg.actor_rollout_ref.rollout, dataclass_type=RolloutConfig)
