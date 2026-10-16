@@ -95,6 +95,9 @@ SCRIPT_ENV_KNOBS = {
     "val_top_p",
     "OBJECTIVE",
     "UPDATE_MINIBATCHES",
+    "staleness_threshold",
+    "replay_staleness_threshold",
+    "replay_tau",
     "clip_ratio_low",
     "clip_ratio_high",
     "clip_ratio_c",
@@ -959,6 +962,9 @@ DECOUPLED_OWN = {
     "clip_ratio_c": "10",
     "test_freq": "10",
     "save_freq": "10",
+    "staleness_threshold": "8",
+    "replay_staleness_threshold": "8",
+    "replay_tau": "2",
 }
 DECOUPLED_KEYS = {
     "algorithm.rollout_correction.bypass_mode",
@@ -969,6 +975,9 @@ DECOUPLED_KEYS = {
     "async_training.require_batches",
     "trainer.test_freq",
     "trainer.save_freq",
+    "async_training.staleness_threshold",
+    "async_training.replay_buffer.staleness_threshold",
+    "async_training.replay_buffer.tau",
 }
 
 
@@ -986,11 +995,15 @@ class TestDecoupledObjective:
         assert c["async_training"]["require_batches"] == 4
         assert c["async_training"]["trigger_parameter_sync_step"] == 1
         assert (c["trainer"]["test_freq"], c["trainer"]["save_freq"]) == (10, 10)
+        a = c["async_training"]
+        assert float(a["staleness_threshold"]) == 8.0
+        assert (a["replay_buffer"]["staleness_threshold"], a["replay_buffer"]["tau"]) == (8, 2)
 
     def test_name(self):
         name = compose(QWEN25_2P6_DECOUPLED)["trainer"]["experiment_name"]
         base = compose(QWEN25_2P6_KV)["trainer"]["experiment_name"]
-        assert name == base.replace(" tis-C8 ", " tis-C8 ppo-decoupled-K4 clip-0.2-0.28-c10 ")
+        expected = base.replace(" tis-C8 ", " tis-C8 ppo-decoupled-K4 clip-0.2-0.28-c10 ")
+        assert name == expected.replace("replay tau-8 k-32 ", "replay tau-2 k-8 ")
 
     def test_differs_from_the_2p6_arm_only_in_the_objective(self):
         assert _differing(compose(QWEN25_2P6_KV), compose(QWEN25_2P6_DECOUPLED)) == DECOUPLED_KEYS
@@ -1035,6 +1048,7 @@ class TestDecoupledObjective:
         monkeypatch.setattr(rollouter_cls, "_init_dump_executor", lambda self: None)
         r = rollouter_cls(config=_cfg(QWEN25_2P6_DECOUPLED), tokenizer=None)
         assert r.replay_mode and r.required_samples == 144
+        assert r.staleness_threshold == 8.0
         assert r.ramp_first_size == t.replay_first_mini_size == 72  # both sides agree on the first update
 
 

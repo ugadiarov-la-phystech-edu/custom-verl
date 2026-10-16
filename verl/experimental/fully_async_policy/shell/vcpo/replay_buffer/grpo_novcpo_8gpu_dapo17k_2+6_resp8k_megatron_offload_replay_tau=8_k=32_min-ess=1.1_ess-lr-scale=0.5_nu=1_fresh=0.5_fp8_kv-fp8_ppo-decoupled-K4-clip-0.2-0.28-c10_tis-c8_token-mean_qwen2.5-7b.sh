@@ -40,6 +40,13 @@
 # clip_ratio_c. exp_name gains " ppo-decoupled-K4 clip-0.2-0.28-c10".
 # test_freq=10, save_freq=10 (2+6 arm: 40): validation and hf_model checkpoints every 10 UPDATES. One update is 4
 # optimizer steps over 144 groups here, so this is every 40 optimizer steps / 1,440 groups.
+# Staleness knobs scaled by K=4 so they mean the same number of OPTIMIZER STEPS as in the other SER arms (versions tick
+# once per update = 4 optimizer steps here):
+#   * staleness_threshold=8 (2+6 arm: 32): rollouter quota 144 x (8 + 1) = 1,296 groups ahead of the trainer (the
+#     2+6 arm: 36 x 33 = 1,188);
+#   * replay_staleness_threshold=8 (k; 2+6 arm: 32): replayed groups are evicted after 8 versions = 32 optimizer steps;
+#   * replay_tau=2 (2+6 arm: 8): replay draw weight 2^(-staleness / 2), i.e. halved every 8 optimizer steps.
+#   The exp_name says "replay tau-2 k-8"; the file name keeps the arm's tau=8_k=32 prefix.
 set -euo pipefail
 
 export OBJECTIVE=${OBJECTIVE:-decoupled}
@@ -49,5 +56,8 @@ export clip_ratio_high=${clip_ratio_high:-0.28}
 export clip_ratio_c=${clip_ratio_c:-10}
 export test_freq=${test_freq:-10}
 export save_freq=${save_freq:-10}
+export staleness_threshold=${staleness_threshold:-8}
+export replay_staleness_threshold=${replay_staleness_threshold:-8}
+export replay_tau=${replay_tau:-2}
 
 exec bash "$(dirname "${BASH_SOURCE[0]}")/grpo_novcpo_8gpu_dapo17k_2+6_resp8k_megatron_offload_replay_tau=8_k=32_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.5_fp8_kv-fp8_tis-c8_token-mean_qwen2.5-7b.sh" "$@"
