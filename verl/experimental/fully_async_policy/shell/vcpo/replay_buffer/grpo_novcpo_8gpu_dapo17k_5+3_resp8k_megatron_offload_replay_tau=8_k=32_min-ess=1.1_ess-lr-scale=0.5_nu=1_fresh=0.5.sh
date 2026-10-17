@@ -389,8 +389,43 @@ max_actor_ckpt_to_keep=null
 ckpt_save_contents="['hf_model']"
 resume_mode=disable
 
+# ================= DAPO overlong reward shaping (toggle) =================
+# As in the sync base launcher (examples/baselines/run_qwen3-8b_dapo17k_grpo_sync_B128xn16_mini32_megatron.sh).
+# OVERLONG_BUFFER_LEN=0 (default) keeps verl's naive reward manager: the reward is the math_dapo score
+# (+1 / -1), so a truncated response (no final "Answer:" line) simply scores -1. OVERLONG_BUFFER_LEN=L > 0
+# switches to the DAPO reward manager (verl/experimental/reward_loop/reward_manager/dapo.py) with DAPO's soft
+# overlong punishment (Yu et al. 2025, arXiv:2503.14476, section 3.4): a response of len tokens gets
+#   reward += min(-(len - (max_response_length - L)) / L * OVERLONG_PENALTY_FACTOR, 0)
+# i.e. no penalty up to max_response_length - L, then a linear ramp to -OVERLONG_PENALTY_FACTOR at the cap.
+# The rollouter's insertion gate sees the shaped rewards: a group whose 16 rewards still all agree (e.g. all
+# -1 and all shorter than max_response_length - L) is dropped as before, but an all-wrong group whose
+# responses run into the buffer by different amounts is kept and trains on the length penalty alone (the
+# sync arm trains every group). critic/score/mean includes the penalty; val-core/*/acc/mean@1 reads the
+# scorer's own acc, which it does not touch. No overlong filtering, no dynamic sampling.
+# overlong_buffer_cfg.log=True records overlong_reward / overlong per response (val-aux/<data_source>/...).
+#   OVERLONG_PENALTY_FACTOR  penalty at the cap (default 1.0, as in DAPO).
+# Tagged in exp_name.
+OVERLONG_BUFFER_LEN=${OVERLONG_BUFFER_LEN:-0}
+OVERLONG_PENALTY_FACTOR=${OVERLONG_PENALTY_FACTOR:-1.0}
+[[ "${OVERLONG_BUFFER_LEN}" =~ ^[0-9]+$ ]] || { echo "OVERLONG_BUFFER_LEN must be a non-negative integer (0 = off), got '${OVERLONG_BUFFER_LEN}'" >&2; exit 2; }
+reward_args=()
+overlong_tag=""
+if (( OVERLONG_BUFFER_LEN > 0 )); then
+    (( OVERLONG_BUFFER_LEN < max_response_length )) || { echo "OVERLONG_BUFFER_LEN must be < max_response_length = ${max_response_length}, got ${OVERLONG_BUFFER_LEN}" >&2; exit 2; }
+    [[ "${OVERLONG_PENALTY_FACTOR}" =~ ^[0-9]+(\.[0-9]+)?$ ]] && awk "BEGIN{exit !(${OVERLONG_PENALTY_FACTOR} > 0)}" || { echo "OVERLONG_PENALTY_FACTOR must be a positive number, got '${OVERLONG_PENALTY_FACTOR}'" >&2; exit 2; }
+    reward_args=(
+        reward.reward_manager.name=dapo
+        +reward.reward_kwargs.overlong_buffer_cfg.enable=True
+        +reward.reward_kwargs.overlong_buffer_cfg.len="${OVERLONG_BUFFER_LEN}"
+        +reward.reward_kwargs.overlong_buffer_cfg.penalty_factor="${OVERLONG_PENALTY_FACTOR}"
+        +reward.reward_kwargs.overlong_buffer_cfg.log=True
+        +reward.reward_kwargs.max_resp_len="${max_response_length}"
+    )
+    overlong_tag=" overlong-${OVERLONG_BUFFER_LEN}-pf${OVERLONG_PENALTY_FACTOR}"
+fi
+
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 ${model_tag} ${n_gpus_rollout}-${n_gpus_training} tp${train_tp}dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${warmup_tag}${dynbsz_tag}${tis_tag}${objective_tag}${quant_tag}${kv_tag}${attn_tag}${val_tag} seed-${SEED}"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 ${model_tag} ${n_gpus_rollout}-${n_gpus_training} tp${train_tp}dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${warmup_tag}${dynbsz_tag}${tis_tag}${objective_tag}${quant_tag}${kv_tag}${attn_tag}${overlong_tag}${val_tag} seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
 # log_dir: TensorBoard (per-update rollout dumps are off: trainer.rollout_data_dir=null); CKPTS_DIR: global_step_N/ checkpoints.
 log_dir=${log_dir:-"logs/${exp_name_safe}"}
@@ -529,4 +564,4 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     async_training.replay_buffer.requires_mini_batches="${replay_requires_mini_batches}" \
     async_training.replay_buffer.sampling_seed="${replay_sampling_seed}" \
     async_training.replay_buffer.reuse_halflife="${replay_reuse_halflife}" \
-    async_training.replay_buffer.min_fresh_ratio="${replay_min_fresh_ratio}" "${engine_args[@]}" "${dynbsz_args[@]}" "$@"
+    async_training.replay_buffer.min_fresh_ratio="${replay_min_fresh_ratio}" "${engine_args[@]}" "${dynbsz_args[@]}" "${reward_args[@]}" "$@"

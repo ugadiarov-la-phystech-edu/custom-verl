@@ -223,6 +223,31 @@ class TestInsertionGate:
         assert (r.all_correct_groups_window, r.all_wrong_groups_window) == (correct, wrong)
         assert r.groups_completed_total == r.groups_completed_window == 1
 
+    def test_overlong_penalised_all_wrong_group_is_kept_on_the_length_penalty(self):
+        # DAPO overlong shaping: -1 for a wrong answer, minus up to 1 more inside the buffer
+        scores = [-1.0, -1.5, -1.0, -2.0]
+        r = _bare_rollouter()
+        rs = _rollout_sample(scores)
+        assert r._prepare_replay_group(rs)
+        adv = rs.full_batch.non_tensor_batch["advantage_scalar"]
+        t = torch.tensor(scores)
+        np.testing.assert_allclose(adv, ((t - t.mean()) / (t.std() + 1e-6)).numpy(), rtol=1e-5, atol=1e-6)
+        assert adv[0] == adv[2] > 0 > adv[1] > adv[3]  # shorter wrong answers are pushed up
+        assert r.all_correct_groups_total == r.all_wrong_groups_total == 0
+
+    def test_all_wrong_group_outside_the_buffer_is_still_dropped(self):
+        r = _bare_rollouter()
+        assert not r._prepare_replay_group(_rollout_sample([-1.0] * N))
+        assert r.all_wrong_groups_total == 1
+
+    def test_all_correct_group_with_one_long_answer_is_kept(self):
+        r = _bare_rollouter()
+        rs = _rollout_sample([1.0, 1.0, 0.3, 1.0])
+        assert r._prepare_replay_group(rs)
+        adv = rs.full_batch.non_tensor_batch["advantage_scalar"]
+        assert adv[2] < 0 < adv[0]
+        assert r.all_correct_groups_total == 0
+
     def test_kept_group_counts_as_completed_only(self):
         r = _bare_rollouter()
         assert r._prepare_replay_group(_rollout_sample([1.0, 0.0, 0.0, 0.0]))

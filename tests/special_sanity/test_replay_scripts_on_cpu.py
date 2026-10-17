@@ -54,6 +54,7 @@ QWEN25_1P7_DECOUPLED = QWEN25_2P6_DECOUPLED.replace("dapo17k_2+6_", "dapo17k_1+7
 QWEN25_1P7_DECOUPLED_CSR64 = QWEN25_1P7_DECOUPLED.replace(
     "_token-mean_qwen2.5-7b.sh", "_token-mean_csr64_seqs1024_mbt16k_qwen2.5-7b.sh"
 )
+QWEN25_1P7_CSR64_OVERLONG = QWEN25_1P7_DECOUPLED_CSR64.replace("_mbt16k_qwen2.5-7b.sh", "_mbt16k_overlong-2048_qwen2.5-7b.sh")
 CUDAGRAPH_1024 = [1, 2, 4] + list(range(8, 256, 8)) + list(range(256, 512, 16)) + list(range(512, 1025, 32))
 ALL = [QWEN, PANGU, QWEN_FP8]
 QWEN_ARMS = (QWEN, QWEN_FP8)
@@ -80,6 +81,8 @@ SCRIPT_ENV_KNOBS = {
     "test_freq",
     "save_freq",
     "rollout_is_threshold",
+    "OVERLONG_BUFFER_LEN",
+    "OVERLONG_PENALTY_FACTOR",
     "loss_agg_mode",
     "DYNAMIC_BSZ",
     "DYNAMIC_BSZ_MAX_TOKENS",
@@ -1295,3 +1298,128 @@ class TestDecoupled1p7Csr64:
         monkeypatch.setattr(rollouter_cls, "_init_dump_executor", lambda self: None)
         r = rollouter_cls(config=_cfg(QWEN25_1P7_DECOUPLED_CSR64), tokenizer=None)
         assert r.concurrent_samples_per_replica == 64 and r.ramp_first_size == 70
+
+
+# --------------------------------------------------------------------------- DAPO overlong reward shaping
+
+# Keys the overlong toggle adds or changes (as in test_baseline_scripts_on_cpu.py for the sync arm).
+OVERLONG_KEYS = {
+    "reward.reward_manager.name",
+    "reward.reward_kwargs.overlong_buffer_cfg.enable",
+    "reward.reward_kwargs.overlong_buffer_cfg.len",
+    "reward.reward_kwargs.overlong_buffer_cfg.penalty_factor",
+    "reward.reward_kwargs.overlong_buffer_cfg.log",
+    "reward.reward_kwargs.max_resp_len",
+}
+
+
+@pytest.mark.parametrize(
+    "script", [*ALL, QWEN25_FP8_C8, QWEN25_2P6_KV, QWEN25_2P6_DECOUPLED, QWEN25_1P7_DECOUPLED, QWEN25_1P7_DECOUPLED_CSR64]
+)
+def test_overlong_penalty_is_off_by_default(script):
+    c = compose(script)
+    assert c["reward"]["reward_manager"]["name"] == "naive"
+    assert "reward_kwargs" not in c["reward"]
+    assert "overlong" not in c["trainer"]["experiment_name"]
+
+
+class TestCsr64Overlong:
+    def test_dapo_reward_manager_with_soft_overlong_penalty(self):
+        reward = compose(QWEN25_1P7_CSR64_OVERLONG)["reward"]
+        assert reward["reward_manager"]["name"] == "dapo"
+        assert reward["reward_manager"]["source"] == "register"
+        assert reward["reward_kwargs"] == {
+            "overlong_buffer_cfg": {"enable": True, "len": 2048, "penalty_factor": 1.0, "log": True},
+            "max_resp_len": 8192,
+        }
+
+    def test_name_is_the_csr64_name_with_the_overlong_tag(self):
+        base = compose(QWEN25_1P7_DECOUPLED_CSR64)["trainer"]["experiment_name"]
+        name = compose(QWEN25_1P7_CSR64_OVERLONG)["trainer"]["experiment_name"]
+        assert " overlong-2048-pf1.0 " in name and name.endswith(" seed-1")
+        assert name.replace(" overlong-2048-pf1.0", "") == base
+        # after the engine tags, before the validation-sampling and seed tags
+        assert name.index(" kv-fp8") < name.index(" overlong-") < name.index(" val-t1.0-p1.0")
+
+    def test_is_the_csr64_arm_plus_only_the_overlong_penalty(self):
+        assert _differing(compose(QWEN25_1P7_DECOUPLED_CSR64), compose(QWEN25_1P7_CSR64_OVERLONG)) == OVERLONG_KEYS
+
+    def test_buffer_zero_is_the_csr64_script(self):
+        off = compose(QWEN25_1P7_CSR64_OVERLONG, OVERLONG_BUFFER_LEN="0")
+        assert _differing(compose(QWEN25_1P7_DECOUPLED_CSR64), off) == set()
+        assert off["trainer"]["experiment_name"] == compose(QWEN25_1P7_DECOUPLED_CSR64)["trainer"]["experiment_name"]
+
+    def test_knobs_apply(self):
+        c = compose(QWEN25_1P7_CSR64_OVERLONG, OVERLONG_BUFFER_LEN="1024", OVERLONG_PENALTY_FACTOR="0.5")
+        cfg = c["reward"]["reward_kwargs"]["overlong_buffer_cfg"]
+        assert (cfg["len"], cfg["penalty_factor"]) == (1024, 0.5)
+        assert " overlong-1024-pf0.5 " in c["trainer"]["experiment_name"]
+
+    def test_max_resp_len_follows_max_response_length(self):
+        c = compose(QWEN25_1P7_CSR64_OVERLONG, max_response_length="4096", OVERLONG_BUFFER_LEN="1024")
+        assert c["reward"]["reward_kwargs"]["max_resp_len"] == 4096 == c["data"]["max_response_length"]
+
+    def test_csr64_knobs_and_trailing_overrides_still_win(self):
+        c = compose(QWEN25_1P7_CSR64_OVERLONG, concurrent_samples_per_replica="48", ROLLOUT_MAX_NUM_SEQS="768")
+        assert c["async_training"]["concurrent_samples_per_replica"] == 48
+        assert c["actor_rollout_ref"]["rollout"]["max_num_seqs"] == 768
+        c = compose(
+            QWEN25_1P7_CSR64_OVERLONG,
+            args=("++reward.reward_kwargs.overlong_buffer_cfg.log=False", "actor_rollout_ref.rollout.max_num_batched_tokens=12288"),
+        )
+        assert c["reward"]["reward_kwargs"]["overlong_buffer_cfg"]["log"] is False
+        assert c["actor_rollout_ref"]["rollout"]["max_num_batched_tokens"] == 12288
+
+    def test_runs_the_csr64_script(self):
+        code = [ln for ln in (SCRIPTS / QWEN25_1P7_CSR64_OVERLONG).read_text().splitlines() if not ln.lstrip().startswith("#")]
+        execs = [ln for ln in code if ln.lstrip().startswith("exec ")]
+        assert len(execs) == 1 and execs[0].count(QWEN25_1P7_DECOUPLED_CSR64) == 1
+
+    def test_reward_manager_reads_the_composed_config(self):
+        from verl.experimental.reward_loop.reward_manager.dapo import DAPORewardManager
+
+        manager = DAPORewardManager(_cfg(QWEN25_1P7_CSR64_OVERLONG), tokenizer=None, compute_score=lambda **kw: 0.0)
+        assert manager.max_resp_len == 8192
+        assert manager.overlong_buffer_cfg.enable is True and manager.overlong_buffer_cfg.len == 2048
+        assert manager.overlong_buffer_cfg.penalty_factor == 1.0
+
+    def test_trainer_and_rollouter_accept_it(self, monkeypatch):
+        from verl.experimental.fully_async_policy import fully_async_rollouter as mod
+        from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
+
+        cfg = _cfg(QWEN25_1P7_CSR64_OVERLONG)
+        cfg.trainer.logger = ["console"]
+        trainer_cls = FullyAsyncTrainer.__ray_metadata__.modified_class
+        t = trainer_cls(config=cfg, tokenizer=None, role_worker_mapping={}, resource_pool_manager=None)
+        assert t.required_samples == 140
+
+        rollouter_cls = mod.FullyAsyncRollouter.__ray_metadata__.modified_class
+        monkeypatch.setattr(mod, "create_rl_dataset", lambda *a, **k: [0] * 8)
+        monkeypatch.setattr(mod, "create_rl_sampler", lambda *a, **k: None)
+        monkeypatch.setattr(
+            rollouter_cls, "_create_dataloader", lambda self, *a, **k: setattr(self, "train_dataloader", [0] * 8)
+        )
+        monkeypatch.setattr(rollouter_cls, "_init_dump_executor", lambda self: None)
+        r = rollouter_cls(config=_cfg(QWEN25_1P7_CSR64_OVERLONG), tokenizer=None)
+        assert r.concurrent_samples_per_replica == 64 and r.replay_mode
+
+
+@pytest.mark.parametrize(
+    "env, message",
+    [
+        ({"OVERLONG_BUFFER_LEN": "-1"}, "OVERLONG_BUFFER_LEN must be a non-negative integer"),
+        ({"OVERLONG_BUFFER_LEN": "2k"}, "OVERLONG_BUFFER_LEN must be a non-negative integer"),
+        ({"OVERLONG_BUFFER_LEN": "8192"}, "OVERLONG_BUFFER_LEN must be < max_response_length = 8192"),
+        ({"OVERLONG_PENALTY_FACTOR": "0"}, "OVERLONG_PENALTY_FACTOR must be a positive number"),
+        ({"OVERLONG_PENALTY_FACTOR": "x"}, "OVERLONG_PENALTY_FACTOR must be a positive number"),
+    ],
+)
+def test_invalid_overlong_settings_fail_fast(env, message, tmp_path):
+    proc = _run(QWEN25_1P7_CSR64_OVERLONG, env, (), tmp_path)
+    assert proc.returncode == 2 and message in proc.stderr
+
+
+def test_the_base_toggle_works_on_any_arm():
+    c = compose(QWEN, OVERLONG_BUFFER_LEN="2048")
+    assert c["reward"]["reward_manager"]["name"] == "dapo"
+    assert _differing(compose(QWEN), c) == OVERLONG_KEYS
