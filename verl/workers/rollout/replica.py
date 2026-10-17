@@ -283,8 +283,9 @@ class RolloutReplica(ABC):
         await asyncio.gather(*[server.clear_kv_cache.remote() for server in self.servers])
 
     async def release_kv_cache(self):
-        """Release only the kv_cache GPU memory, keeping model weights in place."""
-        await asyncio.gather(*[server.release_kv_cache.remote() for server in self.servers])
+        """Release only the kv_cache GPU memory, keeping model weights in place. Returns the servers' results
+        (vLLM: per-worker memory stats; other backends: None)."""
+        return await asyncio.gather(*[server.release_kv_cache.remote() for server in self.servers])
 
     async def resume_kv_cache(self):
         """Restore the kv_cache GPU memory after a weight sync."""
