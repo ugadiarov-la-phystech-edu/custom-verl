@@ -472,7 +472,7 @@ class CheckpointEngineManager:
         weights untouched, so the NCCL transfer can write directly into the
         existing weight buffers.  Call resume_kv_cache_replicas() after sync.
         """
-        await asyncio.gather(*[r.release_kv_cache() for r in self.replicas])
+        return await asyncio.gather(*[r.release_kv_cache() for r in self.replicas])
 
     @auto_await
     async def resume_kv_cache_replicas(self):
@@ -505,8 +505,9 @@ class CheckpointEngineManager:
         rollout = RayWorkerGroup(worker_handles=workers, ray_cls_with_init=RayClassWithInitArgs(cls=_worker_cls))
         actor_wg = self.actor_wg
 
-        # 3. release kv_cache before weight sync (weights stay in place)
-        await self.release_kv_cache_replicas()
+        # 3. release kv_cache before weight sync (weights stay in place); vLLM replicas also hand back their
+        # cached-but-unused memory and report per-worker memory stats
+        release_results = await self.release_kv_cache_replicas()
 
         # 4. build process group
         self.build_process_group(rollout)
@@ -522,6 +523,7 @@ class CheckpointEngineManager:
         for result in results[: actor_wg.world_size]:
             if isinstance(result, dict):
                 sync_metrics.update(result)
+        sync_metrics.update(summarize_rollout_memory(release_results))
 
         # 6. finalize all workers
         ray.get(
@@ -536,6 +538,29 @@ class CheckpointEngineManager:
         await self.resume_generation_replicas()
 
         return sync_metrics
+
+
+ROLLOUT_MEMORY_PREFIX = "rollout_mem/"
+
+
+def summarize_rollout_memory(release_results) -> dict[str, float]:
+    """Per-sync rollout memory metrics from release_kv_cache_replicas()'s nested results (replicas -> servers ->
+    workers -> stats dict, with None for backends / ranks that report nothing): the max over all workers of each
+    stat, as ``rollout_mem/<stat>_gib``."""
+    merged: dict[str, float] = {}
+
+    def visit(node):
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if isinstance(value, int | float):
+                    name = f"{ROLLOUT_MEMORY_PREFIX}{key}_gib"
+                    merged[name] = max(merged.get(name, float("-inf")), float(value))
+        elif isinstance(node, list | tuple):
+            for item in node:
+                visit(item)
+
+    visit(release_results)
+    return merged
 
 
 async def split_weight_chunks(

@@ -25,7 +25,7 @@ from typing import Any, Literal, Optional, get_args
 import torch
 from vllm.outputs import RequestOutput
 
-from verl.utils.device import get_device_name, is_npu_available
+from verl.utils.device import get_device_name, get_torch_device, is_npu_available
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack, resolve_weight_name
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
 from verl.utils.vllm.qwen2_k_bias_center import maybe_apply_qwen2_k_bias_center
@@ -349,6 +349,20 @@ class vLLMColocateWorkerExtension:
             for model, model_config in self._iter_all_models_with_config():
                 process_weights_after_loading(model, model_config, self.device)
 
+        # =========================== step 4: release post-load temporaries ===========================
+        # The receiver's empty_cache ran before step 3; the post-load transforms (online FP8 re-quantization among
+        # them) allocate temporaries that would otherwise stay reserved through the next generation window.
+        release_device_cache()
+
+    def release_cached_memory(self) -> dict[str, float]:
+        """Hand the caching allocator's reserved-but-unallocated blocks back to the driver and report memory (GiB).
+
+        Called on every rollout worker right before a weight sync (vLLMHttpServer.release_kv_cache). The KV pool
+        and the weights stay allocated, but bursts since the last sync (validation, eager batches above the
+        captured CUDA-graph sizes, weight re-quantization temporaries) leave blocks reserved, and the rollout-side
+        checkpoint worker allocates its NCCL / IPC transfer buffers on the same GPU at that moment."""
+        return release_device_cache(collect_stats=True)
+
     def _apply_buffer_updates_all_models(self, buffer_updates, main_named_buffers):
         """Apply buffer updates to the main model and any synced MTP drafter.
 
@@ -428,6 +442,33 @@ class vLLMColocateWorkerExtension:
         trainer_rank_base = os.environ.get("VERL_ZMQ_BASE_TRAINER_RANK")
         trainer_rank = int(trainer_rank_base) + local_rank if trainer_rank_base is not None else local_rank
         return f"ipc:///tmp/rl-colocate-zmq-{job_id}-replica-{replica_rank}-rank-{trainer_rank}.sock"
+
+
+def release_device_cache(collect_stats: bool = False) -> dict[str, float]:
+    """gc + synchronize + ipc_collect + empty_cache on the current device; with ``collect_stats``, the memory
+    before / after in GiB (``reserved_before`` / ``reserved_after``: the caching allocator's reservation,
+    ``allocated`` / ``max_allocated``: live tensors and their peak since the previous call, ``device_used``: the
+    driver's view of the whole GPU, all processes) and a reset of the peak counter."""
+    import gc
+
+    device = get_torch_device()
+    gib = float(1 << 30)
+    gc.collect()
+    device.synchronize()
+    stats = {}
+    if collect_stats:
+        stats["reserved_before"] = device.memory_reserved() / gib
+        stats["allocated"] = device.memory_allocated() / gib
+        stats["max_allocated"] = device.max_memory_allocated() / gib
+    if hasattr(device, "ipc_collect"):
+        device.ipc_collect()
+    device.empty_cache()
+    if collect_stats:
+        stats["reserved_after"] = device.memory_reserved() / gib
+        free, total = device.mem_get_info()
+        stats["device_used"] = (total - free) / gib
+        device.reset_peak_memory_stats()
+    return stats
 
 
 class SuppressSignalInThread:
