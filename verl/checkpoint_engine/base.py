@@ -563,6 +563,12 @@ def summarize_rollout_memory(release_results) -> dict[str, float]:
     return merged
 
 
+def rollout_memory_metrics(metrics) -> dict[str, float]:
+    """The ``rollout_mem/`` entries of a metrics dict (e.g. CheckpointEngineManager.update_weights()'s return);
+    empty for None."""
+    return {k: v for k, v in (metrics or {}).items() if k.startswith(ROLLOUT_MEMORY_PREFIX)}
+
+
 async def split_weight_chunks(
     weights: Generator[tuple[str, torch.Tensor], None, None], bucket_size: int
 ) -> AsyncGenerator[tuple[TensorMeta, torch.Tensor], None]:

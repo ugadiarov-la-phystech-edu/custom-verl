@@ -120,7 +120,7 @@ def test_release_without_ipc_collect(monkeypatch):
 
 
 def test_worker_extension_rpc_returns_the_stats(device):
-    stats = vutils.vLLMColocateWorkerExtension.release_cached_memory(None)
+    stats = object.__new__(vutils.vLLMColocateWorkerExtension).release_cached_memory()
     assert set(stats) == {"reserved_before", "reserved_after", "allocated", "max_allocated", "device_used"}
     assert "empty_cache" in device.calls
 
@@ -315,3 +315,138 @@ def test_update_weights_from_ipc_releases_after_the_quantized_post_processing(mo
     )
     vutils.vLLMColocateWorkerExtension.update_weights_from_ipc(worker)
     assert order == ["prepare", "receive", "requantize", "release"]
+
+
+# --- rollout_mem/* reaching the fully-async trainer's logged metrics ---
+
+
+def test_rollout_memory_metrics_keeps_only_rollout_mem_keys():
+    metrics = {"rollout_mem/reserved_before_gib": 99.0, "timing/x": 1.0, "rollout_mem/allocated_gib": 40.0}
+    assert ce_base.rollout_memory_metrics(metrics) == {
+        "rollout_mem/reserved_before_gib": 99.0,
+        "rollout_mem/allocated_gib": 40.0,
+    }
+    assert ce_base.rollout_memory_metrics(None) == {}
+    assert ce_base.rollout_memory_metrics({}) == {}
+
+
+def _trainer_class(fat):
+    actor = fat.FullyAsyncTrainer
+    return actor.__ray_metadata__.modified_class if hasattr(actor, "__ray_metadata__") else actor
+
+
+def test_fully_async_trainer_logs_rollout_memory_with_the_cycle(monkeypatch):
+    from verl.experimental.fully_async_policy import fully_async_trainer as fat
+
+    logged = []
+    fake = SimpleNamespace(
+        metrics_aggregator=SimpleNamespace(
+            get_aggregated_metrics=lambda rollout_resource_utilization=None: {"actor/entropy": 0.5},
+            reset=lambda: None,
+        ),
+        _add_cumulative_time_metrics=lambda metrics, state: None,
+        rollouter=SimpleNamespace(get_timing_state=SimpleNamespace(remote=lambda: "ref")),
+        logger=SimpleNamespace(log=lambda data, step: logged.append((step, dict(data)))),
+        current_param_version=7,
+    )
+    monkeypatch.setattr(fat.ray, "get", lambda ref: {})
+    reset_timing = {"dynamic_resource/rollout_resource_utilization": 0.9, "rollout_mem/reserved_before_gib": 98.5}
+    _trainer_class(fat)._fit_log_aggregated_training_metrics(fake, reset_timing)
+    assert logged == [(7, {"actor/entropy": 0.5, "rollout_mem/reserved_before_gib": 98.5})]
+
+
+def test_fit_update_weights_folds_the_sync_metrics_into_its_return():
+    """Source-level guard: the update_weights() return must not be dropped again."""
+    import inspect
+
+    from verl.experimental.fully_async_policy import fully_async_trainer as fat
+
+    src = inspect.getsource(_trainer_class(fat)._fit_update_weights)
+    assert "sync_metrics = await self.checkpoint_manager.update_weights(" in src
+    assert "rollout_memory_metrics(sync_metrics)" in src
+
+
+# --- opt-in allocator snapshot (VERL_ROLLOUT_MEM_SNAPSHOT_DIR) ---
+
+
+class _FakeCudaMemory:
+    def __init__(self):
+        self.calls = []
+
+    def _record_memory_history(self, enabled="all", **kwargs):
+        self.calls.append(("record", enabled, kwargs.get("stacks")))
+        self.max_entries = kwargs.get("max_entries", self.__dict__.get("max_entries"))
+
+    def _dump_snapshot(self, path):
+        self.calls.append(("dump", path))
+        with open(path, "wb") as f:
+            f.write(b"snap")
+
+
+@pytest.fixture
+def cuda_memory(monkeypatch):
+    mem = _FakeCudaMemory()
+    monkeypatch.setattr(vutils.torch.cuda, "memory", mem)
+    return mem
+
+
+def test_snapshotter_is_off_without_the_env(monkeypatch, cuda_memory):
+    monkeypatch.delenv(vutils.MEM_SNAPSHOT_DIR_ENV, raising=False)
+    snap = vutils.RolloutMemorySnapshotter()
+    assert not snap.enabled
+    assert snap.on_release(100.0) is None
+    assert cuda_memory.calls == []
+
+
+def test_snapshotter_records_from_the_first_sync_and_dumps_later_ones(monkeypatch, cuda_memory, tmp_path):
+    monkeypatch.setenv(vutils.MEM_SNAPSHOT_DIR_ENV, str(tmp_path / "snaps"))
+    monkeypatch.setenv(vutils.MEM_SNAPSHOT_MIN_GIB_ENV, "60")
+    monkeypatch.setenv(vutils.MEM_SNAPSHOT_MAX_ENV, "2")
+    snap = vutils.RolloutMemorySnapshotter()
+    assert snap.on_release(47.0) is None  # first call: start recording only
+    assert cuda_memory.calls == [("record", "all", "python")]
+    assert cuda_memory.max_entries == 1_000_000
+    assert snap.on_release(50.0) is None  # below the threshold: no dump
+    first = snap.on_release(99.0)
+    assert first.endswith("_sync3.pickle") and (tmp_path / "snaps").is_dir()
+    second = snap.on_release(80.0)
+    assert second.endswith("_sync4.pickle")
+    assert cuda_memory.calls[-1] == ("record", None, None)  # max reached: recording stopped
+    assert not snap.enabled
+    assert snap.on_release(120.0) is None
+    assert [c[0] for c in cuda_memory.calls] == ["record", "dump", "dump", "record"]
+
+
+def test_release_cached_memory_snapshots_before_releasing(monkeypatch, device, cuda_memory, tmp_path):
+    monkeypatch.setenv(vutils.MEM_SNAPSHOT_DIR_ENV, str(tmp_path))
+    order = []
+    real_release = vutils.release_device_cache
+    monkeypatch.setattr(
+        vutils.RolloutMemorySnapshotter, "on_release", lambda self, gib: order.append(("snap", round(gib)))
+    )
+    monkeypatch.setattr(
+        vutils, "release_device_cache", lambda collect_stats=False: order.append("release") or real_release(True)
+    )
+    ext = object.__new__(vutils.vLLMColocateWorkerExtension)
+    stats = ext.release_cached_memory()
+    assert order == [("snap", 90), "release"]
+    assert stats["reserved_before"] == pytest.approx(90.0)
+    ext.release_cached_memory()
+    assert order[2:] == [("snap", round(device.reserved / GIB)), "release"]  # one snapshotter per worker
+
+
+def test_ppo_runtime_env_forwards_the_snapshot_env(monkeypatch):
+    from verl.trainer import constants_ppo
+
+    monkeypatch.setenv("VERL_ROLLOUT_MEM_SNAPSHOT_DIR", "/tmp/snaps")
+    monkeypatch.setenv("VERL_ROLLOUT_MEM_SNAPSHOT_MIN_GIB", "60")
+    env = constants_ppo.get_ppo_ray_runtime_env()["env_vars"]
+    assert env["VERL_ROLLOUT_MEM_SNAPSHOT_DIR"] == "/tmp/snaps"
+    assert env["VERL_ROLLOUT_MEM_SNAPSHOT_MIN_GIB"] == "60"
+
+
+def test_snapshotter_trace_length_is_configurable(monkeypatch, cuda_memory, tmp_path):
+    monkeypatch.setenv(vutils.MEM_SNAPSHOT_DIR_ENV, str(tmp_path))
+    monkeypatch.setenv(vutils.MEM_SNAPSHOT_ENTRIES_ENV, "5000")
+    vutils.RolloutMemorySnapshotter().on_release(10.0)
+    assert cuda_memory.max_entries == 5000

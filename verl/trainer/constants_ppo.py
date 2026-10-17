@@ -126,6 +126,10 @@ def get_ppo_ray_runtime_env(config=None):
         "NCCL_DETERMINISTIC",
         "NCCL_ALGO",
         "VERL_QWEN2_K_BIAS_CENTER",
+        "VERL_ROLLOUT_MEM_SNAPSHOT_DIR",
+        "VERL_ROLLOUT_MEM_SNAPSHOT_MIN_GIB",
+        "VERL_ROLLOUT_MEM_SNAPSHOT_MAX",
+        "VERL_ROLLOUT_MEM_SNAPSHOT_ENTRIES",
     ):
         val = os.environ.get(key)
         if val is not None:

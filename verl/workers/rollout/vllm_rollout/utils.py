@@ -360,7 +360,15 @@ class vLLMColocateWorkerExtension:
         Called on every rollout worker right before a weight sync (vLLMHttpServer.release_kv_cache). The KV pool
         and the weights stay allocated, but bursts since the last sync (validation, eager batches above the
         captured CUDA-graph sizes, weight re-quantization temporaries) leave blocks reserved, and the rollout-side
-        checkpoint worker allocates its NCCL / IPC transfer buffers on the same GPU at that moment."""
+        checkpoint worker allocates its NCCL / IPC transfer buffers on the same GPU at that moment.
+
+        With ``VERL_ROLLOUT_MEM_SNAPSHOT_DIR`` set, an allocator snapshot of the reservation is dumped first
+        (RolloutMemorySnapshotter)."""
+        snapshotter = getattr(self, "_mem_snapshotter", None)
+        if snapshotter is None:
+            snapshotter = self._mem_snapshotter = RolloutMemorySnapshotter()
+        if snapshotter.enabled:
+            snapshotter.on_release(get_torch_device().memory_reserved() / float(1 << 30))
         return release_device_cache(collect_stats=True)
 
     def _apply_buffer_updates_all_models(self, buffer_updates, main_named_buffers):
@@ -469,6 +477,59 @@ def release_device_cache(collect_stats: bool = False) -> dict[str, float]:
         stats["device_used"] = (total - free) / gib
         device.reset_peak_memory_stats()
     return stats
+
+
+MEM_SNAPSHOT_DIR_ENV = "VERL_ROLLOUT_MEM_SNAPSHOT_DIR"
+MEM_SNAPSHOT_MIN_GIB_ENV = "VERL_ROLLOUT_MEM_SNAPSHOT_MIN_GIB"
+MEM_SNAPSHOT_MAX_ENV = "VERL_ROLLOUT_MEM_SNAPSHOT_MAX"
+MEM_SNAPSHOT_ENTRIES_ENV = "VERL_ROLLOUT_MEM_SNAPSHOT_ENTRIES"
+
+
+class RolloutMemorySnapshotter:
+    """Opt-in allocator trace for the rollout worker (``VERL_ROLLOUT_MEM_SNAPSHOT_DIR=<dir>``).
+
+    The first call (the first pre-sync release) starts ``torch.cuda.memory._record_memory_history`` with Python
+    stacks, so engine start-up and profiling stay out of the trace. Each later call dumps a snapshot
+    (``rollout_mem_pid<pid>_sync<n>.pickle``, open it at https://pytorch.org/memory_viz) when the reservation is at
+    least ``VERL_ROLLOUT_MEM_SNAPSHOT_MIN_GIB`` (default 0). After ``VERL_ROLLOUT_MEM_SNAPSHOT_MAX`` dumps (default
+    3) it stops recording. The snapshot names the allocation stacks that make up the reservation. The trace keeps
+    the last ``VERL_ROLLOUT_MEM_SNAPSHOT_ENTRIES`` allocator events (default 1,000,000: several minutes of
+    CUDA-graph decoding, i.e. a whole sync interval)."""
+
+    def __init__(self):
+        self.directory = os.environ.get(MEM_SNAPSHOT_DIR_ENV, "").strip()
+        self.min_gib = float(os.environ.get(MEM_SNAPSHOT_MIN_GIB_ENV, "0"))
+        self.max_dumps = int(os.environ.get(MEM_SNAPSHOT_MAX_ENV, "3"))
+        self.max_entries = int(os.environ.get(MEM_SNAPSHOT_ENTRIES_ENV, "1000000"))
+        self.calls = 0
+        self.dumps = 0
+        self.recording = False
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.directory) and self.dumps < self.max_dumps
+
+    def on_release(self, reserved_gib: float) -> Optional[str]:
+        """Called before empty_cache; returns the snapshot path when one was written."""
+        if not self.enabled:
+            return None
+        self.calls += 1
+        memory = torch.cuda.memory
+        if not self.recording:
+            memory._record_memory_history(max_entries=self.max_entries, stacks="python")
+            self.recording = True
+            return None
+        if reserved_gib < self.min_gib:
+            return None
+        os.makedirs(self.directory, exist_ok=True)
+        path = os.path.join(self.directory, f"rollout_mem_pid{os.getpid()}_sync{self.calls}.pickle")
+        memory._dump_snapshot(path)
+        self.dumps += 1
+        logger.warning("rollout memory snapshot (reserved %.1f GiB) written to %s", reserved_gib, path)
+        if self.dumps >= self.max_dumps:
+            memory._record_memory_history(enabled=None)
+            self.recording = False
+        return path
 
 
 class SuppressSignalInThread:
