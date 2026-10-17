@@ -96,6 +96,7 @@ SCRIPT_ENV_KNOBS = {
     "ROLLOUT_MAX_MODEL_LEN",
     "ROLLOUT_MAX_NUM_SEQS",
     "VERL_QWEN2_K_BIAS_CENTER",
+    "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS",
     "val_temperature",
     "val_top_p",
     "OBJECTIVE",
@@ -1255,6 +1256,20 @@ class TestDecoupled1p7Csr64:
         assert c["async_training"]["replay_buffer"]["min_fresh_ratio"] == 1.0
         c = compose(QWEN25_1P7_DECOUPLED_CSR64, args=("actor_rollout_ref.rollout.max_num_batched_tokens=12288",))
         assert c["actor_rollout_ref"]["rollout"]["max_num_batched_tokens"] == 12288
+
+    def test_vllm_does_not_reserve_kv_for_its_cudagraph_estimate(self, tmp_path):
+        names = ("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS",)
+        seen = _env_seen_by_python(tmp_path, {}, script=QWEN25_1P7_DECOUPLED_CSR64, names=names)
+        assert seen["VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"] == "0"
+        override = {"VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS": "1"}
+        seen = _env_seen_by_python(tmp_path, override, script=QWEN25_1P7_DECOUPLED_CSR64, names=names)
+        assert seen["VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"] == "1"
+
+    def test_the_1p7_arm_keeps_vllm_s_estimate(self, tmp_path):
+        # default capture sizes (<= 512): the estimate is accurate (0.51 vs 0.54 GiB), nothing to switch off
+        names = ("VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS",)
+        seen = _env_seen_by_python(tmp_path, {}, script=QWEN25_1P7_DECOUPLED, names=names)
+        assert seen["VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"] == "<unset>"
 
     def test_trainer_rollouter_and_rollout_config_accept_it(self, monkeypatch):
         from verl.experimental.fully_async_policy import fully_async_rollouter as mod

@@ -28,6 +28,7 @@ from vllm.outputs import RequestOutput
 from verl.utils.device import get_device_name, get_torch_device, is_npu_available
 from verl.utils.vllm import TensorLoRARequest, VLLMHijack, resolve_weight_name
 from verl.utils.vllm.patch import patch_vllm_moe_model_weight_loader
+from verl.utils.gpu_memory_cap import apply_rollout_gpu_memory_cap
 from verl.utils.vllm.qwen2_k_bias_center import maybe_apply_qwen2_k_bias_center
 from verl.utils.vllm.vllm_quant_utils import (
     INT8_QUANT_ENABLED_ENV,
@@ -200,6 +201,8 @@ class vLLMColocateWorkerExtension:
         instance = super().__new__(cls)
         instance._is_qat_model = _is_qat_model
         instance._is_modelopt_qat = _is_modelopt_qat
+        # 4. standalone rollout: cap the allocator (VERL_GPU_MEM_CAP_GB) once init_device has picked the GPU
+        wrap_init_device_with_memory_cap(instance, vllm_config)
         return instance
 
     def _get_drafter_model(self):
@@ -483,6 +486,35 @@ MEM_SNAPSHOT_DIR_ENV = "VERL_ROLLOUT_MEM_SNAPSHOT_DIR"
 MEM_SNAPSHOT_MIN_GIB_ENV = "VERL_ROLLOUT_MEM_SNAPSHOT_MIN_GIB"
 MEM_SNAPSHOT_MAX_ENV = "VERL_ROLLOUT_MEM_SNAPSHOT_MAX"
 MEM_SNAPSHOT_ENTRIES_ENV = "VERL_ROLLOUT_MEM_SNAPSHOT_ENTRIES"
+
+
+ROLLOUT_ALLOCATOR_CAP_ENV = "VERL_VLLM_ALLOCATOR_CAP"  # set to "1" by vLLMHttpServer for STANDALONE engines
+
+
+def maybe_apply_rollout_memory_cap(vllm_config) -> Optional[float]:
+    """Apply the standalone-rollout allocator cap when this worker's server marked it (``VERL_VLLM_ALLOCATOR_CAP=1``).
+
+    Must run after the worker selected its device. Returns the applied fraction, or None."""
+    if os.environ.get(ROLLOUT_ALLOCATOR_CAP_ENV) != "1":
+        return None
+    return apply_rollout_gpu_memory_cap(vllm_config.cache_config.gpu_memory_utilization)
+
+
+def wrap_init_device_with_memory_cap(worker, vllm_config) -> bool:
+    """Make ``worker.init_device()`` apply the rollout allocator cap right after it selects the GPU (and before the
+    model load, memory profiling and KV allocation). An instance attribute, so it wins over the Worker class's
+    method (the extension is appended to the worker's bases and cannot override it). Returns whether it wrapped."""
+    if os.environ.get(ROLLOUT_ALLOCATOR_CAP_ENV) != "1" or vllm_config is None:
+        return False
+    original = worker.init_device
+
+    def init_device(*args, **kwargs):
+        result = original(*args, **kwargs)
+        maybe_apply_rollout_memory_cap(vllm_config)
+        return result
+
+    worker.init_device = init_device
+    return True
 
 
 class RolloutMemorySnapshotter:

@@ -450,3 +450,90 @@ def test_snapshotter_trace_length_is_configurable(monkeypatch, cuda_memory, tmp_
     monkeypatch.setenv(vutils.MEM_SNAPSHOT_ENTRIES_ENV, "5000")
     vutils.RolloutMemorySnapshotter().on_release(10.0)
     assert cuda_memory.max_entries == 5000
+
+
+# --- standalone rollout allocator cap (VERL_GPU_MEM_CAP_GB) ---
+
+
+@pytest.mark.parametrize(
+    "mode, expected",
+    [("STANDALONE", "1"), ("HYBRID", None), ("COLOCATED", None)],
+)
+def test_allocator_cap_env_marks_standalone_servers_only(mode, expected):
+    environ = {vserver.ALLOCATOR_CAP_ENV: "1"}  # stale mark from a previous server in this process
+    vserver._allocator_cap_env(getattr(vserver.RolloutMode, mode), environ)
+    assert environ.get(vserver.ALLOCATOR_CAP_ENV) == expected
+    assert vserver.ALLOCATOR_CAP_ENV == vutils.ROLLOUT_ALLOCATOR_CAP_ENV
+
+
+def test_server_init_marks_the_workers():
+    import inspect
+
+    src = inspect.getsource(vserver.vLLMHttpServer.__init__)
+    assert "_allocator_cap_env(rollout_mode, os.environ)" in src
+
+
+def _cap_config(util=0.5):
+    return SimpleNamespace(cache_config=SimpleNamespace(gpu_memory_utilization=util))
+
+
+def test_maybe_apply_rollout_memory_cap_follows_the_mark(monkeypatch):
+    calls = []
+    monkeypatch.setattr(vutils, "apply_rollout_gpu_memory_cap", lambda util: calls.append(util) or 0.586)
+    monkeypatch.delenv(vutils.ROLLOUT_ALLOCATOR_CAP_ENV, raising=False)
+    assert vutils.maybe_apply_rollout_memory_cap(_cap_config()) is None
+    monkeypatch.setenv(vutils.ROLLOUT_ALLOCATOR_CAP_ENV, "0")
+    assert vutils.maybe_apply_rollout_memory_cap(_cap_config()) is None
+    assert calls == []
+    monkeypatch.setenv(vutils.ROLLOUT_ALLOCATOR_CAP_ENV, "1")
+    assert vutils.maybe_apply_rollout_memory_cap(_cap_config(0.45)) == 0.586
+    assert calls == [0.45]
+
+
+class _Worker:
+    def __init__(self, order):
+        self.order = order
+
+    def init_device(self, *args, **kwargs):
+        self.order.append(("init_device", args, kwargs))
+        return "device-ready"
+
+
+def test_wrapped_init_device_caps_right_after_selecting_the_gpu(monkeypatch):
+    order = []
+    monkeypatch.setenv(vutils.ROLLOUT_ALLOCATOR_CAP_ENV, "1")
+    monkeypatch.setattr(vutils, "apply_rollout_gpu_memory_cap", lambda util: order.append(("cap", util)) or 0.586)
+    worker = _Worker(order)
+    assert vutils.wrap_init_device_with_memory_cap(worker, _cap_config(0.5)) is True
+    assert order == []  # nothing until vLLM calls init_device
+    assert worker.init_device(1, k=2) == "device-ready"
+    assert order == [("init_device", (1,), {"k": 2}), ("cap", 0.5)]
+
+
+@pytest.mark.parametrize("mark, config", [(None, _cap_config()), ("0", _cap_config()), ("1", None)])
+def test_init_device_is_untouched_without_the_mark_or_config(monkeypatch, mark, config):
+    if mark is None:
+        monkeypatch.delenv(vutils.ROLLOUT_ALLOCATOR_CAP_ENV, raising=False)
+    else:
+        monkeypatch.setenv(vutils.ROLLOUT_ALLOCATOR_CAP_ENV, mark)
+    worker = _Worker([])
+    assert vutils.wrap_init_device_with_memory_cap(worker, config) is False
+    assert "init_device" not in vars(worker)
+
+
+def test_worker_extension_new_wraps_init_device():
+    import inspect
+
+    src = inspect.getsource(vutils.vLLMColocateWorkerExtension.__new__)
+    assert "wrap_init_device_with_memory_cap(instance, vllm_config)" in src
+
+
+def test_ppo_runtime_env_forwards_the_cap_env(monkeypatch):
+    from verl.trainer import constants_ppo
+
+    monkeypatch.delenv("VERL_GPU_MEM_CAP_GB", raising=False)
+    env = constants_ppo.get_ppo_ray_runtime_env()["env_vars"]
+    assert "VERL_GPU_MEM_CAP_GB" not in env
+    monkeypatch.setenv("VERL_GPU_MEM_CAP_GB", "78")
+    env = constants_ppo.get_ppo_ray_runtime_env()["env_vars"]
+    assert env["VERL_GPU_MEM_CAP_GB"] == "78"

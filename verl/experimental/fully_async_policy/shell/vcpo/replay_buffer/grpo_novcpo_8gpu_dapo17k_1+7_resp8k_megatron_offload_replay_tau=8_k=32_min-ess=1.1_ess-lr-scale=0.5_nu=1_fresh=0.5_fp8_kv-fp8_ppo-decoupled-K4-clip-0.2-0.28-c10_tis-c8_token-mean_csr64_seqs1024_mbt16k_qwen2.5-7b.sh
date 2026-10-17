@@ -18,6 +18,11 @@
 #     leave ~15k for prefill (new groups and the re-prefill of every in-flight request after each weight sync);
 #   * actor_rollout_ref.rollout.cudagraph_capture_sizes up to 1024 (vLLM default: 512): decode batches above 512
 #     would otherwise run eagerly (slower, and where the rollout worker's memory grew);
+#   * VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0: with captures up to 1024 vLLM's start-up estimate of CUDA-graph
+#     memory is 28.39 GiB vs 0.91 GiB actually used, and it is taken out of the KV cache (33.16 GiB / 1,241,712
+#     tokens instead of ~62 GiB / ~2.3M as in the 1+7 arm). Off, the KV cache is again ~62 GiB, which the 1024
+#     sequences need once responses grow. vLLM's live memory is then ~71 GiB of the 0.5 x 139.8 GiB budget, under
+#     the rollout allocator cap (VERL_GPU_MEM_CAP_GB=78);
 #   * replay_min_fresh_ratio=0.5 (as the 1+7 arm): an update waits for 70 newly arrived groups and the buffer fills the
 #     rest. The 1+7 run at 32 groups was rollout-bound with ~50% replay per update and its entropy blew up; the stable
 #     2+6 decoupled run was ~100% fresh. replay_min_fresh_ratio=1.0 makes every update fresh-only (the trainer then
@@ -36,6 +41,7 @@ set -euo pipefail
 export concurrent_samples_per_replica=${concurrent_samples_per_replica:-64}
 export ROLLOUT_MAX_NUM_SEQS=${ROLLOUT_MAX_NUM_SEQS:-1024}
 export replay_min_fresh_ratio=${replay_min_fresh_ratio:-0.5}
+export VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=${VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS:-0}
 
 exec bash "$(dirname "${BASH_SOURCE[0]}")/grpo_novcpo_8gpu_dapo17k_1+7_resp8k_megatron_offload_replay_tau=8_k=32_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.5_fp8_kv-fp8_ppo-decoupled-K4-clip-0.2-0.28-c10_tis-c8_token-mean_qwen2.5-7b.sh" \
     actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
