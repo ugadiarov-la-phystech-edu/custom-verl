@@ -19,7 +19,12 @@ import pytest
 from omegaconf import OmegaConf
 
 import verl.utils.gpu_memory_cap as gpu_memory_cap
-from verl.utils.gpu_memory_cap import GPU_MEM_CAP_ENV, apply_gpu_memory_cap
+from verl.utils.gpu_memory_cap import (
+    GPU_MEM_CAP_ENV,
+    apply_gpu_memory_cap,
+    apply_rollout_gpu_memory_cap,
+    rollout_allocator_fraction,
+)
 
 GiB = 1024**3
 
@@ -29,6 +34,7 @@ class _FakeDevice:
         self.total = int(total_gib * GiB)
         self.available = available
         self.fractions = []
+        self.fraction_devices = []
 
     def is_available(self):
         return self.available
@@ -40,8 +46,9 @@ class _FakeDevice:
         assert idx == 0
         return type("Props", (), {"total_memory": self.total})()
 
-    def set_per_process_memory_fraction(self, fraction):
+    def set_per_process_memory_fraction(self, fraction, device=None):
         self.fractions.append(fraction)
+        self.fraction_devices.append(device)
 
 
 @pytest.fixture
@@ -120,6 +127,86 @@ class TestGuards:
         monkeypatch.setattr(gpu_memory_cap, "get_torch_device", lambda: dev)
         monkeypatch.setenv(GPU_MEM_CAP_ENV, "80")
         assert apply_gpu_memory_cap() is None
+        assert dev.fractions == []
+
+
+# --------------------------------------------------------------------------- standalone rollout cap
+
+H200 = int(139.8 * GiB)
+
+
+class TestRolloutFraction:
+    def test_unset_cap_is_none(self, device):
+        assert rollout_allocator_fraction(H200, 0.5) is None
+
+    def test_same_cap_as_the_trainer(self, device, monkeypatch):
+        monkeypatch.setenv(GPU_MEM_CAP_ENV, "78")
+        fraction = rollout_allocator_fraction(H200, 0.5)
+        assert fraction == pytest.approx(78 / 139.8, rel=1e-6)
+        monkeypatch.setattr(gpu_memory_cap, "get_torch_device", lambda: _FakeDevice(total_gib=139.8))
+        assert apply_gpu_memory_cap() == pytest.approx(fraction, rel=1e-9)
+
+    @pytest.mark.parametrize("value, gib", [(" 80 ", 80.0), ("1e2", 100.0), ("79.5", 79.5)])
+    def test_numeric_forms(self, device, monkeypatch, value, gib):
+        monkeypatch.setenv(GPU_MEM_CAP_ENV, value)
+        assert rollout_allocator_fraction(H200, 0.5) == pytest.approx(gib / 139.8, rel=1e-6)
+
+    @pytest.mark.parametrize("value", ["0", "-1", "eighty", "nan"])
+    def test_invalid_cap_raises(self, device, monkeypatch, value):
+        monkeypatch.setenv(GPU_MEM_CAP_ENV, value)
+        with pytest.raises(ValueError, match=GPU_MEM_CAP_ENV):
+            rollout_allocator_fraction(H200, 0.5)
+
+    @pytest.mark.parametrize("cap", ["139.8", "200"])
+    def test_whole_device_or_more_is_uncapped(self, device, monkeypatch, caplog, cap):
+        monkeypatch.setenv(GPU_MEM_CAP_ENV, cap)
+        with caplog.at_level(logging.WARNING, logger=gpu_memory_cap.logger.name):
+            assert rollout_allocator_fraction(H200, 0.5) is None
+        assert "leaving the rollout allocator uncapped" in caplog.text
+
+    @pytest.mark.parametrize("util", [0.6, 0.558, 0.9])
+    def test_not_above_gpu_memory_utilization_is_uncapped(self, device, monkeypatch, caplog, util):
+        monkeypatch.setenv(GPU_MEM_CAP_ENV, "78")  # fraction 0.5579
+        with caplog.at_level(logging.WARNING, logger=gpu_memory_cap.logger.name):
+            assert rollout_allocator_fraction(H200, util) is None
+        assert "gpu_memory_utilization" in caplog.text
+
+    def test_just_above_gpu_memory_utilization_is_applied(self, device, monkeypatch):
+        monkeypatch.setenv(GPU_MEM_CAP_ENV, "78")
+        assert rollout_allocator_fraction(H200, 0.557) == pytest.approx(78 / 139.8, rel=1e-6)
+
+
+class TestApplyRolloutCap:
+    def _device(self, monkeypatch, **kw):
+        dev = _FakeDevice(total_gib=139.8, **kw)
+        monkeypatch.setattr(gpu_memory_cap, "get_torch_device", lambda: dev)
+        return dev
+
+    def test_sets_the_fraction_once_on_the_current_device_and_logs(self, device, monkeypatch, caplog):
+        dev = self._device(monkeypatch)
+        monkeypatch.setenv(GPU_MEM_CAP_ENV, "78")
+        with caplog.at_level(logging.WARNING, logger=gpu_memory_cap.logger.name):
+            fraction = apply_rollout_gpu_memory_cap(0.5)
+        assert fraction == pytest.approx(78 / 139.8, rel=1e-6)
+        assert dev.fractions == [fraction]
+        assert dev.fraction_devices == [0]
+        assert "Capped the rollout allocator at 78.0 GiB of 139.8 GiB" in caplog.text
+
+    def test_unset_sets_nothing(self, device, monkeypatch):
+        dev = self._device(monkeypatch)
+        assert apply_rollout_gpu_memory_cap(0.5) is None
+        assert dev.fractions == []
+
+    def test_no_accelerator_sets_nothing(self, device, monkeypatch):
+        dev = self._device(monkeypatch, available=False)
+        monkeypatch.setenv(GPU_MEM_CAP_ENV, "78")
+        assert apply_rollout_gpu_memory_cap(0.5) is None
+        assert dev.fractions == []
+
+    def test_guarded_fraction_sets_nothing(self, device, monkeypatch):
+        dev = self._device(monkeypatch)
+        monkeypatch.setenv(GPU_MEM_CAP_ENV, "78")
+        assert apply_rollout_gpu_memory_cap(0.7) is None
         assert dev.fractions == []
 
 

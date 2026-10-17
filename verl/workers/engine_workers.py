@@ -479,7 +479,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         self._is_ref = self.role in ["ref", "actor_rollout_ref"]
 
         # Optional H100 emulation (VERL_GPU_MEM_CAP_GB). Trainer processes only, before any
-        # allocation; the rollout servers are capped via rollout.gpu_memory_utilization instead.
+        # allocation. Standalone rollout workers get the same cap in vllm_rollout/utils.py.
         if self._is_actor:
             apply_gpu_memory_cap()
 
