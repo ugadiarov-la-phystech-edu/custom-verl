@@ -51,6 +51,10 @@ QWEN25_2P6_DECOUPLED = (
     "_qwen2.5-7b.sh"
 )
 QWEN25_1P7_DECOUPLED = QWEN25_2P6_DECOUPLED.replace("dapo17k_2+6_", "dapo17k_1+7_")
+QWEN25_1P7_DECOUPLED_CSR64 = QWEN25_1P7_DECOUPLED.replace(
+    "_token-mean_qwen2.5-7b.sh", "_token-mean_csr64_seqs1024_mbt16k_qwen2.5-7b.sh"
+)
+CUDAGRAPH_1024 = [1, 2, 4] + list(range(8, 256, 8)) + list(range(256, 512, 16)) + list(range(512, 1025, 32))
 ALL = [QWEN, PANGU, QWEN_FP8]
 QWEN_ARMS = (QWEN, QWEN_FP8)
 DEEPGEMM_VARS = ("CUDA_HOME", "DG_JIT_CACHE_DIR", "VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER")
@@ -1203,3 +1207,76 @@ def test_valid_layouts_pass_the_dp_split_check(script, env):
 def test_invalid_minibatch_values_are_rejected(env, tmp_path):
     proc = _run(QWEN, env, (), tmp_path)
     assert proc.returncode == 2 and "train_prompt_mini_bsz must be a positive integer" in proc.stderr
+
+
+# --------------------------------------------------------------------------- 1+7 decoupled, 64 groups / 1024 seqs
+
+CSR64_KEYS = {
+    "async_training.concurrent_samples_per_replica",
+    "actor_rollout_ref.rollout.max_num_seqs",
+    "actor_rollout_ref.rollout.max_num_batched_tokens",
+    "actor_rollout_ref.rollout.cudagraph_capture_sizes",
+}
+
+
+class TestDecoupled1p7Csr64:
+    def test_rollout_concurrency(self):
+        c = compose(QWEN25_1P7_DECOUPLED_CSR64)
+        r = c["actor_rollout_ref"]["rollout"]
+        assert c["async_training"]["concurrent_samples_per_replica"] == 64
+        assert r["max_num_seqs"] == 1024 == 16 * 64
+        assert r["max_num_batched_tokens"] == 16384
+        assert r["cudagraph_capture_sizes"] == CUDAGRAPH_1024
+        assert max(r["cudagraph_capture_sizes"]) == r["max_num_seqs"]
+        assert c["async_training"]["replay_buffer"]["min_fresh_ratio"] == 0.5  # as the 1+7 arm
+
+    def test_capture_sizes_are_vllm_s_default_spacing_extended(self):
+        sizes = CUDAGRAPH_1024
+        assert sizes == sorted(set(sizes)) and sizes[:4] == [1, 2, 4, 8]
+        assert [s for s in sizes if s <= 512] == [1, 2, 4] + list(range(8, 256, 8)) + list(range(256, 513, 16))
+
+    def test_differs_from_the_1p7_arm_only_in_the_rollout_knobs(self):
+        assert _differing(compose(QWEN25_1P7_DECOUPLED), compose(QWEN25_1P7_DECOUPLED_CSR64)) == CSR64_KEYS
+
+    def test_name(self):
+        name = compose(QWEN25_1P7_DECOUPLED_CSR64)["trainer"]["experiment_name"]
+        base = compose(QWEN25_1P7_DECOUPLED)["trainer"]["experiment_name"]
+        assert name == base and " 1-7 tp1dp7 hdo B-35 " in name  # the rollout knobs are untagged
+
+    def test_runs_the_1p7_arm(self):
+        lines = (SCRIPTS / QWEN25_1P7_DECOUPLED_CSR64).read_text().splitlines()
+        assert [ln for ln in lines if ln.lstrip().startswith("exec ")][0].count(QWEN25_1P7_DECOUPLED) == 1
+
+    def test_env_knobs_and_trailing_overrides_still_win(self):
+        c = compose(QWEN25_1P7_DECOUPLED_CSR64, concurrent_samples_per_replica="48", ROLLOUT_MAX_NUM_SEQS="768",
+                    replay_min_fresh_ratio="1.0")
+        assert c["async_training"]["concurrent_samples_per_replica"] == 48
+        assert c["actor_rollout_ref"]["rollout"]["max_num_seqs"] == 768
+        assert c["async_training"]["replay_buffer"]["min_fresh_ratio"] == 1.0
+        c = compose(QWEN25_1P7_DECOUPLED_CSR64, args=("actor_rollout_ref.rollout.max_num_batched_tokens=12288",))
+        assert c["actor_rollout_ref"]["rollout"]["max_num_batched_tokens"] == 12288
+
+    def test_trainer_rollouter_and_rollout_config_accept_it(self, monkeypatch):
+        from verl.experimental.fully_async_policy import fully_async_rollouter as mod
+        from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
+        from verl.utils.config import omega_conf_to_dataclass
+        from verl.workers.config import RolloutConfig
+
+        cfg = _cfg(QWEN25_1P7_DECOUPLED_CSR64)
+        rollout = omega_conf_to_dataclass(cfg.actor_rollout_ref.rollout, dataclass_type=RolloutConfig)
+        assert rollout.max_num_seqs == 1024 and list(rollout.cudagraph_capture_sizes) == CUDAGRAPH_1024
+        cfg.trainer.logger = ["console"]
+        trainer_cls = FullyAsyncTrainer.__ray_metadata__.modified_class
+        t = trainer_cls(config=cfg, tokenizer=None, role_worker_mapping={}, resource_pool_manager=None)
+        assert t.required_samples == 140 and t.replay_first_mini_size == 70
+        assert t._replay_min_fresh_groups(140) == 70 and t._replay_min_fresh_groups(70) == 35
+
+        rollouter_cls = mod.FullyAsyncRollouter.__ray_metadata__.modified_class
+        monkeypatch.setattr(mod, "create_rl_dataset", lambda *a, **k: [0] * 8)
+        monkeypatch.setattr(mod, "create_rl_sampler", lambda *a, **k: None)
+        monkeypatch.setattr(
+            rollouter_cls, "_create_dataloader", lambda self, *a, **k: setattr(self, "train_dataloader", [0] * 8)
+        )
+        monkeypatch.setattr(rollouter_cls, "_init_dump_executor", lambda self: None)
+        r = rollouter_cls(config=_cfg(QWEN25_1P7_DECOUPLED_CSR64), tokenizer=None)
+        assert r.concurrent_samples_per_replica == 64 and r.ramp_first_size == 70
