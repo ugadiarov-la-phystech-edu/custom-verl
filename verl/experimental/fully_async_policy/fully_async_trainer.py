@@ -29,6 +29,7 @@ from tqdm import tqdm
 
 from verl import DataProto
 from verl.checkpoint_engine import CheckpointEngineManager
+from verl.checkpoint_engine.base import rollout_memory_metrics
 from verl.experimental.fully_async_policy.detach_utils import (
     MetricsAggregator,
     assemble_batch_from_rollout_samples,
@@ -1253,8 +1254,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             # Step 1: NCCL broadcast from trainer to standalone rollout replicas.
             # Skipped when there are no standalone replicas (e.g. rollout.nnodes=0,
             # all rollout is hybrid) -- there is nothing to sync weights to.
+            sync_metrics = {}
             if not self.only_hybrid:
-                await self.checkpoint_manager.update_weights(
+                sync_metrics = await self.checkpoint_manager.update_weights(
                     global_steps=self.current_param_version,
                 )
             # Step 2: When dynamic resource scheduling is enabled, the Trainer GPUs
@@ -1277,6 +1279,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 self.dynamic_schedule_ctx.last_activate_duration_s += time.time() - _act_start
 
         timing_raw = await asyncio.wrap_future(self.rollouter.reset_staleness.remote().future())
+        # rollout_mem/* from the standalone replicas' pre-sync release; logged with this cycle
+        timing_raw = {**(timing_raw or {}), **rollout_memory_metrics(sync_metrics)}
 
         print(
             f"[FullyAsyncTrainer] _fit_update_weights, "
@@ -1382,6 +1386,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             rollout_resource_utilization=rollout_reset_timing_raw.get("dynamic_resource/rollout_resource_utilization"),
         )
         self._add_cumulative_time_metrics(aggregated_metrics, ray.get(self.rollouter.get_timing_state.remote()))
+        aggregated_metrics.update(rollout_memory_metrics(rollout_reset_timing_raw))
         if aggregated_metrics:
             self.logger.log(
                 data=aggregated_metrics,
