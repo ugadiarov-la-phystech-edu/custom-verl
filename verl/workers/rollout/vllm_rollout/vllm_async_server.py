@@ -811,11 +811,17 @@ class vLLMHttpServer:
             await self.engine.reset_encoder_cache()
 
     async def release_kv_cache(self):
-        """Release only kv_cache GPU memory, keeping model weights intact.
-        # TODO: support true release of kv_cache
-        """
-        if self.node_rank != 0 or not self.config.free_cache_engine:
-            return
+        """Before a weight sync: release the workers' cached-but-unused GPU memory and return their memory stats
+        (one dict per worker, GiB; see vLLMColocateWorkerExtension.release_cached_memory).
+
+        The KV pool and the weights stay allocated (a true KV release is still TODO), but the caching allocator's
+        free blocks -- validation bursts, eager batches above the CUDA-graph sizes, re-quantization temporaries --
+        go back to the driver before the rollout-side checkpoint worker allocates its transfer buffers on the same
+        GPU. Without this a grown vLLM worker leaves no room for them (CUDA OOM in BucketedWeightSender._init_buffer).
+        Cheap and semantics-free, so it runs whether or not free_cache_engine is set."""
+        if self.node_rank != 0:
+            return None
+        return await self.engine.collective_rpc(method="release_cached_memory")
 
     async def resume_kv_cache(self):
         """Restore kv_cache GPU memory after a weight sync. Counterpart to release_kv_cache()."""
@@ -1268,7 +1274,7 @@ class vLLMReplica(RolloutReplica):
         # Drain all in-flight requests so that vLLM worker threads go idle
         # before we touch engine.release_kv_cache()
         await self.servers[0].wait_for_requests_to_drain.remote()
-        await asyncio.gather(*[server.release_kv_cache.remote() for server in self.servers])
+        return await asyncio.gather(*[server.release_kv_cache.remote() for server in self.servers])
 
     # -----------------------------------------------------------------------
     # Hook methods for subclass overrides
