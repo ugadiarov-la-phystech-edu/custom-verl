@@ -74,6 +74,19 @@ logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
 
 
+ALLOCATOR_CAP_ENV = "VERL_VLLM_ALLOCATOR_CAP"
+
+
+def _allocator_cap_env(rollout_mode: RolloutMode, environ) -> None:
+    """Mark this server's vLLM workers for the rollout allocator cap: "1" for STANDALONE only.
+
+    HYBRID / COLOCATED engines share their GPUs with the trainer, so a stale mark is removed for them."""
+    if rollout_mode == RolloutMode.STANDALONE:
+        environ[ALLOCATOR_CAP_ENV] = "1"
+    else:
+        environ.pop(ALLOCATOR_CAP_ENV, None)
+
+
 class vLLMHttpServer:
     """vLLM http server in single node, this is equivalent to launch server with command line:
     ```
@@ -147,6 +160,8 @@ class vLLMHttpServer:
 
         self.rollout_mode = rollout_mode
         self.workers = workers
+        # Standalone engines own their GPUs: let the worker subprocesses cap their allocator (VERL_GPU_MEM_CAP_GB).
+        _allocator_cap_env(rollout_mode, os.environ)
 
         self.replica_rank = replica_rank
         self.node_rank = node_rank
