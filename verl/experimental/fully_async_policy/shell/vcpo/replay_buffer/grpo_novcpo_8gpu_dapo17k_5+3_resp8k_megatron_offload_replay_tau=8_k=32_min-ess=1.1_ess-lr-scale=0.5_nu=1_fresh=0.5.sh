@@ -286,6 +286,8 @@ fi
 # ================= Async Training =================
 # Generation quota aligned with the eviction horizon: groups older than k updates are evicted anyway.
 staleness_threshold=${staleness_threshold:-32.0}
+stale_tag=""
+if [[ "${staleness_threshold}" != "32.0" ]]; then stale_tag=" stale-${staleness_threshold}"; fi  # non-default quota, tagged
 updates_per_param_sync=1     # REQUIRED by replay mode: sync after every update
 num_minibatches_per_update=1 # REQUIRED by replay mode: one mini-batch per update
 partial_rollout=True         # REQUIRED by the stop-the-world pauses
@@ -351,7 +353,7 @@ ckpt_save_contents="['hf_model']"
 resume_mode=disable
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 ${model_tag} ${n_gpus_rollout}-${n_gpus_training} tp${train_tp}dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${warmup_tag}${dynbsz_tag}${tis_tag}${quant_tag}${kv_tag}${attn_tag}${val_tag} seed-${SEED}"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold}${stale_tag} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 ${model_tag} ${n_gpus_rollout}-${n_gpus_training} tp${train_tp}dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${warmup_tag}${dynbsz_tag}${tis_tag}${quant_tag}${kv_tag}${attn_tag}${val_tag} seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
 # log_dir: TensorBoard (per-update rollout dumps are off: trainer.rollout_data_dir=null); CKPTS_DIR: global_step_N/ checkpoints.
 log_dir=${log_dir:-"logs/${exp_name_safe}"}
