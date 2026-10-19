@@ -940,7 +940,7 @@ def test_invalid_engine_knobs_are_rejected(script, env, message, tmp_path):
 
 QWEN25_BF16_C8 = (
     "grpo_novcpo_8gpu_dapo17k_3+5_resp8k_megatron_offload_replay_tau=4_k=16"
-    "_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.5_bf16_tis-c8_token-mean_nowarmup_stale=1_qwen2.5-7b.sh"
+    "_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.9_bf16_tis-c8_token-mean_nowarmup_stale=1_qwen2.5-7b.sh"
 )
 QWEN25_BF16_OWN = {
     "ROLLOUT_QUANT": "bf16",
@@ -948,6 +948,10 @@ QWEN25_BF16_OWN = {
     "replay_tau": "4",
     "replay_staleness_threshold": "16",
     "staleness_threshold": "1",
+    "replay_min_fresh_ratio": "0.9",
+    "concurrency_ramp": "null",
+    "test_freq": "60",
+    "save_freq": "60",
 }
 
 
@@ -977,7 +981,8 @@ class TestQwen25Bf16NoWarmup3p5:
         a = compose(QWEN25_BF16_C8)["async_training"]
         assert a["staleness_threshold"] == 1
         assert (a["replay_buffer"]["tau"], a["replay_buffer"]["staleness_threshold"]) == (4, 16)
-        assert a["replay_buffer"]["requires_mini_batches"] == 0.5 and a["replay_buffer"]["min_fresh_ratio"] == 0.5
+        assert a["replay_buffer"]["requires_mini_batches"] == 0.5 and a["replay_buffer"]["min_fresh_ratio"] == 0.9
+        assert a["concurrency_ramp"] is None
 
     def test_model_layout_and_cadence_are_the_fp8_arms(self):
         c = compose(QWEN25_BF16_C8)
@@ -985,7 +990,7 @@ class TestQwen25Bf16NoWarmup3p5:
         assert (c["rollout"]["n_gpus_per_node"], c["trainer"]["n_gpus_per_node"]) == (3, 5)
         assert c["actor_rollout_ref"]["actor"]["ppo_mini_batch_size"] == 35
         assert c["async_training"]["concurrent_samples_per_replica"] == 35
-        assert (c["trainer"]["test_freq"], c["trainer"]["save_freq"]) == (20, 20)
+        assert (c["trainer"]["test_freq"], c["trainer"]["save_freq"]) == (60, 60)
         assert c["data"]["seed"] == 1 and c["actor_rollout_ref"]["rollout"]["seed"] == 1
         val = c["actor_rollout_ref"]["rollout"]["val_kwargs"]
         assert (val["temperature"], val["top_p"]) == (1.0, 1.0)
@@ -993,8 +998,8 @@ class TestQwen25Bf16NoWarmup3p5:
     def test_name(self):
         name = compose(QWEN25_BF16_C8)["trainer"]["experiment_name"]
         assert " DAPO17K-AIME24 Qwen2.5-7B 3-5 tp1dp5 hdo B-35 token-mean " in name and "Qwen3" not in name
-        assert name.startswith("GRPO-noVCPO replay tau-4 k-16 stale-1 rmb-0.5 nu-1 fresh-0.5 ess-")
-        assert " h100-emu-78gb-gmu0.5 ramp-5-12-20 DAPO17K-AIME24 " in name
+        assert name.startswith("GRPO-noVCPO replay tau-4 k-16 stale-1 rmb-0.5 nu-1 fresh-0.9 ess-")
+        assert " h100-emu-78gb-gmu0.5 DAPO17K-AIME24 " in name and " ramp-" not in name
         assert name.endswith(" 0.1-wd dynbsz-10240 tis-C8 val-t1.0-p1.0 seed-1")
         assert "warmup" not in name and "rollout-fp8" not in name and " kv-" not in name
 
@@ -1009,6 +1014,10 @@ class TestQwen25Bf16NoWarmup3p5:
             "async_training.staleness_threshold",
             "async_training.replay_buffer.tau",
             "async_training.replay_buffer.staleness_threshold",
+            "async_training.replay_buffer.min_fresh_ratio",
+            "async_training.concurrency_ramp",
+            "trainer.test_freq",
+            "trainer.save_freq",
             "trainer.experiment_name",
             "actor_rollout_ref.rollout.trace.experiment_name",  # mirrors trainer.experiment_name
         }
@@ -1019,7 +1028,12 @@ class TestQwen25Bf16NoWarmup3p5:
 
         fp8, bf16 = exports(QWEN25_FP8_C8), exports(QWEN25_BF16_C8)
         assert bf16 - fp8 == {f"export {k}=${{{k}:-{v}}}" for k, v in QWEN25_BF16_OWN.items()}
-        assert fp8 - bf16 == {"export ROLLOUT_QUANT=${ROLLOUT_QUANT:-fp8}", "export lr_warmup_steps=${lr_warmup_steps:-12}"}
+        assert fp8 - bf16 == {
+            "export ROLLOUT_QUANT=${ROLLOUT_QUANT:-fp8}",
+            "export lr_warmup_steps=${lr_warmup_steps:-12}",
+            "export test_freq=${test_freq:-20}",
+            "export save_freq=${save_freq:-20}",
+        }
         text = (SCRIPTS / QWEN25_BF16_C8).read_text()
         assert "DEEPGEMM_CUDA_HOME" not in text and not any(f"export {v}" in text for v in DEEPGEMM_VARS)
 
@@ -1044,13 +1058,17 @@ class TestQwen25Bf16NoWarmup3p5:
             replay_tau="8",
             replay_staleness_threshold="32",
             staleness_threshold="32.0",
+            replay_min_fresh_ratio="0.5",
+            concurrency_ramp="[5, 12, 20]",
         )
         assert c["actor_rollout_ref"]["rollout"]["quantization"] == "fp8"
         a = c["async_training"]
         assert a["staleness_threshold"] == 32.0 and (a["replay_buffer"]["tau"], a["replay_buffer"]["staleness_threshold"]) == (8, 32)
-        assert c["trainer"]["experiment_name"].startswith("GRPO-noVCPO replay tau-8 k-32 rmb-0.5 ")
+        assert c["trainer"]["experiment_name"].startswith("GRPO-noVCPO replay tau-8 k-32 rmb-0.5 nu-1 fresh-0.5 ess-")
         assert c["actor_rollout_ref"]["actor"]["optim"]["lr_warmup_steps"] == 5
-        assert c["trainer"]["test_freq"] == 10 and c["trainer"]["save_freq"] == 20
+        assert c["trainer"]["test_freq"] == 10 and c["trainer"]["save_freq"] == 60
+        assert c["async_training"]["replay_buffer"]["min_fresh_ratio"] == 0.5
+        assert c["async_training"]["concurrency_ramp"] == [5, 12, 20] and " ramp-5-12-20 " in c["trainer"]["experiment_name"]
         assert c["actor_rollout_ref"]["rollout"]["gpu_memory_utilization"] == 0.7
         name = c["trainer"]["experiment_name"]
         assert " warmup-5 " in name and " rollout-fp8 " in name and " h100-emu-78gb-gmu0.7 " in name
@@ -1081,7 +1099,7 @@ class TestQwen25Bf16NoWarmup3p5:
         )
         monkeypatch.setattr(rollouter_cls, "_init_dump_executor", lambda self: None)
         r = rollouter_cls(config=_cfg(QWEN25_BF16_C8), tokenizer=None)
-        assert r.concurrency_ramp == [5, 12, 20] and r.ramp_first_size == 20
+        assert not r.concurrency_ramp and r.ramp_first_size == 20
         assert r.staleness_threshold == 1 and r.required_samples == 35
 
 
