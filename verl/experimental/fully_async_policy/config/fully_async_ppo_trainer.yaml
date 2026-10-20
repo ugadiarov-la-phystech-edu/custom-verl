@@ -90,6 +90,11 @@ async_training:
     # Cap on the fresh-share wait in seconds (<= 0 = uncapped).
     min_fresh_wait_timeout_s: 3600.0
 
+    # Pull at most one mini-batch of groups from the message queue per update (oldest first), leaving the rest
+    # queued where the rollouter's staleness quota counts it. Off = drain the queue into the buffer every step.
+    # Needs requires_mini_batches <= 1.
+    pull_cap: False
+
 # Rollout config
 rollout:
 

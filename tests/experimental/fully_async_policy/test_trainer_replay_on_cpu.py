@@ -16,7 +16,8 @@
 - __init__ validation: the replay arm's required objective / sync settings, unsupported custom_vcpo keys,
   trainer.total_training_steps as an update cap
 - acquisition: watermark, the smaller all-fresh first mini-batch, the fresh-share gate and its waivers,
-  termination on the rollouter's end signal
+  termination on the rollouter's end signal, the pull cap (at most one mini-batch taken from the queue per
+  composition, the rest left queued for the rollouter's quota)
 - the training batch built from frozen statistics, buffer maintenance order, replay/* metrics
 - one replay step end to end with the worker calls stubbed: exact mini-batch size, weight sync per update,
   metrics landing at the version the update produced
@@ -147,6 +148,29 @@ class TestInit:
         with pytest.raises(ValueError, match="dynamic_filtering"):
             _init_trainer(["+async_training.dynamic_filtering.enable=True"])
 
+    def test_pull_cap_off_by_default(self):
+        t = _init_trainer()
+        assert t.replay_pull_cap is False and t._replay_pulled == 0
+
+    @pytest.mark.parametrize("rmb", ["0.5", "1.0"])
+    def test_pull_cap_reads_the_config(self, rmb):
+        t = _init_trainer(
+            ["async_training.replay_buffer.pull_cap=True", f"async_training.replay_buffer.requires_mini_batches={rmb}"]
+        )
+        assert t.replay_pull_cap is True
+
+    def test_pull_cap_rejects_a_watermark_above_one_minibatch(self):
+        with pytest.raises(AssertionError, match="pull_cap needs requires_mini_batches <= 1"):
+            _init_trainer(
+                ["async_training.replay_buffer.pull_cap=True", "async_training.replay_buffer.requires_mini_batches=2"]
+            )
+
+    @pytest.mark.parametrize("config_name", ["fully_async_ppo_trainer", "fully_async_ppo_megatron_trainer"])
+    def test_pull_cap_key_in_both_configs(self, config_name):
+        with initialize_config_dir(config_dir=CONFIG_DIR, version_base=None):
+            cfg = compose(config_name=config_name)
+        assert cfg.async_training.replay_buffer.pull_cap is False
+
 
 class TestUnsupportedKeys:
     @pytest.mark.parametrize(
@@ -196,17 +220,26 @@ class TestParseMaxTrainSteps:
 
 
 class _Queue:
-    """The async MessageQueueClient surface the replay loop uses; ``arrivals`` feed get_sample one by one."""
+    """The async MessageQueueClient surface the replay loop uses; ``arrivals`` feed get_sample one by one.
+    ``limits`` records the max_n of every drain (None = unlimited)."""
 
     def __init__(self, available=(), arrivals=()):
         self.available = list(available)
         self.arrivals = list(arrivals)
         self.drains = 0
+        self.limits = []
 
-    async def get_available_samples(self):
+    async def get_available_samples(self, max_n=None):
         self.drains += 1
-        out, self.available = self.available, []
+        self.limits.append(max_n)
+        if max_n is None or max_n >= len(self.available):
+            out, self.available = self.available, []
+        else:
+            out, self.available = self.available[:max_n], self.available[max_n:]
         return out
+
+    async def get_queue_size(self):
+        return len(self.available)
 
     async def get_sample(self):
         if not self.arrivals:
@@ -245,7 +278,7 @@ def _sample(version=0, scores=(1.0, 0.0, 0.0, 1.0)):
     return ray.cloudpickle.dumps(rs)
 
 
-def _bare_trainer(mini=4, first=None, rmb=1.0, fresh=0.0, timeout=3600.0, queue=None):
+def _bare_trainer(mini=4, first=None, rmb=1.0, fresh=0.0, timeout=3600.0, queue=None, pull_cap=False):
     t = FullyAsyncTrainer.__new__(FullyAsyncTrainer)
     t.required_samples = mini
     t.replay_first_mini_size = first
@@ -253,6 +286,9 @@ def _bare_trainer(mini=4, first=None, rmb=1.0, fresh=0.0, timeout=3600.0, queue=
     t.replay_min_fresh_ratio = fresh
     t.replay_min_fresh_wait_timeout_s = timeout
     t.replay_fresh_poll_interval_s = 0.0
+    t.replay_pull_cap = pull_cap
+    t._replay_pulled = 0
+    t._replay_queue_backlog = 0
     t.replay_buffer = ReplayBuffer(tau=8.0, staleness_threshold=32, seed=0)
     t.replay_updates_done = 0
     t.rollout_done = False
@@ -346,7 +382,7 @@ class TestFreshGate:
         t = self._primed()
         arrivals = [[_sample(0)], [], [_sample(0)]]
 
-        async def drain():
+        async def drain(max_n=None):
             return arrivals.pop(0) if arrivals else []
 
         t.message_queue_client.get_available_samples = drain
@@ -371,7 +407,7 @@ class TestFreshGate:
         t = self._primed(timeout=1e-9)
         polls = []
 
-        async def drain():
+        async def drain(max_n=None):
             # safety bound: end the rollout after 200 polls; the cap must waive long before that
             polls.append(1)
             return [None] if len(polls) >= 200 else []
@@ -380,6 +416,144 @@ class TestFreshGate:
         _run(t._acquire_replay_minibatch())
         assert t._replay_fresh_floor_waived == 1
         assert len(polls) < 200
+
+
+def _uids(entries):
+    return sorted(str(e.sample.full_batch.non_tensor_batch["uid"][0]) for e in entries)
+
+
+class TestPullCap:
+    """pull_cap=True: a composition takes at most its mini-batch size from the queue, oldest first."""
+
+    def _queued(self, n, mini=4, **kw):
+        q = _Queue(available=[_sample(i) for i in range(n)])
+        t = _bare_trainer(mini=mini, queue=q, **kw)
+        t.current_param_version = 20  # every queued group is older than the trainer: positive staleness
+        return t, q
+
+    def test_off_drains_the_whole_queue(self):
+        t, q = self._queued(10)
+        entries, info = _run(t._acquire_replay_minibatch())
+        assert q.limits == [None] and q.available == []
+        assert t.replay_buffer.size() == 10 and info["n_new"] == 4
+        assert _uids(entries) == ["u6", "u7", "u8", "u9"]  # fresh-first takes the newest arrivals
+        t._replay_post_update_maintenance(entries, 21)
+        assert t.replay_buffer.untrained_count() == 6  # the surplus ages in the buffer
+        assert t._replay_pulled == 10
+
+    def test_on_pulls_one_minibatch_oldest_first_and_leaves_the_rest(self):
+        t, q = self._queued(10, pull_cap=True)
+        entries, info = _run(t._acquire_replay_minibatch())
+        assert q.limits == [4] and len(q.available) == 6
+        assert t.replay_buffer.size() == 4 and info["n_new"] == 4 and info["n_replayed"] == 0
+        assert _uids(entries) == ["u0", "u1", "u2", "u3"]
+        assert t._replay_pulled == 4 and t._replay_queue_backlog == 6
+        t.replay_updates_done = 1
+        t._replay_post_update_maintenance(entries, 21)
+        assert t.replay_buffer.untrained_count() == 0  # nothing left behind untrained
+        t.current_param_version = 21
+        entries, info = _run(t._acquire_replay_minibatch())
+        assert _uids(entries) == ["u4", "u5", "u6", "u7"] and info["n_new"] == 4  # arrival order
+        assert len(q.available) == 2 and t._replay_pulled == 4
+        t._replay_post_update_maintenance(entries, 22)  # the step logs replay/* after maintenance
+        metrics = {}
+        t._add_replay_metrics(metrics, info, 22)
+        assert metrics["replay/pulled_groups"] == 4 and metrics["replay/queue_backlog"] == 2
+        assert metrics["replay/buffer_untrained"] == 0
+
+    def test_off_logs_no_backlog_metric(self):
+        t, q = self._queued(10)
+        entries, info = _run(t._acquire_replay_minibatch())
+        metrics = {}
+        t._add_replay_metrics(metrics, info, 21)
+        assert metrics["replay/pulled_groups"] == 10 and "replay/queue_backlog" not in metrics
+
+    def test_first_smaller_minibatch_pulls_its_own_size(self):
+        t, q = self._queued(10, first=2, rmb=0.5, pull_cap=True)
+        entries, info = _run(t._acquire_replay_minibatch())
+        assert q.limits == [2] and len(entries) == 2 and info["n_new"] == 2 and len(q.available) == 8
+        t.replay_updates_done = 1
+        t._replay_post_update_maintenance(entries, 21)
+        entries, info = _run(t._acquire_replay_minibatch())
+        assert q.limits == [2, 4] and len(entries) == 4 and info["n_new"] == 4 and len(q.available) == 4
+
+    def test_budget_spans_the_watermark_fill(self):
+        q = _Queue(available=[_sample(0)], arrivals=[_sample(0) for _ in range(10)])
+        t = _bare_trainer(mini=4, queue=q, pull_cap=True)
+        entries, info = _run(t._acquire_replay_minibatch())
+        assert q.limits == [4] and t.replay_buffer.size() == 4 and info["n_new"] == 4
+        assert t._replay_pulled == 4 and len(q.arrivals) == 7  # 1 drained + 3 blocking pulls, no more
+
+    def test_fresh_floor_drains_only_the_remaining_budget(self):
+        t = _bare_trainer(mini=4, fresh=0.5, pull_cap=True)
+        for _ in range(4):
+            t.replay_buffer.add(ray.cloudpickle.loads(_sample(0)), 0)
+        t.replay_buffer.compose_minibatch(4, 0)  # consume their freshness
+        limits = []
+
+        async def drain(max_n=None):
+            limits.append(max_n)
+            return [_sample(0)] if max_n is None or max_n > 0 else []
+
+        t.message_queue_client.get_available_samples = drain
+        entries, info = _run(t._acquire_replay_minibatch())
+        assert limits == [4, 3]  # the acquire's drain, then one floor poll with what the cap left
+        assert info["n_new"] == 2 and info["n_replayed"] == 2
+        assert t._replay_pulled == 2 and t._replay_fresh_floor_waived == 0
+
+    def test_fewer_than_a_minibatch_queued_fills_with_replay(self):
+        t, q = self._queued(3, pull_cap=True)
+        for _ in range(4):
+            t.replay_buffer.add(ray.cloudpickle.loads(_sample(0)), 0)
+        t.replay_buffer.compose_minibatch(4, 0)
+        entries, info = _run(t._acquire_replay_minibatch())
+        assert q.limits == [4] and q.available == []
+        assert info["n_new"] == 3 and info["n_replayed"] == 1 and t._replay_pulled == 3
+        assert t._replay_queue_backlog == 0
+
+    def test_end_signal_beyond_the_cap_is_seen_on_a_later_pull(self):
+        q = _Queue(available=[_sample(i) for i in range(5)] + [None])
+        t = _bare_trainer(mini=4, queue=q, pull_cap=True)
+        t.current_param_version = 20
+        entries, info = _run(t._acquire_replay_minibatch())
+        assert info["n_new"] == 4 and not t.rollout_done and len(q.available) == 2
+        t.replay_updates_done = 1
+        t._replay_post_update_maintenance(entries, 21)
+        t.current_param_version = 21
+        entries, info = _run(t._acquire_replay_minibatch())
+        assert t.rollout_done and q.available == []
+        assert info["n_new"] == 1 and info["n_replayed"] == 3 and t._replay_pulled == 1
+        assert _uids(entries[:1]) == ["u4"]
+
+    def test_end_signal_within_the_cap_stops_below_the_watermark(self):
+        q = _Queue(available=[_sample(0), None])
+        t = _bare_trainer(mini=4, queue=q, pull_cap=True)
+        assert _run(t._acquire_replay_minibatch()) == (None, None)
+        assert t.rollout_done and q.limits == [4]
+
+    def test_pulled_counter_resets_per_composition(self):
+        t, q = self._queued(8, pull_cap=True)
+        entries, _ = _run(t._acquire_replay_minibatch())
+        t._replay_post_update_maintenance(entries, 21)
+        assert t._replay_pulled == 4
+        entries, _ = _run(t._acquire_replay_minibatch())
+        assert t._replay_pulled == 4 and q.available == []  # not 8: the budget is per composition
+
+    def test_budget_helper(self):
+        t = _bare_trainer(mini=4)
+        assert t._replay_pull_budget(4) is None
+        t.replay_pull_cap = True
+        assert t._replay_pull_budget(4) == 4
+        t._replay_pulled = 3
+        assert t._replay_pull_budget(4) == 1
+        t._replay_pulled = 9
+        assert t._replay_pull_budget(4) == 0
+
+    def test_zero_budget_skips_the_queue(self):
+        t, q = self._queued(3, pull_cap=True)
+        t._replay_pulled = 4
+        assert _run(t._drain_queue_into_buffer(t._replay_pull_budget(4))) == 0
+        assert q.drains == 0 and len(q.available) == 3
 
 
 class TestBatchAndMaintenance:
@@ -514,6 +688,7 @@ class TestReplayStep:
         metrics = t.calls[5][1]
         assert metrics["actor/pg_loss"] == pytest.approx(0.1)
         assert metrics["replay/minibatch_size"] == 2
+        assert "replay/pulled_groups" in metrics
 
     def test_end_signal_stops_training(self):
         t = self._trainer(entries=False)

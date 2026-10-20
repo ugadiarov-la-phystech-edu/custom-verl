@@ -102,16 +102,21 @@ class MessageQueue:
             self.total_consumed += 1
             return data, len(self.queue)
 
-    async def get_available_samples(self) -> list[Any]:
-        """Pop and return everything currently queued, without waiting.
+    async def get_available_samples(self, max_n: int | None = None) -> list[Any]:
+        """Pop and return what is currently queued, without waiting: everything, or the oldest ``max_n``
+        items when a limit is given (the replay trainer's pull cap).
 
         Used by the replay-buffer trainer to drain the transport queue between updates. The returned
-        list may contain the ``None`` termination sentinel, which the caller must handle. Empty when
-        the queue is empty.
+        list may contain the ``None`` termination sentinel, which the caller must handle; it is always
+        the last item, so under a limit it stays queued until a later pull reaches it. Empty when the
+        queue is empty or ``max_n`` is 0.
         """
         async with self._lock:
-            drained = list(self.queue)
-            self.queue.clear()
+            if max_n is None or max_n >= len(self.queue):
+                drained = list(self.queue)
+                self.queue.clear()
+            else:
+                drained = [self.queue.popleft() for _ in range(max(0, int(max_n)))]
             self.total_consumed += len(drained)
             return drained
 
@@ -213,9 +218,9 @@ class MessageQueueClient:
         future = self.queue_actor.get_sample.remote()
         return await asyncio.wrap_future(future.future())
 
-    async def get_available_samples(self) -> list[Any]:
-        """Drain all currently queued samples without waiting (async)"""
-        future = self.queue_actor.get_available_samples.remote()
+    async def get_available_samples(self, max_n: int | None = None) -> list[Any]:
+        """Drain the currently queued samples without waiting (async); at most ``max_n`` when given"""
+        future = self.queue_actor.get_available_samples.remote(max_n)
         return await asyncio.wrap_future(future.future())
 
     async def get_queue_size(self) -> int:

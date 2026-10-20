@@ -327,6 +327,17 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
         )
         self.replay_min_fresh_wait_timeout_s = float(replay_cfg.get("min_fresh_wait_timeout_s", 3600.0))
         self.replay_fresh_poll_interval_s = 0.5
+        # Pull cap: take at most one mini-batch of groups from the message queue per composition (oldest first)
+        # and leave the rest queued, where the rollouter's staleness quota and full-queue pause count it. Off =
+        # drain the whole queue into the buffer every step (the rollouter then never sees the untrained backlog).
+        self.replay_pull_cap = bool(replay_cfg.get("pull_cap", False))
+        if self.replay_pull_cap:
+            assert self.replay_requires_mini_batches <= 1, (
+                "replay_buffer.pull_cap needs requires_mini_batches <= 1: the watermark must fit in one pull, got "
+                f"{self.replay_requires_mini_batches}"
+            )
+        self._replay_pulled = 0
+        self._replay_queue_backlog = 0
         reuse_halflife = replay_cfg.get("reuse_halflife", None)
         self.replay_buffer = ReplayBuffer(
             tau=float(replay_cfg.get("tau", 8.0)),
@@ -342,7 +353,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             f"[FullyAsyncTrainer][Replay] tau={self.replay_buffer.tau} k={self.replay_buffer.staleness_threshold} "
             f"reuse_halflife={self.replay_buffer.reuse_halflife} mini-batch={self.required_samples} groups, "
             f"first={self.replay_first_mini_size or self.required_samples}, "
-            f"min_fresh_ratio={self.replay_min_fresh_ratio}"
+            f"min_fresh_ratio={self.replay_min_fresh_ratio} pull_cap={self.replay_pull_cap}"
         )
 
     async def _setup_checkpoint_manager(self):
@@ -682,16 +693,27 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
 
     # ==================== replay-buffer training mode ====================
 
-    async def _drain_queue_into_buffer(self) -> int:
-        """Move everything currently in the message queue into the replay buffer without blocking. Returns
-        the number of groups added; the termination sentinel sets rollout_done."""
+    def _replay_pull_budget(self, mini_size: int) -> int | None:
+        """Groups this composition may still pull from the queue: None (unlimited) when the pull cap is off,
+        else mini_size minus what it already pulled."""
+        if not self.replay_pull_cap:
+            return None
+        return max(0, int(mini_size) - self._replay_pulled)
+
+    async def _drain_queue_into_buffer(self, limit: int | None = None) -> int:
+        """Move what is currently in the message queue into the replay buffer without blocking: everything, or
+        the oldest ``limit`` items. Returns the number of groups added; the termination sentinel sets
+        rollout_done."""
+        if limit is not None and limit <= 0:
+            return 0
         added = 0
-        for raw in await self.message_queue_client.get_available_samples():
+        for raw in await self.message_queue_client.get_available_samples(limit):
             if raw is None:
                 self.rollout_done = True
                 continue
             self.replay_buffer.add(ray.cloudpickle.loads(raw), self.current_param_version)
             added += 1
+        self._replay_pulled += added
         return added
 
     async def _wait_one_sample_into_buffer(self) -> bool:
@@ -702,6 +724,7 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             self.rollout_done = True
             return False
         self.replay_buffer.add(ray.cloudpickle.loads(sample), self.current_param_version)
+        self._replay_pulled += 1
         return True
 
     def _replay_minibatch_size(self) -> int:
@@ -741,7 +764,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                     f"({self.replay_buffer.pending_fresh_count()} fresh groups); composing anyway"
                 )
                 return waited, 1
-            if await self._drain_queue_into_buffer() == 0:
+            budget = self._replay_pull_budget(mini_size)
+            if budget is not None and budget <= 0:
+                # the pull cap is spent (floor <= mini_size makes this unreachable; guards against a spin)
+                return waited, 0
+            if await self._drain_queue_into_buffer(budget) == 0:
                 await asyncio.sleep(self.replay_fresh_poll_interval_s)
                 if not announced and waited >= 60.0:
                     announced = True
@@ -762,7 +789,8 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             watermark = mini_size
         else:
             watermark = self.replay_requires_mini_batches * mini_size
-        await self._drain_queue_into_buffer()
+        self._replay_pulled = 0
+        await self._drain_queue_into_buffer(self._replay_pull_budget(mini_size))
         while self.replay_buffer.size() < watermark:
             if self.rollout_done:
                 print(
@@ -773,6 +801,9 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
             await self._wait_one_sample_into_buffer()
         self._replay_fresh_wait_s, self._replay_fresh_floor_waived = await self._wait_for_fresh_floor(mini_size)
         entries, info = self.replay_buffer.compose_minibatch(mini_size, self.current_param_version)
+        if self.replay_pull_cap:
+            # what the cap left queued: the rollouter's quota counts it (one RPC per update)
+            self._replay_queue_backlog = int(await self.message_queue_client.get_queue_size())
         # replayed groups were ready long ago: only the fresh prefix's arrivals gate this step
         self._open_virtual_step(time.time(), [e.sample for e in entries[: info["n_new"]]])
         return entries, info
@@ -834,8 +865,11 @@ class FullyAsyncTrainer(SeparateRayPPOTrainer):
                 "replay/fresh_floor": float(self._replay_min_fresh_groups(size)),
                 "replay/fresh_wait_s": float(self._replay_fresh_wait_s),
                 "replay/fresh_floor_waived": float(self._replay_fresh_floor_waived),
+                "replay/pulled_groups": float(self._replay_pulled),
             }
         )
+        if self.replay_pull_cap:
+            metrics["replay/queue_backlog"] = float(self._replay_queue_backlog)
         if buffer_staleness:
             metrics["replay/buffer_staleness_mean"] = float(np.mean(buffer_staleness))
             metrics["replay/buffer_staleness_p50"] = float(np.percentile(buffer_staleness, 50))

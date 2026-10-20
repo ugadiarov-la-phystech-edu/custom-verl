@@ -638,6 +638,67 @@ class TestGetAvailableSamples:
     def test_empty_queue_returns_immediately(self):
         assert asyncio.run(self._queue().get_available_samples()) == []
 
+    def test_limit_takes_the_oldest_and_leaves_the_rest(self):
+        q = self._queue()
+
+        async def scenario():
+            for x in (b"a", b"b", b"c", b"d"):
+                await q.put_sample(x)
+            first = await q.get_available_samples(3)
+            consumed = q.total_consumed
+            rest = await q.get_available_samples(3)
+            return first, consumed, rest, await q.get_queue_size()
+
+        first, consumed, rest, size = asyncio.run(scenario())
+        assert first == [b"a", b"b", b"c"] and consumed == 3
+        assert rest == [b"d"] and size == 0 and q.total_consumed == 4
+
+    def test_sentinel_beyond_the_limit_stays_queued(self):
+        q = self._queue()
+
+        async def scenario():
+            await q.put_sample(b"a")
+            await q.put_sample(b"b")
+            await q.put_sample(None)
+            first = await q.get_available_samples(2)
+            second = await q.get_available_samples(2)
+            return first, second
+
+        first, second = asyncio.run(scenario())
+        assert first == [b"a", b"b"]  # the end signal is not lost: it comes out on the next pull
+        assert second == [None]
+
+    def test_sentinel_within_the_limit_is_returned(self):
+        q = self._queue()
+
+        async def scenario():
+            await q.put_sample(b"a")
+            await q.put_sample(None)
+            return await q.get_available_samples(5)
+
+        assert asyncio.run(scenario()) == [b"a", None]
+
+    @pytest.mark.parametrize("limit", [None, 10])
+    def test_no_limit_or_a_larger_one_drains_everything(self, limit):
+        q = self._queue()
+
+        async def scenario():
+            for x in (b"a", b"b"):
+                await q.put_sample(x)
+            return await q.get_available_samples(limit), await q.get_queue_size()
+
+        assert asyncio.run(scenario()) == ([b"a", b"b"], 0)
+
+    def test_zero_limit_consumes_nothing(self):
+        q = self._queue()
+
+        async def scenario():
+            await q.put_sample(b"a")
+            return await q.get_available_samples(0), await q.get_queue_size()
+
+        assert asyncio.run(scenario()) == ([], 1)
+        assert q.total_consumed == 0
+
 
 # ------------------------------------------------------------------ config and __init__ validation
 
@@ -657,6 +718,7 @@ def test_new_async_training_keys_default_off(config_name):
         "reuse_halflife": None,
         "min_fresh_ratio": 0.0,
         "min_fresh_wait_timeout_s": 3600.0,
+        "pull_cap": False,
     }
 
 

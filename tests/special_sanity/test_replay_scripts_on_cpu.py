@@ -53,6 +53,7 @@ SCRIPT_ENV_KNOBS = {
     "min_ess",
     "concurrency_ramp",
     "replay_min_fresh_ratio",
+    "replay_pull_cap",
     "replay_reuse_halflife",
     "replay_requires_mini_batches",
     "log_dir",
@@ -194,6 +195,7 @@ class TestRecipe:
         assert (r["tau"], r["staleness_threshold"], r["requires_mini_batches"]) == (8, 32, 0.5)
         assert r["reuse_halflife"] == 1 and r["min_fresh_ratio"] == 0.5
         assert r["min_fresh_wait_timeout_s"] == 3600.0
+        assert r["pull_cap"] is False
 
     def test_checkpoints(self, script):
         c = compose(script)
@@ -224,6 +226,7 @@ class TestRecipe:
         assert "fresh-" not in name and " nu-" not in name and "ramp-" not in name
         default = compose(script)["trainer"]["experiment_name"]
         assert " nu-1" in default and " fresh-0.5" in default and " rmb-0.5" in default and " ramp-" in default
+        assert "pull-cap" not in default and "pull-cap" not in name
 
     def test_emulation_tag(self, script):
         name = compose(script, VERL_GPU_MEM_CAP_GB="80", gpu_memory_utilization="0.5")["trainer"]["experiment_name"]
@@ -1108,3 +1111,54 @@ def test_base_arm_tags_a_non_default_staleness_threshold(script):
     assert " stale-" not in compose(script)["trainer"]["experiment_name"]
     name = compose(script, staleness_threshold="4")["trainer"]["experiment_name"]
     assert " k-32 stale-4 rmb-0.5 " in name
+
+
+# --------------------------------------------------------------------------- pull cap knob
+
+
+class TestPullCapKnob:
+    """replay_pull_cap=True: the trainer pulls at most one mini-batch per update (default off, tagged pull-cap)."""
+
+    def test_on(self):
+        c = compose(QWEN25_BF16_C8, replay_pull_cap="True")
+        assert c["async_training"]["replay_buffer"]["pull_cap"] is True
+        assert " fresh-0.9 pull-cap ess-" in c["trainer"]["experiment_name"]
+
+    def test_changes_only_that_key(self):
+        assert _differing(compose(QWEN25_BF16_C8), compose(QWEN25_BF16_C8, replay_pull_cap="True")) == {
+            "async_training.replay_buffer.pull_cap"
+        }
+
+    def test_explicit_false_is_the_default(self):
+        assert compose(QWEN25_BF16_C8, replay_pull_cap="False") == compose(QWEN25_BF16_C8)
+
+    def test_composes_with_a_wider_quota_and_the_4p4_layout(self):
+        c = compose(
+            QWEN25_BF16_C8,
+            replay_pull_cap="True",
+            staleness_threshold="2",
+            train_prompt_mini_bsz="32",
+            n_gpus_rollout="4",
+        )
+        a = c["async_training"]
+        assert a["replay_buffer"]["pull_cap"] is True and a["staleness_threshold"] == 2
+        assert c["actor_rollout_ref"]["actor"]["ppo_mini_batch_size"] == 32
+        assert (c["rollout"]["n_gpus_per_node"], c["trainer"]["n_gpus_per_node"]) == (4, 4)
+        name = c["trainer"]["experiment_name"]
+        assert " stale-2 " in name and " pull-cap " in name and " 4-4 " in name
+
+    def test_trainer_accepts_the_composed_config(self):
+        from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer as actor_cls
+
+        cls = actor_cls.__ray_metadata__.modified_class if hasattr(actor_cls, "__ray_metadata__") else actor_cls
+        cfg = _cfg(QWEN25_BF16_C8, replay_pull_cap="True")
+        t = cls(config=cfg, tokenizer=None, role_worker_mapping={}, resource_pool_manager=None)
+        assert t.replay_pull_cap is True and t.replay_requires_mini_batches == 0.5
+
+    def test_trainer_rejects_the_cap_with_a_multi_minibatch_watermark(self):
+        from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer as actor_cls
+
+        cls = actor_cls.__ray_metadata__.modified_class if hasattr(actor_cls, "__ray_metadata__") else actor_cls
+        cfg = _cfg(QWEN25_BF16_C8, replay_pull_cap="True", replay_requires_mini_batches="2")
+        with pytest.raises(AssertionError, match="pull_cap needs requires_mini_batches <= 1"):
+            cls(config=cfg, tokenizer=None, role_worker_mapping={}, resource_pool_manager=None)

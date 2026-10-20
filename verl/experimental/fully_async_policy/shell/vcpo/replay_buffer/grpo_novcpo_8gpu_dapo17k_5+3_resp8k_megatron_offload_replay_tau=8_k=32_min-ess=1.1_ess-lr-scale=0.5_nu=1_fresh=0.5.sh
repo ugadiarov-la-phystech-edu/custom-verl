@@ -19,6 +19,10 @@
 #     weighted by the staleness score x 2^(-times_trained/nu), nu=1 (reuse decay);
 #   * fresh-share gate: an update waits for ceil(0.5 x 33) = 17 newly arrived groups (waived once the
 #     rollouter is done or after replay_buffer.min_fresh_wait_timeout_s, logged replay/fresh_floor_waived);
+#   * pull cap (replay_pull_cap=True, off by default, tagged " pull-cap"): each update takes at most one
+#     mini-batch of groups from the message queue (oldest first) and leaves the rest queued, where the
+#     rollouter's staleness quota counts it, so staleness_threshold bounds the untrained backlog again; off,
+#     the trainer drains the whole queue into the buffer every update and the surplus ages out untrained;
 #   * first update: requires_mini_batches=0.5 -> an all-fresh 18-group mini-batch (16.5 rounded up so the
 #     18 x 16 sequences split over the 3 trainer ranks), full 33-group mini-batches afterwards;
 #   * rollouter insertion gate: groups whose 16 rewards are all equal are dropped (their generation
@@ -315,6 +319,13 @@ if [[ "${replay_reuse_halflife}" != "null" ]]; then replay_reuse_tag=" nu-${repl
 replay_min_fresh_ratio=${replay_min_fresh_ratio:-0.5}
 replay_fresh_tag=""
 if [[ "${replay_min_fresh_ratio}" != "0" ]]; then replay_fresh_tag=" fresh-${replay_min_fresh_ratio}"; fi
+# Pull cap (True/False): take at most one mini-batch per update from the message queue, oldest first, and leave
+# the rest queued for the rollouter's staleness quota to count (needs replay_requires_mini_batches <= 1). Watch
+# replay/pulled_groups (<= mini-batch), replay/queue_backlog (<= quota), replay/buffer_untrained (~0) and the
+# rollouter's count/staleness_samples (near the quota once it throttles). Tagged pull-cap.
+replay_pull_cap=${replay_pull_cap:-False}
+pull_tag=""
+if [[ "${replay_pull_cap}" == "True" ]]; then pull_tag=" pull-cap"; fi
 
 # ================= Stop-the-world accounting =================
 serialize_validation=${serialize_validation:-True}
@@ -353,7 +364,7 @@ ckpt_save_contents="['hf_model']"
 resume_mode=disable
 
 # ================= Logging =================
-exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold}${stale_tag} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 ${model_tag} ${n_gpus_rollout}-${n_gpus_training} tp${train_tp}dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${warmup_tag}${dynbsz_tag}${tis_tag}${quant_tag}${kv_tag}${attn_tag}${val_tag} seed-${SEED}"}
+exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold}${stale_tag} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag}${pull_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 ${model_tag} ${n_gpus_rollout}-${n_gpus_training} tp${train_tp}dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${warmup_tag}${dynbsz_tag}${tis_tag}${quant_tag}${kv_tag}${attn_tag}${val_tag} seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
 # log_dir: TensorBoard (per-update rollout dumps are off: trainer.rollout_data_dir=null); CKPTS_DIR: global_step_N/ checkpoints.
 log_dir=${log_dir:-"logs/${exp_name_safe}"}
@@ -492,4 +503,5 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     async_training.replay_buffer.requires_mini_batches="${replay_requires_mini_batches}" \
     async_training.replay_buffer.sampling_seed="${replay_sampling_seed}" \
     async_training.replay_buffer.reuse_halflife="${replay_reuse_halflife}" \
-    async_training.replay_buffer.min_fresh_ratio="${replay_min_fresh_ratio}" "${engine_args[@]}" "${dynbsz_args[@]}" "$@"
+    async_training.replay_buffer.min_fresh_ratio="${replay_min_fresh_ratio}" \
+    async_training.replay_buffer.pull_cap="${replay_pull_cap}" "${engine_args[@]}" "${dynbsz_args[@]}" "$@"
