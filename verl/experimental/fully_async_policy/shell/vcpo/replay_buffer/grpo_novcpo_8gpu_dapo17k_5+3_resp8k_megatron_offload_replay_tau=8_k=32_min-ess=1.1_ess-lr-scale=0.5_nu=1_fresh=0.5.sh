@@ -366,7 +366,9 @@ resume_mode=disable
 # ================= Logging =================
 exp_name=${exp_name:-"GRPO-noVCPO replay tau-${replay_tau} k-${replay_staleness_threshold}${stale_tag} rmb-${replay_requires_mini_batches}${replay_reuse_tag}${replay_fresh_tag}${pull_tag} ess-${ess_tag}${emu_tag}${ramp_tag} DAPO17K-AIME24 ${model_tag} ${n_gpus_rollout}-${n_gpus_training} tp${train_tp}dp${n_gpus_training} hdo B-${train_prompt_mini_bsz} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd${warmup_tag}${dynbsz_tag}${tis_tag}${quant_tag}${kv_tag}${attn_tag}${val_tag} seed-${SEED}"}
 exp_name_safe=${exp_name//\//_}
-# log_dir: TensorBoard (per-update rollout dumps are off: trainer.rollout_data_dir=null); CKPTS_DIR: global_step_N/ checkpoints.
+# log_dir: TensorBoard (per-update rollout dumps are off: trainer.rollout_data_dir=null) and Hydra's record of the run
+# (hydra.run.dir, so hydra/config.yaml = the fully resolved config, hydra/overrides.yaml = this command line, and the
+# driver log fully_async_main.log land in log_dir instead of outputs/<date>/<time>/); CKPTS_DIR: global_step_N/ checkpoints.
 log_dir=${log_dir:-"logs/${exp_name_safe}"}
 CKPTS_DIR=${CKPTS_DIR:-"${log_dir}"}
 mkdir -p -- "${log_dir}" "${CKPTS_DIR}"
@@ -482,6 +484,8 @@ python -m verl.experimental.fully_async_policy.fully_async_main \
     trainer.rollout_data_dir=null \
     trainer.log_val_generations=${log_val_generations} \
     trainer.default_local_dir="${CKPTS_DIR}" \
+    hydra.run.dir="${log_dir}" \
+    hydra.output_subdir=hydra \
     trainer.nnodes="${NNODES}" \
     trainer.n_gpus_per_node="${n_gpus_training}" \
     trainer.total_epochs="${epochs}" \

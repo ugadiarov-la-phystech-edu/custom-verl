@@ -224,6 +224,8 @@ n_gpus_per_node=${n_gpus_per_node:-8}
 # ================= Logging =================
 exp_name=${exp_name:-"MAIN-PPO-SYNC grpo B-${train_prompt_bsz}xn${n_resp_per_prompt} mini-${train_prompt_mini_bsz} ppo-epochs-${ppo_epochs} DAPO17K-AIME24-25 openPangu-7B tp${train_tp}dp${n_gpus_per_node} ${loss_agg_mode} ${max_response_length}-len ${weight_decay}-wd bos seed-${SEED}${emu_tag}"}
 exp_name_safe=${exp_name//\//_}
+# log_dir: TensorBoard, global_step_N/ checkpoints and Hydra's record of the run (hydra.run.dir: hydra/config.yaml = the
+# fully resolved config, hydra/overrides.yaml = this command line, main_ppo.log = the driver log) instead of outputs/<date>/<time>/.
 log_dir="logs/${exp_name_safe}"
 CKPTS_DIR="${log_dir}"
 mkdir -p -- "${log_dir}"
@@ -322,6 +324,8 @@ python3 -m verl.trainer.main_ppo \
     trainer.rollout_data_dir=null \
     trainer.log_val_generations=0 \
     trainer.default_local_dir="${CKPTS_DIR}" \
+    hydra.run.dir="${log_dir}" \
+    hydra.output_subdir=hydra \
     trainer.nnodes="${NNODES}" \
     trainer.n_gpus_per_node="${n_gpus_per_node}" \
     trainer.total_training_steps=${total_training_steps} \

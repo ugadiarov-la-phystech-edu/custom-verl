@@ -238,6 +238,23 @@ class TestRecipe:
         # per-update rollout dumps (<step>.jsonl) are off
         assert c["trainer"]["rollout_data_dir"] is None
 
+    def test_hydra_record_goes_to_log_dir(self, script, tmp_path):
+        # hydra/config.yaml, hydra/overrides.yaml and the driver log land next to tensorboard/ and global_step_N/
+        argv = _argv_seen_by_python(tmp_path, {}, script=script)
+        log_dir = str(tmp_path / "logs")
+        assert f"hydra.run.dir={log_dir}" in argv
+        assert "hydra.output_subdir=hydra" in argv
+        assert f"trainer.default_local_dir={log_dir}" in argv
+        # the user's own overrides still come last and win
+        assert argv.index("hydra.run.dir=" + log_dir) < argv.index("trainer.total_training_steps=5")
+
+    def test_hydra_record_defaults_to_logs_exp_name(self, script, tmp_path):
+        exp_name = "a/b with spaces"
+        argv = _argv_seen_by_python(tmp_path, {"exp_name": exp_name}, script=script, log_dir=None, cwd=tmp_path)
+        assert "hydra.run.dir=logs/a_b with spaces" in argv
+        assert f"trainer.experiment_name={exp_name}" in argv
+        assert (tmp_path / "logs" / "a_b with spaces").is_dir()
+
     def test_worker_side_actor_config(self, script):
         from verl.utils.config import omega_conf_to_dataclass
         from verl.workers.config import ESSScalingConfig
@@ -416,6 +433,30 @@ def _env_seen_by_python(tmp_path, env, script=QWEN_FP8, names=DEEPGEMM_VARS):
     )
     assert proc.returncode == 0, proc.stderr[-2000:]
     return dict(line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line)
+
+
+def _argv_seen_by_python(tmp_path, env, script=QWEN, log_dir="<tmp>/logs", cwd=REPO):
+    """Run a wrapper with a stand-in python that prints its argv, one element per line."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    fake = bindir / "python"
+    fake.write_text('#!/bin/sh\nfor a in "$@"; do printf "%s\\n" "$a"; done\n')
+    fake.chmod(0o755)
+    base = {k: v for k, v in os.environ.items() if k not in SCRIPT_ENV_KNOBS and k != "log_dir"}
+    base["PATH"] = f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}"
+    if log_dir is not None:
+        base["log_dir"] = log_dir.replace("<tmp>", str(tmp_path))
+    base.update(env)
+    proc = subprocess.run(
+        ["bash", str(SCRIPTS / script), "trainer.total_training_steps=5"],
+        cwd=cwd,
+        env=base,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    return proc.stdout.splitlines()
 
 
 def _fake_toolkit(tmp_path):
@@ -1152,6 +1193,7 @@ class TestPullCapKnob:
 
         cls = actor_cls.__ray_metadata__.modified_class if hasattr(actor_cls, "__ray_metadata__") else actor_cls
         cfg = _cfg(QWEN25_BF16_C8, replay_pull_cap="True")
+        cfg.trainer.logger = ["console"]  # no tensorboard_log/ in the cwd
         t = cls(config=cfg, tokenizer=None, role_worker_mapping={}, resource_pool_manager=None)
         assert t.replay_pull_cap is True and t.replay_requires_mini_batches == 0.5
 
@@ -1160,5 +1202,6 @@ class TestPullCapKnob:
 
         cls = actor_cls.__ray_metadata__.modified_class if hasattr(actor_cls, "__ray_metadata__") else actor_cls
         cfg = _cfg(QWEN25_BF16_C8, replay_pull_cap="True", replay_requires_mini_batches="2")
+        cfg.trainer.logger = ["console"]
         with pytest.raises(AssertionError, match="pull_cap needs requires_mini_batches <= 1"):
             cls(config=cfg, tokenizer=None, role_worker_mapping={}, resource_pool_manager=None)

@@ -233,6 +233,14 @@ class TestSharedRecipe:
         assert c["trainer"]["max_actor_ckpt_to_keep"] is None
         assert c["trainer"]["default_local_dir"] == f"logs/{c['trainer']['experiment_name']}"
 
+    def test_hydra_record_goes_to_log_dir(self, script, tmp_path):
+        # hydra/config.yaml, hydra/overrides.yaml and the driver log land next to tensorboard/ and global_step_N/
+        argv = _argv_seen_by_python(script, tmp_path)
+        name = next(a for a in argv if a.startswith("trainer.experiment_name=")).split("=", 1)[1]
+        assert f"hydra.run.dir=logs/{name.replace('/', '_')}" in argv
+        assert "hydra.output_subdir=hydra" in argv
+        assert f"trainer.default_local_dir=logs/{name.replace('/', '_')}" in argv
+
     def test_one_seed_feeds_every_knob_including_vllm(self, script):
         for seed in (1, 7):
             c = compose(script, SEED=str(seed)) if seed != 1 else compose(script)
@@ -869,6 +877,24 @@ def _env_seen_by_python(script, tmp_path, env=None, names=None):
     )
     assert proc.returncode == 0, proc.stderr[-2000:]
     return dict(line.split("=", 1) for line in proc.stdout.splitlines() if "=" in line)
+
+
+def _argv_seen_by_python(script, tmp_path, env=None):
+    """Run a script with a stand-in python3 that prints its argv, one element per line."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir(exist_ok=True)
+    fake = bindir / "python3"
+    fake.write_text('#!/bin/sh\nfor a in "$@"; do printf "%s\\n" "$a"; done\n')
+    fake.chmod(0o755)
+    base = {k: v for k, v in os.environ.items() if k not in SCRIPT_ENV_KNOBS and k not in DEEPGEMM_VARS}
+    base.pop("DEEPGEMM_CUDA_HOME", None)
+    base["PATH"] = f"{bindir}{os.pathsep}{os.environ.get('PATH', '')}"
+    base.update(env or {})
+    proc = subprocess.run(
+        ["bash", str(SCRIPTS / script)], cwd=tmp_path, env=base, capture_output=True, text=True, timeout=120
+    )
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    return proc.stdout.splitlines()
 
 
 def _fake_toolkit(tmp_path):
