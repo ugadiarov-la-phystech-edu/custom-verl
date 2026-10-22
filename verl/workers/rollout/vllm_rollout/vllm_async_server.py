@@ -13,6 +13,7 @@
 # limitations under the License.
 import argparse
 import asyncio
+import copy
 import inspect
 import json
 import logging
@@ -72,6 +73,40 @@ if os.getenv("VERL_USE_GPT_OSS", "0") == "1":
 
 logger = logging.getLogger(__file__)
 logger.setLevel(logging.INFO)
+
+
+def merge_hf_overrides(base: dict, user: Any) -> dict:
+    """Merge a user's ``engine_kwargs.vllm.hf_overrides`` into verl's own ``hf_overrides``.
+
+    verl builds ``hf_overrides`` itself, e.g. the FP8 block ``quantization_config`` (``weight_block_size``) that the
+    weight sync re-quantizes against. The engine args used to end with ``**engine_kwargs``, so a user value (say
+    ``{"max_position_embeddings": 32768}`` for Qwen2.5-Math-7B at 8k) silently REPLACED verl's dict: vLLM then ran
+    without the block config and the first weight sync failed on ``weight_block_size[0]`` (None).
+
+    ``user`` may be None, a dict / mapping or a JSON string (as passed from the command line). Nested mappings are
+    merged recursively and the user's value wins on conflicts, so a partial user ``quantization_config`` only
+    overrides the keys it names. ``base`` is not modified.
+    """
+    if user is None:
+        return copy.deepcopy(base)
+    if isinstance(user, str):
+        user = json.loads(user) if user.strip() else {}
+    if hasattr(user, "items") and not isinstance(user, dict):  # OmegaConf DictConfig and other mappings
+        user = {k: v for k, v in user.items()}
+    if not isinstance(user, dict):
+        raise TypeError(f"hf_overrides must be a dict or a JSON object string, got {type(user).__name__}")
+
+    def _merge(dst: dict, src: dict) -> dict:
+        for key, val in src.items():
+            if hasattr(val, "items") and not isinstance(val, dict):
+                val = {k: v for k, v in val.items()}
+            if isinstance(val, dict) and isinstance(dst.get(key), dict):
+                dst[key] = _merge(dict(dst[key]), val)
+            else:
+                dst[key] = copy.deepcopy(val)
+        return dst
+
+    return _merge(copy.deepcopy(base), user)
 
 
 ALLOCATOR_CAP_ENV = "VERL_VLLM_ALLOCATOR_CAP"
@@ -281,6 +316,12 @@ class vLLMHttpServer:
             set_expandable_segments(True)
 
         quantization, hf_overrides = self._apply_quantization()
+        # A user engine_kwargs.vllm.hf_overrides is merged into verl's (it would otherwise replace it via
+        # **engine_kwargs below and drop e.g. the FP8 block quantization_config).
+        user_hf_overrides = engine_kwargs.pop("hf_overrides", None)
+        if user_hf_overrides is not None:
+            hf_overrides = merge_hf_overrides(hf_overrides, user_hf_overrides)
+            logger.info(f"hf_overrides (verl's merged with engine_kwargs): {hf_overrides}")
 
         compilation_config = engine_kwargs.pop("compilation_config", None) or {}
         if isinstance(compilation_config, str):
