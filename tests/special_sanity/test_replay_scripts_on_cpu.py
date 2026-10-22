@@ -986,6 +986,10 @@ QWEN25_BF16_C8 = (
     "grpo_novcpo_8gpu_dapo17k_3+5_resp8k_megatron_offload_replay_tau=4_k=16"
     "_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.9_bf16_tis-c8_token-mean_nowarmup_stale=1_qwen2.5-7b.sh"
 )
+QWEN25_FP8KV_PULLCAP = (
+    "grpo_novcpo_8gpu_dapo17k_3+5_resp8k_megatron_offload_replay_tau=4_k=16"
+    "_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.9_fp8_kv-fp8_tis-c8_token-mean_nowarmup_stale=1_pull-cap_qwen2.5-7b.sh"
+)
 QWEN25_BF16_OWN = {
     "ROLLOUT_QUANT": "bf16",
     "lr_warmup_steps": "0",
@@ -1145,6 +1149,112 @@ class TestQwen25Bf16NoWarmup3p5:
         r = rollouter_cls(config=_cfg(QWEN25_BF16_C8), tokenizer=None)
         assert not r.concurrency_ramp and r.ramp_first_size == 20
         assert r.staleness_threshold == 1 and r.required_samples == 35
+
+
+class TestQwen25Fp8KvPullCap3p5:
+    """The bf16 stale-1 arm with FP8 weights + FP8 KV (k-bias centring), the pull cap, max_num_seqs 512, max_model_len
+    10240 and vLLM log stats; everything else identical."""
+
+    def test_fp8_rollout_fp8_kv_and_pull_cap(self):
+        c = compose(QWEN25_FP8KV_PULLCAP)
+        rollout = c["actor_rollout_ref"]["rollout"]
+        assert rollout["quantization"] == "fp8" and rollout["dtype"] == "bfloat16"
+        assert rollout["engine_kwargs"]["vllm"]["kv_cache_dtype"] == "fp8_e4m3"
+        assert rollout["max_num_seqs"] == 512 and rollout["max_model_len"] == 10240
+        assert rollout["disable_log_stats"] is False
+        a = c["async_training"]
+        assert a["replay_buffer"]["pull_cap"] is True and a["replay_buffer"]["requires_mini_batches"] == 0.5
+        assert a["staleness_threshold"] == 1 and a["replay_buffer"]["min_fresh_ratio"] == 0.9
+        assert (a["replay_buffer"]["tau"], a["replay_buffer"]["staleness_threshold"]) == (4, 16)
+        assert a["concurrency_ramp"] is None and a["concurrent_samples_per_replica"] == 35
+        assert c["actor_rollout_ref"]["actor"]["optim"]["lr_warmup_steps"] == 0
+        assert c["algorithm"]["rollout_correction"]["rollout_is_threshold"] == 8
+        assert c["actor_rollout_ref"]["actor"]["loss_agg_mode"] == "token-mean"
+        assert c["actor_rollout_ref"]["actor"]["use_dynamic_bsz"] is True
+
+    def test_model_layout_and_cadence(self):
+        c = compose(QWEN25_FP8KV_PULLCAP)
+        assert c["actor_rollout_ref"]["model"]["path"] == "Qwen/Qwen2.5-7B"
+        assert (c["rollout"]["n_gpus_per_node"], c["trainer"]["n_gpus_per_node"]) == (3, 5)
+        assert c["actor_rollout_ref"]["actor"]["ppo_mini_batch_size"] == 35
+        assert (c["trainer"]["test_freq"], c["trainer"]["save_freq"]) == (60, 60)
+        assert c["data"]["seed"] == 1 and c["actor_rollout_ref"]["rollout"]["seed"] == 1
+        val = c["actor_rollout_ref"]["rollout"]["val_kwargs"]
+        assert (val["temperature"], val["top_p"]) == (1.0, 1.0)
+
+    def test_name(self):
+        name = compose(QWEN25_FP8KV_PULLCAP)["trainer"]["experiment_name"]
+        assert name.startswith("GRPO-noVCPO replay tau-4 k-16 stale-1 rmb-0.5 nu-1 fresh-0.9 pull-cap ess-")
+        assert " h100-emu-78gb-gmu0.5 DAPO17K-AIME24 Qwen2.5-7B 3-5 tp1dp5 hdo B-35 token-mean " in name
+        assert name.endswith(" 0.1-wd dynbsz-10240 tis-C8 rollout-fp8 kv-fp8_e4m3 val-t1.0-p1.0 seed-1")
+        assert " ramp-" not in name and "warmup" not in name and " attn-" not in name and "Qwen3" not in name
+
+    def test_differs_from_the_bf16_stale1_arm_only_there(self):
+        bf16, fp8 = _flat(compose(QWEN25_BF16_C8)), _flat(compose(QWEN25_FP8KV_PULLCAP))
+        assert {k for k in fp8 if fp8[k] != bf16.get(k)} | {k for k in bf16 if k not in fp8} == {
+            "actor_rollout_ref.rollout.quantization",
+            "actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype",
+            "actor_rollout_ref.rollout.max_num_seqs",
+            "actor_rollout_ref.rollout.max_model_len",
+            "actor_rollout_ref.rollout.disable_log_stats",
+            "async_training.replay_buffer.pull_cap",
+            "trainer.experiment_name",
+            "actor_rollout_ref.rollout.trace.experiment_name",  # mirrors trainer.experiment_name
+        }
+
+    def test_execs_the_fp8_tis_c8_wrapper_with_the_max_num_seqs_override_first(self):
+        text = (SCRIPTS / QWEN25_FP8KV_PULLCAP).read_text()
+        execs = [ln for ln in text.splitlines() if ln.lstrip().startswith("exec ")]
+        assert len(execs) == 1 and QWEN_FP8_C8 in execs[0]
+        assert 'actor_rollout_ref.rollout.max_num_seqs=${ROLLOUT_MAX_NUM_SEQS}" "$@"' in text
+
+    def test_env_reaches_python_with_k_bias_centring_and_deepgemm(self, tmp_path):
+        toolkit = _fake_toolkit(tmp_path)
+        names = ("ROLLOUT_QUANT", "KV_CACHE_DTYPE", "VERL_QWEN2_K_BIAS_CENTER", "VERL_GPU_MEM_CAP_GB", *DEEPGEMM_VARS)
+        seen = _env_seen_by_python(tmp_path, {"DEEPGEMM_CUDA_HOME": str(toolkit)}, script=QWEN25_FP8KV_PULLCAP, names=names)
+        assert seen["ROLLOUT_QUANT"] == "fp8" and seen["KV_CACHE_DTYPE"] == "fp8_e4m3"
+        assert seen["VERL_QWEN2_K_BIAS_CENTER"] == "1" and seen["VERL_GPU_MEM_CAP_GB"] == "78"
+        assert seen["CUDA_HOME"] == str(toolkit) and seen["VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER"] == "0"
+
+    def test_knobs_still_apply(self):
+        c = compose(
+            QWEN25_FP8KV_PULLCAP,
+            replay_pull_cap="False",
+            KV_CACHE_DTYPE="auto",
+            ROLLOUT_MAX_NUM_SEQS="256",
+            staleness_threshold="2",
+            VLLM_LOG_STATS="False",
+        )
+        rollout = c["actor_rollout_ref"]["rollout"]
+        assert rollout["max_num_seqs"] == 256 and rollout["disable_log_stats"] is True
+        assert rollout.get("engine_kwargs", {}).get("vllm", {}).get("kv_cache_dtype") in (None, "auto")
+        assert c["async_training"]["replay_buffer"]["pull_cap"] is False and c["async_training"]["staleness_threshold"] == 2
+        name = c["trainer"]["experiment_name"]
+        assert " stale-2 " in name and "pull-cap" not in name and " kv-" not in name and " rollout-fp8 " in name
+
+    def test_trailing_override_wins_over_max_num_seqs(self):
+        c = compose(QWEN25_FP8KV_PULLCAP, args=("actor_rollout_ref.rollout.max_num_seqs=768",))
+        assert c["actor_rollout_ref"]["rollout"]["max_num_seqs"] == 768
+
+    def test_trainer_and_rollouter_accept_the_config(self, monkeypatch):
+        from verl.experimental.fully_async_policy import fully_async_rollouter as mod
+        from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
+
+        cfg = _cfg(QWEN25_FP8KV_PULLCAP)
+        cfg.trainer.logger = ["console"]
+        trainer_cls = FullyAsyncTrainer.__ray_metadata__.modified_class
+        t = trainer_cls(config=cfg, tokenizer=None, role_worker_mapping={}, resource_pool_manager=None)
+        assert t.replay_enable and t.replay_pull_cap is True and t.replay_first_mini_size == 20
+
+        rollouter_cls = mod.FullyAsyncRollouter.__ray_metadata__.modified_class
+        monkeypatch.setattr(mod, "create_rl_dataset", lambda *a, **k: [0] * 8)
+        monkeypatch.setattr(mod, "create_rl_sampler", lambda *a, **k: None)
+        monkeypatch.setattr(
+            rollouter_cls, "_create_dataloader", lambda self, *a, **k: setattr(self, "train_dataloader", [0] * 8)
+        )
+        monkeypatch.setattr(rollouter_cls, "_init_dump_executor", lambda self: None)
+        r = rollouter_cls(config=_cfg(QWEN25_FP8KV_PULLCAP), tokenizer=None)
+        assert not r.concurrency_ramp and r.staleness_threshold == 1 and r.required_samples == 35
 
 
 @pytest.mark.parametrize("script", [QWEN, QWEN25_FP8_C8])
