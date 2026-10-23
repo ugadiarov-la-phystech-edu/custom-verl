@@ -37,6 +37,7 @@ QWEN = f"{_ARM}_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.5.sh"
 PANGU = f"{_ARM}_min-ess=1.07_ess-lr-scale=0.5_fresh=0.5_openpangu7b.sh"
 QWEN_FP8 = f"{_ARM}_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.5_fp8.sh"
 QWEN_FP8_C8 = f"{_ARM}_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.5_fp8_tis-c8_token-mean.sh"
+QWEN_FP8_C8_KVFP8_NOWARMUP = f"{_ARM}_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.5_fp8_kv-fp8_tis-c8_token-mean_nowarmup.sh"
 QWEN25_FP8_C8 = (
     "grpo_novcpo_8gpu_dapo17k_3+5_resp8k_megatron_offload_replay_tau=8_k=32"
     "_min-ess=1.1_ess-lr-scale=0.5_nu=1_fresh=0.5_fp8_tis-c8_token-mean_qwen2.5-7b.sh"
@@ -488,6 +489,76 @@ DYNBSZ_KEYS = {
     "actor_rollout_ref.ref.log_prob_max_token_len_per_gpu",
     "critic.use_dynamic_bsz",
 }
+
+
+class TestFp8TisC8TokenMeanKvFp8NoWarmup:
+    """The 5+3 FP8 TIS-C8 token-mean arm, written out in full like it (no thin wrapper), with an FP8 KV cache, vLLM
+    stats on and no LR warmup; nothing else changes."""
+
+    def test_the_three_changes(self):
+        c = compose(QWEN_FP8_C8_KVFP8_NOWARMUP)
+        rollout = c["actor_rollout_ref"]["rollout"]
+        assert rollout["engine_kwargs"]["vllm"]["kv_cache_dtype"] == "fp8_e4m3"
+        assert rollout["disable_log_stats"] is False
+        assert c["actor_rollout_ref"]["actor"]["optim"]["lr_warmup_steps"] == 0
+        assert rollout["quantization"] == "fp8" and rollout["max_model_len"] is None
+
+    def test_name(self):
+        name = compose(QWEN_FP8_C8_KVFP8_NOWARMUP)["trainer"]["experiment_name"]
+        assert name.endswith(" 0.1-wd dynbsz-10240 tis-C8 rollout-fp8 kv-fp8_e4m3 seed-1")
+        assert "warmup" not in name and " attn-" not in name and " 5-3 tp1dp3 hdo B-33 " in name
+
+    def test_differs_from_the_tis_c8_arm_only_there(self):
+        assert _differing(compose(QWEN_FP8_C8), compose(QWEN_FP8_C8_KVFP8_NOWARMUP)) == {
+            "actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype",
+            "actor_rollout_ref.rollout.disable_log_stats",
+            "actor_rollout_ref.actor.optim.lr_warmup_steps",
+        }
+
+    def test_equals_the_tis_c8_arm_with_the_three_knobs(self):
+        assert compose(QWEN_FP8_C8_KVFP8_NOWARMUP) == compose(
+            QWEN_FP8_C8, KV_CACHE_DTYPE="fp8_e4m3", VLLM_LOG_STATS="True", lr_warmup_steps="0"
+        )
+
+    def test_knobs_can_be_set_back(self):
+        assert compose(
+            QWEN_FP8_C8_KVFP8_NOWARMUP, KV_CACHE_DTYPE="auto", VLLM_LOG_STATS="False", lr_warmup_steps="12"
+        ) == compose(QWEN_FP8_C8)
+
+    def test_execs_the_fp8_arm_like_the_tis_c8_arm(self):
+        def execs(script):
+            return [ln for ln in (SCRIPTS / script).read_text().splitlines() if ln.lstrip().startswith("exec ")]
+
+        assert execs(QWEN_FP8_C8_KVFP8_NOWARMUP) == execs(QWEN_FP8_C8)
+        assert QWEN_FP8 in execs(QWEN_FP8_C8_KVFP8_NOWARMUP)[0]
+
+    def test_exports_are_the_tis_c8_arm_s_with_the_three_changes(self):
+        def exports(script):
+            return {ln.strip() for ln in (SCRIPTS / script).read_text().splitlines() if ln.lstrip().startswith("export ")}
+
+        new, old = exports(QWEN_FP8_C8_KVFP8_NOWARMUP), exports(QWEN_FP8_C8)
+        assert new - old == {
+            "export KV_CACHE_DTYPE=${KV_CACHE_DTYPE:-fp8_e4m3}",
+            "export VLLM_LOG_STATS=${VLLM_LOG_STATS:-True}",
+            "export lr_warmup_steps=${lr_warmup_steps:-0}",
+        }
+        assert old - new == {"export lr_warmup_steps=${lr_warmup_steps:-12}"}
+
+    def test_deepgemm_env_is_inherited(self, tmp_path):
+        toolkit = _fake_toolkit(tmp_path)
+        seen = _env_seen_by_python(tmp_path, {"DEEPGEMM_CUDA_HOME": str(toolkit)}, script=QWEN_FP8_C8_KVFP8_NOWARMUP)
+        assert seen["CUDA_HOME"] == str(toolkit) and seen["VLLM_BLOCKSCALE_FP8_GEMM_FLASHINFER"] == "0"
+
+    def test_trainer_accepts_the_config(self):
+        from verl.experimental.fully_async_policy.fully_async_trainer import FullyAsyncTrainer
+        from verl.utils.config import omega_conf_to_dataclass
+
+        cfg = _cfg(QWEN_FP8_C8_KVFP8_NOWARMUP)
+        assert omega_conf_to_dataclass(cfg.actor_rollout_ref.actor).optim.lr_warmup_steps == 0
+        cfg.trainer.logger = ["console"]
+        trainer_cls = FullyAsyncTrainer.__ray_metadata__.modified_class
+        t = trainer_cls(config=cfg, tokenizer=None, role_worker_mapping={}, resource_pool_manager=None)
+        assert t.replay_enable
 
 
 class TestFp8TisC8TokenMean:
